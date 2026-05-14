@@ -1,0 +1,12 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "./bin",
+    "outDir": "./dist/bin"
+  },
+  "include": ["bin/**/*"],
+  "references": [
+    { "path": "../shared" },
+    { "path": "../mcp-core" }
+  ]
+}

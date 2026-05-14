@@ -1,0 +1,26 @@
+{
+  "name": "followr-mcp-root",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Followr MCP server. Connects Claude and other AI agents to Followr's social media management platform.",
+  "workspaces": [
+    "packages/shared",
+    "packages/mcp-core",
+    "packages/stdio",
+    "packages/worker"
+  ],
+  "scripts": {
+    "build": "tsc --build packages/shared packages/mcp-core packages/stdio",
+    "build:worker": "cd packages/worker && npx wrangler deploy --dry-run --outdir dist",
+    "typecheck": "tsc --build packages/shared packages/mcp-core packages/stdio packages/worker --noEmit",
+    "clean": "rm -rf packages/*/dist packages/*/tsconfig.tsbuildinfo"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0",
+    "@types/node": "^20.0.0"
+  },
+  "license": "MIT"
+}

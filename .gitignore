@@ -1,0 +1,48 @@
+# Dependencies
+node_modules/
+
+# Build artifacts
+dist/
+build/
+*.tsbuildinfo
+
+# Cloudflare / deploy artifacts
+.vercel/
+.wrangler/
+
+# Env files (secrets)
+.env
+.env.local
+.env.*.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Logs
+*.log
+npm-debug.log*
+
+# Cache
+.cache/
+.npm/
+
+# Temp / local
+/tmp/
+*.local
+
+# Local documentation and notes intentionally kept out of the public repo
+CLAUDE.md
+docs/build-status.md
+
+# Followr API tokens or similar credentials accidentally dropped at root
+*token*
+*.token
+
+# Anything inside `secrets/` directories at any level
+secrets/
