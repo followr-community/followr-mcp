@@ -274,6 +274,31 @@ export interface Message {
   updated_at: Iso8601;
 }
 
+/**
+ * Brand-voice prompt resource. The Followr UI calls these "Prompts" under
+ * Company Settings → Prompts and lets the user create multiple variants per
+ * social network, marking one or more as default. When AI content generation
+ * runs (Post Generator, etc.), Followr picks among the prompts where
+ * `default=true` for the relevant `social_network_type`.
+ *
+ * Note: there is also a legacy denormalized field `Company.social_network_prompts`
+ * that mirrors a slice of this resource, but it is read-only via PUT
+ * /api/companies/{id}. Always mutate via the /api/prompts endpoints.
+ */
+export interface Prompt {
+  id: number;
+  user_id: number;
+  /** Null when the prompt is a Followr built-in default; numeric for workspace-scoped prompts. */
+  company_id: number | null;
+  type: string;
+  social_network_type: SocialNetworkType | string;
+  default: boolean;
+  name: string;
+  prompt: string;
+  created_at: Iso8601;
+  updated_at: Iso8601;
+}
+
 export interface RuleGroup {
   id: number;
   name: string;

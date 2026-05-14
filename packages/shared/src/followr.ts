@@ -27,6 +27,7 @@ import type {
   FollowrUser,
   Message,
   PostGroup,
+  Prompt,
   RuleGroup,
   SubscriptionBalance,
   Tag,
@@ -533,6 +534,70 @@ export class FollowrClient {
     if (options?.type) query["filter[type]"] = options.type;
     const result = await this.request<ApiCollection<ExternalUser>>("GET", "/api/externalUsers", { query });
     return result.data;
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // Prompts (brand-voice prompts, AKA "social_network_prompts")
+  // ──────────────────────────────────────────────────────────
+  //
+  // The /api/prompts resource is the source of truth for the brand-voice
+  // feature exposed in the Followr UI under Company Settings → Prompts.
+  // Each prompt belongs to a (company_id, social_network_type) tuple, has a
+  // `default` flag, and can be selected at generate time. Multiple prompts
+  // with default=true per network are allowed; Followr picks one.
+  //
+  // The legacy field `Company.social_network_prompts` is a denormalized
+  // mirror of this resource and is read-only via PUT /api/companies/{id}.
+  // Discovered empirically 2026-05-14.
+
+  async listPrompts(options: {
+    companyId: number | null;
+    socialNetworkType?: string;
+    onlyDefault?: boolean;
+    include?: string;
+    pageSize?: number;
+    sort?: string;
+  }): Promise<Prompt[]> {
+    const query: Query = {
+      // company_id=null surfaces the global Followr defaults; numeric scopes
+      // to the workspace.
+      "filter[company_id]": options.companyId === null ? "null" : options.companyId,
+      "page[size]": options.pageSize ?? 30,
+      sort: options.sort ?? "-created_at",
+    };
+    if (options.socialNetworkType) query["filter[social_network_type]"] = options.socialNetworkType;
+    if (options.onlyDefault) query["filter[default]"] = 1;
+    if (options.include) query["include"] = options.include;
+    const result = await this.request<ApiCollection<Prompt>>("GET", "/api/prompts", { query });
+    return result.data;
+  }
+
+  async getPrompt(promptId: number): Promise<Prompt> {
+    const result = await this.request<ApiSingle<Prompt>>("GET", `/api/prompts/${promptId}`);
+    return result.data;
+  }
+
+  async createPrompt(body: {
+    company_id: number;
+    social_network_type: string;
+    name: string;
+    prompt: string;
+    type?: string;
+    default?: boolean;
+  }): Promise<Prompt> {
+    const result = await this.request<ApiSingle<Prompt>>("POST", "/api/prompts", {
+      body: { type: "text", default: false, ...body },
+    });
+    return result.data;
+  }
+
+  async updatePrompt(promptId: number, patch: Partial<Prompt>): Promise<Prompt> {
+    const result = await this.request<ApiSingle<Prompt>>("PUT", `/api/prompts/${promptId}`, { body: patch });
+    return result.data;
+  }
+
+  async deletePrompt(promptId: number): Promise<void> {
+    await this.request<void>("DELETE", `/api/prompts/${promptId}`);
   }
 
   /**

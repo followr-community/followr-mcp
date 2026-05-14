@@ -23,6 +23,7 @@ import { registerCanvaTools } from "./tools/canva.js";
 import { registerCompanyTools } from "./tools/companies.js";
 import { registerFolderTools } from "./tools/folders.js";
 import { registerPostGroupTools } from "./tools/post-groups.js";
+import { registerPromptTools } from "./tools/prompts.js";
 import { registerRuleGroupTools } from "./tools/rule-groups.js";
 import { registerSocialHubTools } from "./tools/social-hub.js";
 import { registerSubscriptionTools } from "./tools/subscription.js";
@@ -55,6 +56,7 @@ export function registerFollowrTools(
   registerSubscriptionTools(server, client, options);
   registerUserTools(server, client, options);
   registerWorkspaceSettingsTools(server, client, options);
+  registerPromptTools(server, client, options);
   registerAnalyticsTools(server, client, options);
   registerAssetTools(server, client, options);
   registerCanvaTools(server, client, options);

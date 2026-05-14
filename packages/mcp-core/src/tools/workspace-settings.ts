@@ -4,39 +4,17 @@ import { z } from "zod";
 
 import type { RegisterOptions } from "../index.js";
 
+// Note: `update_brand_voice` was removed after discovery 2026-05-14 that the
+// `Company.social_network_prompts` field is a read-only denormalized cache.
+// Brand-voice prompts are now mutated via the dedicated /api/prompts resource,
+// exposed in this MCP through the `prompts.ts` tools (list_prompts,
+// get_prompt, create_prompt, update_prompt, delete_prompt).
+
 export function registerWorkspaceSettingsTools(
   server: McpServer,
   client: FollowrClient,
   _options: RegisterOptions,
 ): void {
-  server.registerTool(
-    "update_brand_voice",
-    {
-      title: "Update the per-network brand voice prompts of a workspace",
-      description:
-        "Update the workspace's `social_network_prompts` field with a fresh array of per-network voice / tone overrides. REPLACE semantics: the array passed becomes the full new value (the caller is responsible for merging entries for networks that should keep their prior prompt). Each entry typically has shape { social_network_type, prompt }.",
-      inputSchema: {
-        company_id: z.number().int().positive(),
-        social_network_prompts: z
-          .array(z.record(z.unknown()))
-          .describe("Full list of per-network prompts (REPLACE, not append). Each item is an object; typical shape is { social_network_type, prompt }."),
-      },
-    },
-    async ({ company_id, social_network_prompts }) => {
-      const updated = await client.updateCompany(company_id, {
-        social_network_prompts,
-      });
-      return {
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({ id: updated.id, social_network_prompts: updated.social_network_prompts }, null, 2),
-          },
-        ],
-      };
-    },
-  );
-
   server.registerTool(
     "update_webhook_url",
     {
