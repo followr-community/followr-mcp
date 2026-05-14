@@ -81,8 +81,11 @@ export function registerAiResultsTools(
         ...(image_url ? { image_url } : {}),
         ...(image_urls?.length ? { image_urls } : {}),
         ...(n ? { n } : {}),
-        ...(driver ? { driver } : {}),
-        ...(model ? { model } : {}),
+        // Defaults verified empirically: fal + nano_banana_2. The workspace's
+        // ai_preferences.image_model is not automatically applied by the
+        // backend when omitted, so we set explicit defaults here.
+        driver: driver ?? "fal",
+        model: model ?? "nano_banana_2",
         ...(queue !== undefined ? { queue } : {}),
       });
       if (!wait || initial.status === "completed" || initial.status === "failed") {
@@ -120,8 +123,9 @@ export function registerAiResultsTools(
         type: "audio",
         voice,
         ...(speed !== undefined ? { speed } : {}),
-        ...(driver ? { driver } : {}),
-        ...(model ? { model } : {}),
+        // Defaults verified empirically: fal + elevenlabs_tts_3.
+        driver: driver ?? "fal",
+        model: model ?? "elevenlabs_tts_3",
         ...(queue !== undefined ? { queue } : {}),
       });
       if (!wait || initial.status === "completed" || initial.status === "failed") {
@@ -174,13 +178,14 @@ export function registerAiResultsTools(
         type: "audio",
         voice: voicePlatformId,
         ...(audio_speed !== undefined ? { speed: audio_speed } : {}),
-        ...(driver ? { driver } : {}),
-        ...(model ? { model } : {}),
+        driver: "fal",
+        model: "elevenlabs_tts_3",
       });
       const audioFinal = await client.waitForAiResult(audioInitial.id, {
         timeoutMs: (timeout_seconds ?? 600) * 1000,
       });
-      if (audioFinal.status !== "completed" || !audioFinal.audio_url) {
+      const audioUrl = audioFinal.response ?? "";
+      if (audioFinal.status !== "completed" || !audioUrl) {
         throw new Error(
           `Audio generation failed for avatar ${avatar_id}: status=${audioFinal.status} message=${audioFinal.status_message ?? "(none)"}`,
         );
@@ -189,11 +194,14 @@ export function registerAiResultsTools(
       const videoInitial = await client.generateVideo({
         type: "video",
         q: script,
-        audio_url: audioFinal.audio_url,
+        audio_url: audioUrl,
         image_url: imageUrl,
         aspect_ratio: aspect_ratio ?? "9:16",
         driver: driver ?? "fal",
-        model: model ?? "veed/lipsync-1",
+        // Empirically verified default: veed_fabric_1.0 is what Followr uses
+        // in production for avatar lipsync renders (workspace 8 historical
+        // aiResults with type=video on 2026-05-13).
+        model: model ?? "veed_fabric_1.0",
         company_id,
         chargeable: 1,
       });
@@ -208,6 +216,8 @@ export function registerAiResultsTools(
               {
                 avatar_id,
                 audio_ai_result_id: audioFinal.id,
+                audio_url: audioUrl,
+                image_url: imageUrl,
                 video: sanitizeAiResult(videoFinal),
               },
               null,

@@ -380,17 +380,30 @@ export class FollowrClient {
     return result.data;
   }
 
-  /** POST /api/voices. Creates a voice profile linked to a TTS provider (e.g. ElevenLabs). */
-  async createVoice(body: {
-    name: string;
-    language_code: string;
-    platform: string;
-    platform_external_id: string;
-    company_id: number;
-    accent?: string | null;
-    description?: string | null;
-  }): Promise<Voice> {
-    const result = await this.request<ApiSingle<Voice>>("POST", "/api/voices", { body });
+  /**
+   * POST /api/companies/{companyId}/voices. Creates a voice profile linked to a
+   * TTS provider (e.g. ElevenLabs).
+   *
+   * Note: the path is NESTED under the company. The internal doc previously
+   * listed this as `POST /api/voices` (flat) but that route returns 404. The
+   * nested path was verified empirically 2026-05-14.
+   */
+  async createVoice(
+    companyId: number,
+    body: {
+      name: string;
+      language_code: string;
+      platform: string;
+      platform_external_id: string;
+      accent?: string | null;
+      description?: string | null;
+    },
+  ): Promise<Voice> {
+    const result = await this.request<ApiSingle<Voice>>(
+      "POST",
+      `/api/companies/${companyId}/voices`,
+      { body },
+    );
     return result.data;
   }
 
@@ -415,15 +428,27 @@ export class FollowrClient {
     return result.data;
   }
 
-  /** POST /api/avatars. Creates a custom avatar resource (without image; image attached in next step). */
-  async createAvatar(body: {
-    name: string;
-    description: string;
-    voice_id: number;
-    company_id: number;
-    default?: boolean;
-  }): Promise<Avatar> {
-    const result = await this.request<ApiSingle<Avatar>>("POST", "/api/avatars", { body });
+  /**
+   * POST /api/companies/{companyId}/avatars. Creates a custom avatar resource
+   * (without image; image attached in next step). Path is NESTED under the
+   * company, same as the other CREATE endpoints (voices, folders, postGroups).
+   * The internal doc previously listed this as POST /api/avatars (flat) but
+   * that route returns 404. Verified empirically 2026-05-14.
+   */
+  async createAvatar(
+    companyId: number,
+    body: {
+      name: string;
+      description: string;
+      voice_id: number;
+      default?: boolean;
+    },
+  ): Promise<Avatar> {
+    const result = await this.request<ApiSingle<Avatar>>(
+      "POST",
+      `/api/companies/${companyId}/avatars`,
+      { body },
+    );
     return result.data;
   }
 

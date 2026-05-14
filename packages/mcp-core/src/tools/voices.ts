@@ -139,12 +139,11 @@ export function registerVoiceTools(
       },
     },
     async ({ company_id, name, language_code, elevenlabs_voice_id, accent, description }) => {
-      const voice = await client.createVoice({
+      const voice = await client.createVoice(company_id, {
         name,
         language_code,
         platform: "elevenlabs",
         platform_external_id: elevenlabs_voice_id,
-        company_id,
         ...(accent !== undefined ? { accent } : {}),
         ...(description !== undefined ? { description } : {}),
       });

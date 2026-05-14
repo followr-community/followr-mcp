@@ -226,11 +226,11 @@ export interface AiResult {
   words?: number | null;
   created_at: Iso8601 | null;
   updated_at: Iso8601 | null;
-  // Output URLs (populated on completed results, depending on type).
-  // Verified empirically in docs/followr-api/ai-results.md (2026-05-13).
-  image_url?: string | null;
-  audio_url?: string | null;
-  video_url?: string | null;
+  // Note: when status is `completed`, the output URL (image / audio / video)
+  // lives in the `response` field above (a string URL on CDN), NOT in
+  // dedicated `image_url` / `audio_url` / `video_url` fields. The internal
+  // doc previously claimed otherwise; corrected via empirical probe
+  // 2026-05-14. For type=chat, `response` is the raw text completion.
 }
 
 export interface Conversation {

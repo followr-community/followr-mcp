@@ -108,22 +108,26 @@ export function registerAvatarTools(
         n: 1,
         chargeable: 1,
         queue: true,
-        ...(image_driver ? { driver: image_driver } : {}),
-        ...(image_model ? { model: image_model } : {}),
+        // Defaults verified empirically (workspace ai_preferences are NOT
+        // automatically applied when driver/model are omitted from the body).
+        driver: image_driver ?? "fal",
+        model: image_model ?? "nano_banana_2",
       });
       const completedImage = await client.waitForAiResult(initialImage.id, {
         timeoutMs: (timeout_seconds ?? 300) * 1000,
       });
-      if (completedImage.status !== "completed" || !completedImage.image_url) {
+      // For aiResults with type=image, the CDN URL of the generated image is
+      // returned in the `response` field (not in an `image_url` field).
+      const generatedImageUrl = completedImage.response ?? "";
+      if (completedImage.status !== "completed" || !generatedImageUrl) {
         throw new Error(
           `Avatar image generation failed: status=${completedImage.status} message=${completedImage.status_message ?? "(none)"}`,
         );
       }
-      const avatar = await client.createAvatar({
+      const avatar = await client.createAvatar(company_id, {
         name,
         description: description ?? prompt.slice(0, 340),
         voice_id,
-        company_id,
         default: isDefault ?? false,
       });
       const filename = `avatar-${avatar.id}-${Date.now()}.jpg`;
@@ -132,7 +136,7 @@ export function registerAvatarTools(
         type: "image",
         visibility: "public",
       });
-      const downloadResp = await fetch(completedImage.image_url);
+      const downloadResp = await fetch(generatedImageUrl);
       if (!downloadResp.ok) {
         throw new Error(
           `Failed to download generated image from CDN: ${downloadResp.status} ${downloadResp.statusText}`,
@@ -148,7 +152,7 @@ export function registerAvatarTools(
             text: JSON.stringify(
               {
                 image_ai_result_id: completedImage.id,
-                source_image_url: completedImage.image_url,
+                source_image_url: generatedImageUrl,
                 avatar: sanitizeAvatar(finalAvatar),
               },
               null,
