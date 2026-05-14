@@ -267,10 +267,15 @@ export class FollowrClient {
   // Tags (CRUD complete, sessions 5 + 6 verified empirically)
   // ──────────────────────────────────────────────────────────
 
-  async listTags(companyId: number, options?: { pageSize?: number }): Promise<Tag[]> {
-    const result = await this.request<ApiCollection<Tag>>("GET", "/api/tags", {
-      query: { "filter[company_id]": companyId, "page[size]": options?.pageSize ?? 100 },
-    });
+  async listTags(companyId: number, options?: { pageSize?: number; name?: string }): Promise<Tag[]> {
+    const query: Query = {
+      "filter[company_id]": companyId,
+      "page[size]": options?.pageSize ?? 100,
+    };
+    // `filter[name]` does an indexed lookup. Useful for find-or-create flows
+    // where we want a strongly consistent existence check right after a write.
+    if (options?.name !== undefined) query["filter[name]"] = options.name;
+    const result = await this.request<ApiCollection<Tag>>("GET", "/api/tags", { query });
     return result.data;
   }
 

@@ -96,8 +96,11 @@ export function registerTagTools(server: McpServer, client: FollowrClient, _opti
       },
     },
     async ({ company_id, name, color }) => {
-      const tags = await client.listTags(company_id);
-      const existing = tags.find((t) => t.name.toLowerCase() === name.toLowerCase());
+      // Indexed lookup by name. The previous implementation listed the whole
+      // company's tags and filtered client-side, which missed just-created
+      // tags due to read-after-write consistency lag on the list endpoint.
+      const matches = await client.listTags(company_id, { name });
+      const existing = matches.find((t) => t.name.toLowerCase() === name.toLowerCase());
       if (existing) {
         return {
           content: [{ type: "text", text: JSON.stringify({ found: true, tag: existing }, null, 2) }],
