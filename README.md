@@ -25,7 +25,7 @@ Once installed, you can ask Claude things like:
 
 The MCP exposes:
 
-- **61 tools** spanning post groups, posts, tags, folders, assets, avatars, voices, Canva integration, Social Hub (DMs, comments, contacts), Autopilot rules, AI generation (text/image/audio/lipsync video), analytics, subscription balance, and workspace settings.
+- **65 tools** spanning post groups, posts, tags, folders, assets, avatars, voices, brand-voice prompts, Canva integration, Social Hub (DMs, comments, contacts), Autopilot rules, AI generation (text/image/audio/lipsync video), analytics, subscription balance, and workspace settings.
 - **6 resources** (catalog endpoints) for companies, calendars, brand voice, avatars, ElevenLabs voices, and individual post groups.
 - **5 prompts** (canned multi-tool workflows) for weekly briefs, campaign launches, video series, crisis response, and URL repurposing.
 
@@ -33,20 +33,67 @@ See `packages/mcp-core/src/tools/` for the full tool list with descriptions.
 
 ## Installation
 
-Coming soon. The package will be published to npm as `@followr/mcp` and
-installable in Claude Desktop, Claude Code, Cursor, and any other
-MCP-compatible client. See `packages/stdio/README.md` for the planned
-configuration once the npm release lands.
+The MCP is published on npm as `@followr/mcp` and runs as a local subprocess
+of your AI client. Pick the section that matches your client; full step-by-step
+with troubleshooting lives in
+[`packages/stdio/README.md`](packages/stdio/README.md).
 
-## Authentication
+### Quick start: Claude Desktop
 
-The MCP requires a Followr API token, provided as the `FOLLOWR_API_TOKEN`
-environment variable. Generate one in the Followr UI under
-**Company Settings → API Keys → Generate**.
+Add this to `~/Library/Application Support/Claude/claude_desktop_config.json`
+(macOS path; see the full README for Windows / Linux):
 
-The token is read by the MCP at startup and used for all calls. The MCP never
-logs it, never sends it anywhere other than the Followr API, and never stores
-it on disk. Source code is auditable in this repo.
+```json
+{
+  "mcpServers": {
+    "followr": {
+      "command": "npx",
+      "args": ["-y", "@followr/mcp"],
+      "env": {
+        "FOLLOWR_API_TOKEN": "PASTE_YOUR_TOKEN_HERE"
+      }
+    }
+  }
+}
+```
+
+Fully quit and reopen Claude Desktop. The `followr` connector appears once
+the initial `npx` download completes (~5 to 10 seconds first time, cached after).
+
+### Quick start: Claude Code (CLI)
+
+```bash
+claude mcp add --scope user followr --env 'FOLLOWR_API_TOKEN=PASTE_YOUR_TOKEN_HERE' -- npx -y @followr/mcp
+```
+
+The **single quotes** around the env var are mandatory: Followr tokens contain
+a `|` (pipe) which the shell would otherwise interpret as a pipe operator,
+truncating the token and producing 401 errors on every call. `--scope user`
+makes the MCP available in every project.
+
+Verify with `claude mcp get followr`. Expected `Status: ✓ Connected` and
+`Scope: User config`.
+
+### Quick start: Cursor
+
+Edit `~/.cursor/mcp.json` (or the `Cursor Settings → MCP` panel). Use the same
+JSON shape as Claude Desktop.
+
+## Generate your Followr API token
+
+1. Sign in at https://app.followr.ai.
+2. Workspace switcher → gear icon → **API Keys**.
+3. Click **Generate**, name it (e.g. "Claude MCP").
+4. Copy the token. Followr only shows it once.
+
+> ⚠️ **Treat the token like a password.** Never paste it in a chat (Claude,
+> Slack, GitHub issues, anywhere). Paste it only into your terminal or your
+> local config file. If a token leaks, revoke it in the same Followr UI and
+> generate a new one.
+
+The MCP reads `FOLLOWR_API_TOKEN` at startup, uses it for all Followr API calls,
+never logs it, never sends it anywhere other than `api.followr.ai`, and never
+stores it on disk. Source code is auditable in this repo.
 
 ## Repository structure
 
