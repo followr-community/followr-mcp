@@ -3,23 +3,27 @@
   "version": "0.1.0",
   "description": "Followr MCP server. Connect Claude (and any MCP-compatible AI agent) to your Followr workspace to manage posts, generate AI content, work with avatars and videos, and orchestrate social media workflows from natural language.",
   "type": "module",
-  "main": "./dist/index.js",
   "bin": {
     "followr-mcp": "./dist/bin/followr-mcp.js"
   },
   "files": [
-    "dist",
+    "dist/bin/followr-mcp.js",
+    "dist/bin/followr-mcp.js.map",
     "README.md"
   ],
   "scripts": {
-    "build": "tsc -b",
+    "build": "tsup",
     "clean": "rm -rf dist tsconfig.tsbuildinfo",
     "start": "node dist/bin/followr-mcp.js"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
     "@followr-mcp/mcp-core": "0.1.0",
     "@followr-mcp/shared": "0.1.0",
-    "@modelcontextprotocol/sdk": "^1.0.0"
+    "tsup": "^8.3.0"
   },
   "engines": {
     "node": ">=20"
