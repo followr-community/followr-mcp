@@ -36,6 +36,7 @@ npm-debug.log*
 # Temp / local
 /tmp/
 *.local
+*.bak
 
 # Local documentation and notes intentionally kept out of the public repo
 CLAUDE.md

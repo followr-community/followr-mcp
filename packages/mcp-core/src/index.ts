@@ -23,12 +23,14 @@ import { registerCanvaTools } from "./tools/canva.js";
 import { registerCompanyTools } from "./tools/companies.js";
 import { registerFolderTools } from "./tools/folders.js";
 import { registerPostGroupTools } from "./tools/post-groups.js";
+import { registerPostTools } from "./tools/posts.js";
 import { registerPromptTools } from "./tools/prompts.js";
 import { registerRuleGroupTools } from "./tools/rule-groups.js";
 import { registerSocialHubTools } from "./tools/social-hub.js";
 import { registerSubscriptionTools } from "./tools/subscription.js";
 import { registerTagTools } from "./tools/tags.js";
 import { registerUserTools } from "./tools/users.js";
+import { registerValidateTools } from "./tools/validate.js";
 import { registerVoiceTools } from "./tools/voices.js";
 import { registerWorkspaceSettingsTools } from "./tools/workspace-settings.js";
 import { registerFollowrResources } from "./resources/index.js";
@@ -46,6 +48,8 @@ export function registerFollowrTools(
 ): void {
   registerCompanyTools(server, client, options);
   registerPostGroupTools(server, client, options);
+  registerPostTools(server, client, options);
+  registerValidateTools(server, client, options);
   registerTagTools(server, client, options);
   registerAiResultsTools(server, client, options);
   registerAvatarTools(server, client, options);

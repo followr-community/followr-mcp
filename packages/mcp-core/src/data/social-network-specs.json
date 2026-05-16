@@ -1,0 +1,386 @@
+{
+  "_meta": {
+    "source": "Extracted from app.followr.ai frontend bundle, position 1553329-1559200",
+    "verified_at": "2026-05-16",
+    "extraction_method": "Chrome inspection of webpackChunkfollow main bundle",
+    "structure_note": "Top-level keys are `<network>_<product_type>`. Booleans normalized from !0/!1. void 0 → null. Conditionals noted as both branches where present."
+  },
+  "medium_feed": {
+    "connection": {
+      "required": true
+    },
+    "title": {
+      "max_length": 100,
+      "required": true
+    },
+    "description": {
+      "max_length": 10240000,
+      "required": true
+    }
+  },
+  "pinterest_feed": {
+    "connection": {
+      "required": true
+    },
+    "title": {
+      "max_length": 100,
+      "required": true
+    },
+    "board_id": {
+      "required": true
+    },
+    "description": {
+      "max_length": 500
+    },
+    "media_urls": {
+      "allow_multiple_types": false,
+      "max_images_length": 5,
+      "max_videos_length": 1,
+      "max_gifs_length": 0,
+      "max_length": 5,
+      "required": true,
+      "image_max_size_bytes": 33554432,
+      "video_max_size_bytes": 2097152000,
+      "video_min_duration_seconds": 3,
+      "video_max_duration_seconds": 900,
+      "same_ratio": true,
+      "allow_file_cover": true,
+      "allow_frame_cover": true,
+      "required_cover": true
+    }
+  },
+  "twitter_feed": {
+    "connection": {
+      "required": true
+    },
+    "description": {
+      "max_length": 280,
+      "max_length_if_verified": 25000,
+      "_note": "Followr resolves this at runtime: 25000 if the connected Twitter account.preferences.verified is true, else 280"
+    },
+    "media_urls": {
+      "allow_multiple_types": false,
+      "max_images_length": 4,
+      "max_videos_length": 1,
+      "max_gifs_length": 1,
+      "max_length": 4,
+      "required": false,
+      "image_max_size_bytes": 5242880,
+      "video_max_size_bytes": 536870912,
+      "video_min_duration_seconds": 0.5,
+      "video_max_duration_seconds": 140
+    }
+  },
+  "facebook_feed": {
+    "connection": {
+      "required": true
+    },
+    "description": {
+      "max_length": 60000
+    },
+    "media_urls": {
+      "allow_multiple_types": false,
+      "max_images_length": 10,
+      "max_videos_length": 1,
+      "max_gifs_length": 0,
+      "max_length": 10,
+      "required": false,
+      "image_max_size_bytes": 8388608,
+      "video_max_size_bytes": 10737418240,
+      "video_min_duration_seconds": 3,
+      "video_max_duration_seconds": 1200,
+      "allow_file_cover": false,
+      "allow_frame_cover": false
+    }
+  },
+  "facebook_reel": {
+    "connection": {
+      "required": true
+    },
+    "description": {
+      "max_length": 60000
+    },
+    "media_urls": {
+      "allow_multiple_types": false,
+      "max_images_length": 0,
+      "max_videos_length": 1,
+      "max_gifs_length": 0,
+      "max_length": 1,
+      "required": true,
+      "image_max_size_bytes": 8388608,
+      "video_max_size_bytes": 1073741824,
+      "video_min_duration_seconds": 3,
+      "video_max_duration_seconds": 90,
+      "video_max_width": 1920,
+      "video_min_width": 540,
+      "allowed_aspect_ratios": [
+        0.5,
+        0.6
+      ],
+      "allow_file_cover": false,
+      "allow_frame_cover": false
+    }
+  },
+  "facebook_story": {
+    "connection": {
+      "required": true
+    },
+    "description": {
+      "max_length": 0
+    },
+    "media_urls": {
+      "allow_multiple_types": true,
+      "max_images_length": 1,
+      "max_videos_length": 1,
+      "max_gifs_length": 0,
+      "max_length": 1,
+      "required": true,
+      "image_max_size_bytes": 8388608,
+      "video_max_size_bytes": 104857600,
+      "video_min_duration_seconds": 3,
+      "video_max_duration_seconds": 60,
+      "video_max_width": 1920,
+      "video_min_width": 540,
+      "allowed_aspect_ratios": [
+        0.5,
+        0.6
+      ]
+    }
+  },
+  "instagram_feed": {
+    "connection": {
+      "required": true
+    },
+    "description": {
+      "max_length": 2200
+    },
+    "media_urls": {
+      "allow_multiple_types": false,
+      "max_images_length": 10,
+      "max_videos_length": 1,
+      "max_gifs_length": 0,
+      "max_length": 10,
+      "required": true,
+      "image_max_size_bytes": 8388608,
+      "video_max_size_bytes": 10737418240,
+      "video_min_duration_seconds": 3,
+      "video_max_duration_seconds": 900,
+      "video_max_width": 1920,
+      "allowed_aspect_ratios": [
+        0.5,
+        1.91
+      ],
+      "allow_file_cover": true,
+      "allow_frame_cover": true
+    }
+  },
+  "instagram_reel": {
+    "connection": {
+      "required": true
+    },
+    "description": {
+      "max_length": 2200
+    },
+    "media_urls": {
+      "allow_multiple_types": false,
+      "max_images_length": 0,
+      "max_videos_length": 1,
+      "max_gifs_length": 0,
+      "max_length": 1,
+      "required": true,
+      "image_max_size_bytes": null,
+      "video_max_size_bytes": 1073741824,
+      "video_min_duration_seconds": 3,
+      "video_max_duration_seconds": 900,
+      "video_max_width": 1920,
+      "video_min_width": 720,
+      "allowed_aspect_ratios": [
+        0.5,
+        1.91
+      ],
+      "allow_file_cover": true,
+      "allow_frame_cover": true
+    }
+  },
+  "instagram_story": {
+    "connection": {
+      "required": true
+    },
+    "description": {
+      "max_length": 0
+    },
+    "media_urls": {
+      "allow_multiple_types": true,
+      "max_images_length": 1,
+      "max_videos_length": 1,
+      "max_gifs_length": 0,
+      "max_length": 1,
+      "required": true,
+      "image_max_size_bytes": 8388608,
+      "video_max_size_bytes": 104857600,
+      "video_min_duration_seconds": 3,
+      "video_max_duration_seconds": 60,
+      "video_max_width": 1920,
+      "video_min_width": 540,
+      "allowed_aspect_ratios": [
+        0.5,
+        0.6
+      ],
+      "allow_file_cover": false,
+      "allow_frame_cover": false
+    }
+  },
+  "tiktok_feed": {
+    "connection": {
+      "required": true
+    },
+    "description": {
+      "max_length": 2200,
+      "required": false
+    },
+    "media_urls": {
+      "allow_multiple_types": false,
+      "max_images_length": 0,
+      "max_videos_length": 1,
+      "max_gifs_length": 0,
+      "max_length": 1,
+      "required": true,
+      "image_max_size_bytes": null,
+      "video_max_size_bytes": 4294967296,
+      "video_min_duration_seconds": 3,
+      "video_max_duration_seconds": 600,
+      "allow_file_cover": false,
+      "allow_frame_cover": true,
+      "_video_max_duration_note": "Followr resolves this at runtime: if connected TikTok account.video_duration is set, uses that; otherwise falls back to 600s. Max varies per TikTok account (1-3-10-60 min tiers)"
+    },
+    "privacy_level": {
+      "required": true
+    }
+  },
+  "linkedin_feed": {
+    "connection": {
+      "required": true
+    },
+    "description": {
+      "max_length": 3000,
+      "required": true
+    },
+    "media_urls": {
+      "allow_multiple_types": false,
+      "max_images_length": 9,
+      "max_videos_length": 1,
+      "max_gifs_length": 0,
+      "max_length": 9,
+      "required": false,
+      "image_max_size_bytes": 8388608,
+      "video_max_size_bytes": 209715200,
+      "video_min_duration_seconds": 3,
+      "video_max_duration_seconds": 600
+    }
+  },
+  "youtube_feed": {
+    "connection": {
+      "required": true
+    },
+    "title": {
+      "max_length": 100,
+      "required": true
+    },
+    "description": {
+      "max_length": 5000,
+      "required": false
+    },
+    "media_urls": {
+      "allow_multiple_types": false,
+      "max_images_length": 0,
+      "max_videos_length": 1,
+      "max_gifs_length": 0,
+      "max_length": 1,
+      "required": true,
+      "image_max_size_bytes": null,
+      "video_max_size_bytes": 137438953472,
+      "video_min_duration_seconds": 1,
+      "video_max_duration_seconds": 43200,
+      "video_max_width": 7680,
+      "video_min_width": 426,
+      "allowed_aspect_ratios": [
+        0.3333,
+        2.3922
+      ],
+      "allow_file_cover": true,
+      "allow_frame_cover": true
+    }
+  },
+  "youtube_short": {
+    "connection": {
+      "required": true
+    },
+    "title": {
+      "max_length": 100,
+      "required": false
+    },
+    "description": {
+      "max_length": 5000,
+      "required": false
+    },
+    "media_urls": {
+      "allow_multiple_types": false,
+      "max_images_length": 0,
+      "max_videos_length": 1,
+      "max_gifs_length": 0,
+      "max_length": 1,
+      "required": true,
+      "video_max_size_bytes": 268435456,
+      "video_min_duration_seconds": 1,
+      "video_max_duration_seconds": 60,
+      "video_max_width": 1920,
+      "video_min_width": 600,
+      "allowed_aspect_ratios": [
+        0.5,
+        0.625
+      ],
+      "allow_file_cover": true,
+      "allow_frame_cover": true
+    }
+  },
+  "threads_feed": {
+    "connection": {
+      "required": true
+    },
+    "description": {
+      "max_length": 500
+    },
+    "media_urls": {
+      "allow_multiple_types": true,
+      "max_images_length": 20,
+      "max_videos_length": 20,
+      "max_gifs_length": 20,
+      "max_length": 20,
+      "required": false,
+      "image_max_size_bytes": 5242880,
+      "video_max_size_bytes": 536870912,
+      "video_min_duration_seconds": 0.5,
+      "video_max_duration_seconds": 140
+    }
+  },
+  "bluesky_feed": {
+    "connection": {
+      "required": true
+    },
+    "description": {
+      "max_length": 300
+    },
+    "media_urls": {
+      "allow_multiple_types": false,
+      "max_images_length": 4,
+      "max_videos_length": 1,
+      "max_gifs_length": 0,
+      "max_length": 4,
+      "required": false,
+      "image_max_size_bytes": 1048576,
+      "video_max_size_bytes": 52428800,
+      "video_min_duration_seconds": 1,
+      "video_max_duration_seconds": 180
+    }
+  }
+}

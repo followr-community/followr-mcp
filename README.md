@@ -25,7 +25,7 @@ Once installed, you can ask Claude things like:
 
 The MCP exposes:
 
-- **65 tools** spanning post groups, posts, tags, folders, assets, avatars, voices, brand-voice prompts, Canva integration, Social Hub (DMs, comments, contacts), Autopilot rules, AI generation (text/image/audio/lipsync video), analytics, subscription balance, and workspace settings.
+- **67 tools** spanning post groups, posts (including `create_post` for attaching media per network), tags, folders, assets, avatars, voices, brand-voice prompts, Canva integration, Social Hub (DMs, comments, contacts), Autopilot rules, AI generation (text/image/audio/lipsync video), analytics, subscription balance, workspace settings, and cross-network spec validation (`validate_against_specs`) that warns about caption length, asset count/type/size, video duration, aspect ratio, and per-account constraints (Twitter Premium, TikTok tier) before publishing.
 - **6 resources** (catalog endpoints) for companies, calendars, brand voice, avatars, ElevenLabs voices, and individual post groups.
 - **5 prompts** (canned multi-tool workflows) for weekly briefs, campaign launches, video series, crisis response, and URL repurposing.
 

@@ -21,7 +21,7 @@ between minor versions until v1.0.
 - "List all unread DMs across my Facebook and Instagram accounts."
 - "Create a short avatar video with [avatar name] saying [script] for Instagram Reels."
 
-The MCP exposes 65 tools, 6 resources, and 5 canned workflows. Source code and
+The MCP exposes 67 tools, 6 resources, and 5 canned workflows. Source code and
 full tool list at https://github.com/followr-community/followr-mcp.
 
 ## Before you start
