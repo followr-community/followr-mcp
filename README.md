@@ -10,7 +10,7 @@ Followr workspace and operate it from natural language: schedule posts, generate
 content with AI, manage avatars and lipsync videos, run automations, triage the
 social inbox, and more.
 
-**Status:** v0.1 alpha. API surface is stabilizing; expect occasional changes
+**Status:** v0.3.0. API surface is stabilizing; expect occasional changes
 between minor versions until v1.0.
 
 ## What it does
@@ -25,7 +25,7 @@ Once installed, you can ask Claude things like:
 
 The MCP exposes:
 
-- **67 tools** spanning post groups, posts (including `create_post` for attaching media per network), tags, folders, assets, avatars, voices, brand-voice prompts, Canva integration, Social Hub (DMs, comments, contacts), Autopilot rules, AI generation (text/image/audio/lipsync video), analytics, subscription balance, workspace settings, and cross-network spec validation (`validate_against_specs`) that warns about caption length, asset count/type/size, video duration, aspect ratio, and per-account constraints (Twitter Premium, TikTok tier) before publishing.
+- **72 tools** spanning post groups (including `search_posts_by_topic` for semantic queries over the post history), posts (including `create_post` for attaching media per network), tags, folders, assets (`upload_image_from_url`, `delete_asset`), avatars, voices (`create_voice_from_elevenlabs`, `delete_voice`), brand-voice prompts, Canva integration, Social Hub (DMs, comments, contacts), Autopilot rules, AI generation (text/image/audio/lipsync video), analytics, subscription balance, company settings, session orientation (`get_session_context`), and cross-network spec validation (`validate_against_specs`) that warns about caption length, asset count/type/size, video duration, aspect ratio, and per-account constraints (Twitter Premium, TikTok tier) before publishing.
 - **6 resources** (catalog endpoints) for companies, calendars, brand voice, avatars, ElevenLabs voices, and individual post groups.
 - **5 prompts** (canned multi-tool workflows) for weekly briefs, campaign launches, video series, crisis response, and URL repurposing.
 

@@ -10,7 +10,7 @@ Followr workspace and operate it from natural language: schedule posts, generate
 content with AI, manage avatars and lipsync videos, run automations, triage the
 social inbox, and more.
 
-**Status:** v0.1 alpha. API surface is stabilizing; expect occasional changes
+**Status:** v0.3.0. API surface is stabilizing; expect occasional changes
 between minor versions until v1.0.
 
 ## What you can ask Claude after installing
@@ -21,8 +21,10 @@ between minor versions until v1.0.
 - "List all unread DMs across my Facebook and Instagram accounts."
 - "Create a short avatar video with [avatar name] saying [script] for Instagram Reels."
 
-The MCP exposes 67 tools, 6 resources, and 5 canned workflows. Source code and
-full tool list at https://github.com/followr-community/followr-mcp.
+The MCP exposes 72 tools, 6 resources, and 5 canned workflows. New since v0.2.0:
+`search_posts_by_topic` (semantic search over post history), `delete_voice`,
+`delete_asset`, and `get_session_context` (one-call orientation). Source code
+and full tool list at https://github.com/followr-community/followr-mcp.
 
 ## Before you start
 
