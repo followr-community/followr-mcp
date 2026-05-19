@@ -9,7 +9,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { FollowrClient } from "@followr-mcp/shared";
-import { registerFollowrTools } from "@followr-mcp/mcp-core";
+import { registerFollowrTools, FOLLOWR_SERVER_INSTRUCTIONS } from "@followr-mcp/mcp-core";
 
 const token = process.env["FOLLOWR_API_TOKEN"];
 if (!token) {
@@ -40,10 +40,15 @@ const client = new FollowrClient({
   ...(baseUrl ? { baseUrl } : {}),
 });
 
-const server = new McpServer({
-  name: "followr",
-  version: "0.2.0",
-});
+const server = new McpServer(
+  {
+    name: "followr",
+    version: "0.2.0",
+  },
+  {
+    instructions: FOLLOWR_SERVER_INSTRUCTIONS,
+  },
+);
 
 registerFollowrTools(server, client);
 

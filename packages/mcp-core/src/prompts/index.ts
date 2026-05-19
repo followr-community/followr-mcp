@@ -19,7 +19,7 @@ export function registerFollowrPrompts(
     {
       title: "Generate a week of scheduled posts from a brief",
       description:
-        "Take a free-form weekly brief and produce a full week of scheduled posts in the workspace. Anchors to the workspace's brand voice, picks suitable networks, drafts copy + images, and schedules across the week.",
+        "Take a free-form weekly brief and produce a full week of scheduled posts in the company. Anchors to the company's brand voice, picks suitable networks, drafts copy + images, and schedules across the week.",
       argsSchema: {
         company_id: z.string().describe("Followr company id."),
         brief: z.string().describe("Free-form brief for the week. Topics, hooks, must-mentions, banned terms, target audience notes."),
@@ -31,7 +31,7 @@ export function registerFollowrPrompts(
         starting_iso_date: z
           .string()
           .optional()
-          .describe("ISO 8601 date for day 1 of the week. Defaults to tomorrow at 10:00 in the workspace timezone."),
+          .describe("ISO 8601 date for day 1 of the week. Defaults to tomorrow at 10:00 in the company timezone."),
       },
     },
     ({ company_id, brief, networks, posts_per_day, starting_iso_date }) => ({
@@ -44,12 +44,12 @@ export function registerFollowrPrompts(
               `You are operating inside the Followr MCP. Plan and schedule a full week of social posts for company_id=${company_id} based on this brief:\n\n` +
               `<brief>\n${brief}\n</brief>\n\n` +
               `Constraints:\n` +
-              `- Networks: ${networks ?? "use every connected account in the workspace"}\n` +
+              `- Networks: ${networks ?? "use every connected account in the company"}\n` +
               `- Posts per day: ${posts_per_day ?? "1"}\n` +
-              `- Starting from: ${starting_iso_date ?? "tomorrow at 10:00 in the workspace timezone"}\n\n` +
+              `- Starting from: ${starting_iso_date ?? "tomorrow at 10:00 in the company timezone"}\n\n` +
               `Procedure:\n` +
               `1. Read the brand voice from the followr://company/${company_id}/brand resource.\n` +
-              `2. Read the workspace calendar from followr://company/${company_id}/calendar to avoid collisions.\n` +
+              `2. Read the company calendar from followr://company/${company_id}/calendar to avoid collisions.\n` +
               `3. Draft N post ideas honoring brand voice and brief.\n` +
               `4. For each idea: optionally generate an image with generate_image, then create_post_group + create_post for the chosen networks, then update_post_group with publish_at.\n` +
               `5. Return a summary: { post_group_id, publish_at, networks, title } for each scheduled post.`,
@@ -237,7 +237,7 @@ export function registerFollowrPrompts(
               `   - instagram: caption + ${include_visual === "false" ? "no image" : "1-3 generated images forming a carousel"}.\n` +
               `   - facebook: similar to linkedin, slightly more casual.\n` +
               `   - tiktok / youtube: if requested, generate a short script and (optionally) an avatar video via generate_avatar_video.\n` +
-              `   - medium (blog post): full repost in workspace voice with credit to source.\n` +
+              `   - medium (blog post): full repost in company voice with credit to source.\n` +
               `4. If include_visual is true, call generate_image once per format that needs visuals (use image_url=primary image of the source as reference for consistency).\n` +
               `5. Create one PostGroup tied together by a shared tag (find_or_create_tag). One post per network. Schedule with publish_at if provided.\n` +
               `6. Return a manifest: { source_url, post_group_id, posts: [{ network, draft_preview, asset_count }] }.`,

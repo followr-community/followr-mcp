@@ -34,9 +34,9 @@ export function registerFollowrResources(
     "companies",
     "followr://companies",
     {
-      title: "Workspaces catalog",
+      title: "Companies catalog",
       description:
-        "Catalog of Followr workspaces (companies) accessible to the current API token. Returns id, name, type, language, and timezone metadata. Read this once at session start to anchor which workspaces exist.",
+        "Catalog of Followr companies (companies) accessible to the current API token. Returns id, name, type, language, and timezone metadata. Read this once at session start to anchor which companies exist.",
       mimeType: "application/json",
     },
     async (uri) => {
@@ -104,9 +104,9 @@ export function registerFollowrResources(
       },
     }),
     {
-      title: "Workspace calendar (next 30 days)",
+      title: "Company calendar (next 30 days)",
       description:
-        "Read the scheduled posts of a workspace in a default window from 7 days ago to 23 days from now. For a custom date range, use the list_scheduled tool with explicit from_iso / to_iso instead.",
+        "Read the scheduled posts of a company in a default window from 7 days ago to 23 days from now. For a custom date range, use the list_scheduled tool with explicit from_iso / to_iso instead.",
       mimeType: "application/json",
     },
     async (uri, variables) => {
@@ -158,9 +158,9 @@ export function registerFollowrResources(
       },
     }),
     {
-      title: "Workspace brand voice and audience settings",
+      title: "Company brand voice and audience settings",
       description:
-        "Read the brand-related fields of a workspace: per-network brand voice prompts, AI preferences (driver/model defaults), audience ages/genders/types, tones, palettes, and language type. Use to anchor copy and image generation to the brand's voice.",
+        "Read the brand-related fields of a company: per-network brand voice prompts, AI preferences (driver/model defaults), audience ages/genders/types, tones, palettes, and language type. Use to anchor copy and image generation to the brand's voice.",
       mimeType: "application/json",
     },
     async (uri, variables) => {
@@ -220,9 +220,9 @@ export function registerFollowrResources(
       },
     }),
     {
-      title: "Avatars catalog for a workspace",
+      title: "Avatars catalog for a company",
       description:
-        "Read the avatar catalog of a workspace, hydrated with image, voice (with audio sample), and scenes. Use to pick an avatar before generate_avatar_video.",
+        "Read the avatar catalog of a company, hydrated with image, voice (with audio sample), and scenes. Use to pick an avatar before generate_avatar_video.",
       mimeType: "application/json",
     },
     async (uri, variables) => {

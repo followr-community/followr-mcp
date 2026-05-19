@@ -15,12 +15,17 @@
 import { FollowrClient } from "@followr-mcp/shared";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 
+export { FOLLOWR_SERVER_INSTRUCTIONS } from "./instructions.js";
+export { toolError, toolErrorFromException, ToolErrorException } from "./lib/tool-error.js";
+export type { ToolErrorOptions, ToolErrorResult, SuggestedAction } from "./lib/tool-error.js";
+
 import { registerAiResultsTools } from "./tools/ai-results.js";
 import { registerAnalyticsTools } from "./tools/analytics.js";
 import { registerAssetTools } from "./tools/assets.js";
 import { registerAvatarTools } from "./tools/avatars.js";
 import { registerCanvaTools } from "./tools/canva.js";
 import { registerCompanyTools } from "./tools/companies.js";
+import { registerContextTools } from "./tools/context.js";
 import { registerFolderTools } from "./tools/folders.js";
 import { registerPostGroupTools } from "./tools/post-groups.js";
 import { registerPostTools } from "./tools/posts.js";
@@ -32,7 +37,7 @@ import { registerTagTools } from "./tools/tags.js";
 import { registerUserTools } from "./tools/users.js";
 import { registerValidateTools } from "./tools/validate.js";
 import { registerVoiceTools } from "./tools/voices.js";
-import { registerWorkspaceSettingsTools } from "./tools/workspace-settings.js";
+import { registerCompanySettingsTools } from "./tools/company-settings.js";
 import { registerFollowrResources } from "./resources/index.js";
 import { registerFollowrPrompts } from "./prompts/index.js";
 
@@ -46,6 +51,7 @@ export function registerFollowrTools(
   client: FollowrClient,
   options: RegisterOptions = {},
 ): void {
+  registerContextTools(server, client, options);
   registerCompanyTools(server, client, options);
   registerPostGroupTools(server, client, options);
   registerPostTools(server, client, options);
@@ -59,7 +65,7 @@ export function registerFollowrTools(
   registerRuleGroupTools(server, client, options);
   registerSubscriptionTools(server, client, options);
   registerUserTools(server, client, options);
-  registerWorkspaceSettingsTools(server, client, options);
+  registerCompanySettingsTools(server, client, options);
   registerPromptTools(server, client, options);
   registerAnalyticsTools(server, client, options);
   registerAssetTools(server, client, options);

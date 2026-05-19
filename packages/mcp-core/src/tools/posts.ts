@@ -3,6 +3,8 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import type { RegisterOptions } from "../index.js";
+import { MUTATION } from "../lib/annotations.js";
+import { toolErrorFromException } from "../lib/tool-error.js";
 import { gatherRuntimeContext } from "../specs/runtime-context.js";
 import type { NetworkType, ProductType } from "../specs/types.js";
 import { validateAgainstSpec } from "../specs/validate.js";
@@ -58,16 +60,24 @@ export function registerPostTools(
   server.registerTool(
     "create_post",
     {
+      annotations: MUTATION,
       title: "Create a Post inside a PostGroup, attaching assets and copy",
-      description:
-        "Create a Post (per-network entry) within an existing PostGroup. This is the second step of the manual PostGroup → Post → Schedule workflow: after create_post_group, call create_post once per target social network, then update_post_group to set publish_at. Pre-validates the payload against per-network specs (caption length, asset count/type/size/aspect ratio, etc.) and returns advisory warnings alongside the created post. Warnings are informational — the post is always created. The caller (LLM or user) decides whether to act on warnings before scheduling.",
+      description: `Create a Post (per-network entry) within an existing PostGroup. This is the second step of the manual PostGroup -> Post -> Schedule workflow: after create_post_group, call create_post once per target social network, then update_post_group to set publish_at.
+
+PRECONDITION: The parent PostGroup must already exist in the user's chosen company. company_id is required to resolve account-specific limits (Twitter verified status, TikTok tier) for validation.
+
+VALIDATION: Pre-validates the payload against per-network specs (caption length, asset count/type/size/aspect ratio, etc.) and returns advisory warnings alongside the created post. The post is ALWAYS created; warnings don't block.
+
+WARNINGS HANDLING: Inspect each warning's severity. severity="error" indicates the post will likely fail at publish time (e.g. Instagram without an image, video too long for TikTok). Surface those to the user BEFORE proceeding to update_post_group / scheduling. severity="warning" or "info" can be presented as advisory; the user decides whether to fix or proceed.
+
+EARLIER VALIDATION: For tighter UX, call validate_against_specs at intent time (as soon as the user describes the post idea, networks, and assets) instead of waiting to validate after the post is built. That way blocking issues surface immediately, not after multiple steps.`,
       inputSchema: {
         post_group_id: z.number().int().positive().describe("Parent PostGroup id from create_post_group."),
         company_id: z
           .number()
           .int()
           .positive()
-          .describe("Followr workspace id. Required to resolve account-specific limits (Twitter verified, TikTok tier) for validation."),
+          .describe("Followr company id. Required to resolve account-specific limits (Twitter verified, TikTok tier) for validation."),
         social_network_type: z.enum(NETWORK_ENUM).describe("Target social network."),
         product_type: z
           .enum(PRODUCT_TYPE_ENUM)
@@ -92,6 +102,7 @@ export function registerPostTools(
       },
     },
     async (input) => {
+      try {
       // 1. Gather runtime context (Twitter verified, TikTok tier) with cache
       const context = await gatherRuntimeContext(input.company_id, input.social_network_type, client);
 
@@ -145,6 +156,9 @@ export function registerPostTools(
       return {
         content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
       };
+      } catch (err) {
+        return toolErrorFromException(err);
+      }
     },
   );
 }

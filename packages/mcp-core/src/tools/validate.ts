@@ -3,6 +3,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import type { RegisterOptions } from "../index.js";
+import { READ_ONLY } from "../lib/annotations.js";
 import { getSpec, getSpecsMeta } from "../specs/loader.js";
 import { gatherRuntimeContext } from "../specs/runtime-context.js";
 import type { NetworkType, ProductType, SpecKey } from "../specs/types.js";
@@ -40,15 +41,23 @@ export function registerValidateTools(
   server.registerTool(
     "validate_against_specs",
     {
+      annotations: READ_ONLY,
       title: "Validate a Post payload against social network specs (advisory)",
-      description:
-        "Check if a post (caption, assets, preferences) violates any social network rules before publishing. Returns advisory warnings; does NOT block. Use BEFORE expensive operations (generate_avatar_video, image generation, etc.) to avoid wasting credits on outputs the platform will reject. Asset metadata (size_bytes, width, height, duration_seconds) is optional — provide what you have, the validator skips checks for missing fields.",
+      description: `Check if a post (caption, assets, preferences) violates any social network rules before publishing. Returns advisory warnings with structured fields (field, rule, current_value, expected, severity, suggestion). Does NOT block; this tool never has side effects.
+
+CALL EARLY: as soon as the user describes intent (network + format + assets, even before creating the PostGroup). Surfacing blocking issues at intent time (e.g. "Instagram requires at least one image, and the user mentioned no image") avoids creating a PostGroup that can't be scheduled. Don't wait until create_post runs validation post-hoc.
+
+ALSO CALL BEFORE: expensive operations (generate_avatar_video at 775+ credits, generate_image, create_avatar_full_flow) to avoid spending credits on outputs the platform will reject anyway.
+
+WARNINGS HANDLING: severity="error" warnings will likely cause publish to fail; raise these to the user immediately and resolve before proceeding. severity="warning" and "info" are advisory; present them and let the user decide.
+
+ASSET METADATA: size_bytes, width, height, duration_seconds are optional. Provide what you have; the validator skips checks for missing fields. Provide as much as possible to catch issues early.`,
       inputSchema: {
         company_id: z
           .number()
           .int()
           .positive()
-          .describe("Followr workspace id. Required to resolve account-specific limits (Twitter verified, TikTok tier)."),
+          .describe("Followr company id. Required to resolve account-specific limits (Twitter verified, TikTok tier)."),
         network: z.enum(NETWORK_ENUM).describe("Target social network."),
         product_type: z
           .enum(PRODUCT_TYPE_ENUM)
