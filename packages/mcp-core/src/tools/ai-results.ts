@@ -356,9 +356,9 @@ MODEL: hardcoded to fal + veed_fabric_1.0 (the only lipsync model verified to wo
       title: "Generate a full multi-scene avatar video with burned-in subtitles",
       description: `Compound workflow that produces a complete multi-scene avatar video, mirroring Followr's "AI Video Avatars" UI flow. Internally:
 
-1. For each scene script (in parallel): generate TTS audio with the avatar's voice.
-2. Wait for audio jobs.
-3. For each scene (in parallel): generate avatar lipsync video using audio + avatar portrait.
+1. (Optional, when generate_backgrounds=true) For each scene: generate a unique image-to-image background that depicts the avatar in a scene matching the script context. Backgrounds are derived from a chat call that turns the scripts into visual prompts.
+2. For each scene script (in parallel): generate TTS audio with the avatar's voice.
+3. For each scene (in parallel): generate avatar lipsync video using audio + per-scene background (or avatar portrait directly when backgrounds are disabled).
 4. Wait for lipsync jobs.
 5. Concat all lipsync clips into one MP4 with burned-in subtitles via Creatomate (driver=creatomate, model=creatomate_video).
 
@@ -366,21 +366,64 @@ USE THIS WHEN: the user wants a real avatar video like the one Followr UI produc
 
 USE generate_avatar_lipsync_clip INSTEAD: when the user only wants a single-scene clip without subtitles or concat.
 
-CRITICAL: heavy operation. Cost is dynamic in Followr (depends on script length, aspect ratio, scene count); the UI typically shows 600-1100 credits for a 3-4 scene 9:16 video at Regular speed. Always confirm with the user before proceeding and surface get_credits_balance first.
+CRITICAL: heavy operation. Cost is dynamic in Followr (depends on script length, aspect ratio, scene count, and whether generate_backgrounds is enabled); the UI typically shows 600-1100 credits for a 3-4 scene 9:16 video at Regular speed without backgrounds, more with backgrounds enabled. Always confirm with the user before proceeding and surface get_credits_balance first.
 
 PRECONDITION: company_id + avatar_id required. The avatar MUST have a voice and an image attached. Verify with get_avatar before calling.
 
-SIMPLIFICATION vs Followr UI: this tool uses the avatar's portrait as the visual for every scene (talking head). The Followr UI generates a unique image-to-image background per scene; that level of visual variety is a future enhancement.
+VISUAL OPTIONS:
+- generate_backgrounds=true (recommended for polished output): each scene gets a unique image-to-image background that depicts the avatar in a context matching the script. This mirrors Followr's UI default and produces the "real" avatar video look. Adds ~30-100 credits per scene + 30-60s latency.
+- generate_backgrounds=false (default, faster + cheaper): every scene uses the avatar's portrait directly as the lipsync image. Talking head with a static background. Faster + cheaper but less polished.
 
-LATENCY: typically 3-5 minutes for a 3-4 scene video. Configurable via timeout_seconds.
+LATENCY: typically 3-5 minutes without backgrounds, 5-8 minutes with. Configurable via timeout_seconds.
 
-SUBTITLES: burned in by default with Followr's default style (Montserrat 700, 9.29 vmin font size, white text + #0095a6 highlight color, dark stroke, highlight effect, 14 char max per line, positioned at 82% from top). Override via subtitle_* params.`,
+SUBTITLES: burned in by default with Followr's default style (Montserrat 700, 9.29 vmin font size, white text + #0095a6 highlight color, dark stroke, highlight effect, 14 char max per line, positioned at 82% from top). Override via subtitle_* params.
+
+SCENE ANIMATIONS: optional camera animation per scene via scene_animation. 'zoom_in' adds a gradual 100%->110% scale across each scene (subtle parallax feel). Mirrors Followr UI Scene Animations toggle.
+
+SCENE TRANSITIONS: optional transition between scenes via scene_transition. 'slide_left' makes each new scene slide in from the right (1 second). First scene never has a transition (no previous scene). Mirrors Followr UI Scene Transitions toggle.`,
       inputSchema: {
         company_id: z.number().int().positive(),
         avatar_id: z.number().int().positive().describe("Avatar with voice + image attached."),
         scripts: z.array(z.string().min(1).max(500)).min(1).max(10).describe("One script per scene. 1 to 10 scenes. Typical 80-150 chars each. May include ElevenLabs emotion tags like [excited] [confident] [whispers] [pause]. Each script becomes one scene in the final video."),
         aspect_ratio: z.enum(["16:9", "9:16"]).optional().describe("9:16 (vertical, default, for Reels/Shorts/TikTok) or 16:9 (landscape). Default 9:16."),
         audio_speed: z.number().min(0.5).max(2.0).optional().describe("TTS speed applied to every scene. Default 1.0."),
+        generate_backgrounds: z.boolean().optional().describe("If true, generate a unique image-to-image background per scene (using the avatar as visual reference) instead of reusing the avatar portrait. Mirrors Followr UI default. Adds latency and credits. Default false."),
+        background_style: z.string().optional().describe("Optional visual style hint for generated backgrounds, applied to every scene. Examples: 'modern content studio', 'outdoor adventurous', 'minimalist office', 'cinematic moody'. Ignored when generate_backgrounds is false."),
+        reference_image_urls: z.array(z.string().url()).max(5).optional().describe("Optional URLs of additional reference images applied to EVERY scene's background generation. Use to show a product, logo, or wardrobe item the avatar should hold or wear. Combined with the avatar portrait as visual anchors in image-to-image mode (so the avatar stays visually consistent while incorporating the references). Examples: a product photo, a brand logo, a uniform. Up to 5 images. Ignored when generate_backgrounds is false."),
+        scene_reference_images: z.record(z.string().regex(/^\d+$/), z.array(z.string().url()).max(5)).optional().describe("Optional per-scene override of reference_image_urls. Map keys are scene indices as strings ('0', '1', '2', ...); values are arrays of URLs. When a scene index is present here, those URLs REPLACE reference_image_urls for that scene. Use to show different products per scene (e.g. scene 0 holds a handbag, scene 1 holds a mug with logo). Ignored when generate_backgrounds is false."),
+        scene_animation: z.enum([
+          "none",
+          "zoom_in",
+          "zoom_out",
+          "pan_left",
+          "pan_right",
+          "pan_up",
+          "pan_down",
+        ]).optional().describe(`Optional per-scene camera animation applied to every scene's video. Mirrors the 'Scene Animations' selector in Followr UI > Avatar Video Creator > Step 3. Pick the one that matches the scene's mood:
+
+- 'none' (default): static camera, no movement. Use for talking-head clips, formal/educational content, or when subtitles need maximum readability.
+- 'zoom_in': camera slowly pushes in toward the subject across the scene (100% -> 110%). Adds intimacy and intensity; great for emotional hooks, product reveals, dramatic statements.
+- 'zoom_out': camera slowly pulls back (110% -> 100%). Adds context and openness; great for closing scenes, summary statements, "big picture" framing.
+- 'pan_left' / 'pan_right': horizontal camera drift (subtle ~10% sweep). Adds cinematic motion; great for storytelling beats and keeping the eye moving on long talking-head scenes.
+- 'pan_up' / 'pan_down': vertical camera drift. 'pan_up' often feels uplifting (good for inspiring conclusions); 'pan_down' feels grounding.
+
+Shape detail: each animation is encoded as an element-scoped block inside the video's 'animations' array in the Creatomate render_script. 'zoom_*' uses type=scale with start_scale/end_scale; 'pan_*' uses type=pan with start_x/end_x/start_y/end_y coords. Shapes empirically verified for zoom_in and pan_left; directional siblings (zoom_out, pan_right/up/down) derived by coordinate swap of the verified pattern.`),
+        scene_transition: z.enum([
+          "none",
+          "slide_left",
+          "slide_right",
+          "slide_up",
+          "slide_down",
+          "wipe_left",
+          "wipe_right",
+        ]).optional().describe(`Optional transition effect between consecutive scenes. Mirrors the 'Scene Transitions' selector in Followr UI > Avatar Video Creator > Step 3. Applied to scenes 2 onwards (first scene never has a transition since there's no previous scene). Duration is fixed 1 second.
+
+- 'none' (default): hard cut between scenes. Clean and punchy; works for fast-paced content and when you want zero distraction.
+- 'slide_left' / 'slide_right': new scene slides in from one side. Slide Left = enters from the right edge. Slide Right = enters from the left edge. Modern, social-feed feel; widely used for Reels/Shorts.
+- 'slide_up' / 'slide_down': vertical slide. 'slide_up' (enters from below) feels like turning a page or revealing the next idea. 'slide_down' is less common.
+- 'wipe_left' / 'wipe_right': a sweeping reveal that wipes over the previous scene (more graphic, less physical than slide). Use for clean topic changes or section breaks.
+
+Shape detail: each transition is encoded as a video-element-scoped block inside the 'animations' array with transition=true. 'slide_*' uses type=slide with direction in degrees (180° = from right = Slide Left; 0°/90°/270° = right/up/down inferred). 'wipe_*' uses type=wipe with x_anchor percentage. Shapes empirically verified for slide_left and wipe_left; siblings derived by symmetric inference. Other Followr transitions (Scale, Flip, Rotate Slide, Spin, Circular Wipe, Color Wipe, Squash) have unique shapes per type and are NOT exposed yet — each needs its own empirical pass before being safely wired up.`),
         subtitle_text_color: z.string().optional().describe("Hex color for subtitle text. Default #ffffff (white)."),
         subtitle_highlight_color: z.string().optional().describe("Hex color for the active highlighted word. Default #0095a6 (Followr brand teal)."),
         subtitle_max_chars: z.number().int().min(8).max(40).optional().describe("Max characters shown at once in subtitles. Default 14."),
@@ -394,6 +437,12 @@ SUBTITLES: burned in by default with Followr's default style (Montserrat 700, 9.
       scripts,
       aspect_ratio,
       audio_speed,
+      generate_backgrounds,
+      background_style,
+      reference_image_urls,
+      scene_reference_images,
+      scene_animation,
+      scene_transition,
       subtitle_text_color,
       subtitle_highlight_color,
       subtitle_max_chars,
@@ -437,6 +486,123 @@ SUBTITLES: burned in by default with Followr's default style (Montserrat 700, 9.
         // fast (~10-15s) but lipsync renders can take 60-120s each in parallel.
         const perJobTimeoutMs = Math.max(60_000, Math.floor(totalTimeoutMs / 4));
         const finalAspectRatio = aspect_ratio ?? "9:16";
+
+        // === Phase 0 (optional): per-scene background generation. ===
+        // When generate_backgrounds=true: ask Followr's chat to turn each script
+        // into an image prompt, then image-to-image gen per scene using the
+        // avatar's portrait as the visual reference (image_url + image_urls).
+        // The resulting URLs replace avatar.image.url as the lipsync image,
+        // giving each scene its own contextual background while keeping the
+        // avatar visually consistent. When false (default): every scene
+        // reuses the avatar portrait directly (talking head).
+        let lipsyncImageUrls: string[] = scripts.map(() => avatarImageUrl);
+        let backgroundAiResultIds: number[] = [];
+        if (generate_backgrounds) {
+          const styleHint = background_style ? ` Style hint: ${background_style}.` : "";
+          const chatPrompt =
+            `For each of the ${scripts.length} short on-camera video scripts below, write ONE image generation prompt. Each prompt must describe a scene matching its script's tone and content, with the on-camera character (the avatar) visible from waist up in a portrait composition. Keep each prompt under 200 words. Return ONLY a JSON array of ${scripts.length} strings, no other text, no markdown code fences.${styleHint}\n\nScripts: ${JSON.stringify(scripts)}`;
+          const chatInitial = await client.generateChat({
+            q: chatPrompt,
+            company_id,
+            chargeable: 1,
+          });
+          const chatFinal = await client.waitForAiResult(chatInitial.id, {
+            timeoutMs: Math.max(60_000, Math.floor(perJobTimeoutMs / 2)),
+          });
+          if (chatFinal.status !== "completed" || !chatFinal.response) {
+            return toolError({
+              reason: "background_prompts_failed",
+              user_message: `Chat call to derive scene visual prompts failed (status=${chatFinal.status})${chatFinal.status_message ? `: ${chatFinal.status_message}` : ""}. You can retry with generate_backgrounds=false to skip this step and use the avatar's portrait as the background for every scene.`,
+              suggested_actions: [
+                {
+                  tool: "get_credits_balance",
+                  rationale: "Check credit balance.",
+                },
+              ],
+              details: { ai_result_id: chatFinal.id, status: chatFinal.status },
+            });
+          }
+          let imagePrompts: string[];
+          try {
+            const cleaned = chatFinal.response
+              .replace(/^\s*```(?:json)?\s*/m, "")
+              .replace(/\s*```\s*$/m, "")
+              .trim();
+            const parsed: unknown = JSON.parse(cleaned);
+            if (!Array.isArray(parsed) || parsed.length !== scripts.length) {
+              throw new Error(
+                `expected JSON array of ${scripts.length} strings, got ${Array.isArray(parsed) ? `${parsed.length} items` : typeof parsed}`,
+              );
+            }
+            imagePrompts = parsed.map((p) => String(p));
+          } catch {
+            // Fallback: build generic per-script prompts so the flow still works
+            // even if the chat model returned malformed output. Quality is lower
+            // but the user still gets a finished video.
+            imagePrompts = scripts.map(
+              (s) =>
+                `Professional photograph of the on-camera character in a scene matching this script: "${s.slice(0, 200)}". Portrait orientation, visible from waist up, soft cinematic lighting.${styleHint}`,
+            );
+          }
+          // Image-to-image gen per scene. Hardcoded fal + nano_banana_2 (the
+          // model Followr's UI uses for this step; image-to-image mode is
+          // activated by passing image_url + image_urls with references).
+          // Reference logic per scene:
+          //   1. avatar portrait is always included as visual anchor.
+          //   2. if scene_reference_images has an entry for this scene index,
+          //      those URLs are appended (per-scene override).
+          //   3. else if reference_image_urls is set, those are appended (global).
+          // This lets the caller put a product / logo / outfit in some or all
+          // scenes (e.g. scene 0 with a handbag, scene 1 with a mug+logo).
+          const imageInitials = await Promise.all(
+            imagePrompts.map((prompt, i) => {
+              const perSceneRefs = scene_reference_images?.[String(i)];
+              const sceneRefs = perSceneRefs ?? reference_image_urls ?? [];
+              const imageUrls = [avatarImageUrl, ...sceneRefs];
+              return client.generateImage({
+                q: prompt,
+                company_id,
+                n: 1,
+                chargeable: 1,
+                aspect_ratio: finalAspectRatio,
+                driver: "fal",
+                model: "nano_banana_2",
+                image_url: avatarImageUrl,
+                image_urls: imageUrls,
+                queue: true,
+              });
+            }),
+          );
+          const imageFinals = await Promise.all(
+            imageInitials.map((init) =>
+              client.waitForAiResult(init.id, { timeoutMs: perJobTimeoutMs }),
+            ),
+          );
+          const failedImageIdx = imageFinals.findIndex(
+            (img) => img.status !== "completed" || !img.response,
+          );
+          if (failedImageIdx >= 0) {
+            const failed = imageFinals[failedImageIdx]!;
+            return toolError({
+              reason: "background_generation_failed",
+              user_message: `Background image for scene ${failedImageIdx + 1} of ${scripts.length} failed (status=${failed.status})${failed.status_message ? `: ${failed.status_message}` : ""}. Retry with generate_backgrounds=false to skip the per-scene background step and use the avatar's portrait for all scenes.`,
+              suggested_actions: [
+                {
+                  tool: "get_credits_balance",
+                  rationale: "Check credit balance.",
+                },
+              ],
+              details: {
+                failed_scene_index: failedImageIdx,
+                ai_result_id: failed.id,
+                status: failed.status,
+                status_message: failed.status_message ?? null,
+              },
+            });
+          }
+          lipsyncImageUrls = imageFinals.map((img) => img.response!);
+          backgroundAiResultIds = imageFinals.map((img) => img.id);
+        }
 
         // === Phase 1: TTS audio per scene (parallel submit + parallel wait). ===
         const audioInitials = await Promise.all(
@@ -483,13 +649,15 @@ SUBTITLES: burned in by default with Followr's default style (Montserrat 700, 9.
         const audioUrls = audioFinals.map((a) => a.response!);
 
         // === Phase 2: Lipsync render per scene (parallel). HARDCODE model. ===
+        // image_url is either the avatar portrait (default) or a per-scene
+        // image-to-image background (when generate_backgrounds=true).
         const videoInitials = await Promise.all(
           scripts.map((script, i) =>
             client.generateVideo({
               type: "video",
               q: script,
               audio_url: audioUrls[i]!,
-              image_url: avatarImageUrl,
+              image_url: lipsyncImageUrls[i]!,
               aspect_ratio: finalAspectRatio,
               driver: "fal",
               model: "veed_fabric_1.0",
@@ -537,14 +705,70 @@ SUBTITLES: burned in by default with Followr's default style (Montserrat 700, 9.
         const isPortrait = finalAspectRatio === "9:16";
         const renderWidth = isPortrait ? 768 : 1376;
         const renderHeight = isPortrait ? 1376 : 768;
+        // Estimate per-scene duration from script length. ElevenLabs tts_3 reads
+        // roughly 0.06-0.07s per character; add a small buffer for natural
+        // pauses. Used to set the `duration` of the scale animation so it spans
+        // the whole scene. If the estimate drifts, the animation ends slightly
+        // before or after the lipsync ends but the video still composes cleanly.
+        const estimateSceneDuration = (script: string): number => {
+          return Math.min(30, Math.max(2, script.length * 0.07 + 0.5));
+        };
         const elements: Array<Record<string, unknown>> = [];
         lipsyncUrls.forEach((url, i) => {
           const videoId = `video-scene-${i + 1}`;
+          const sceneDuration = estimateSceneDuration(scripts[i]!);
+          // Build the animations array per video element based on options.
+          // Empirically verified shapes (2026-05-19, sesión 7):
+          //   - zoom_in / zoom_out: type="scale", scope="element", with
+          //     start_scale/end_scale percentages. easing="linear", fade=false.
+          //   - pan_*: type="pan", scope="element", with start_x/start_y/end_x/end_y
+          //     percentages. easing="linear".
+          //   - slide_*: type="slide", transition=true, direction in degrees,
+          //     time=0, duration=1.
+          //   - wipe_*: type="wipe", transition=true, x_anchor percentage,
+          //     easing="cubic-in-out", duration=1.
+          //
+          // Only zoom_in, pan_left, slide_left, wipe_left were verified by raw
+          // capture; the other directional siblings are derived by swapping
+          // coordinates (pan, zoom) or degrees (slide) on the verified pattern.
+          // First scene never gets a transition (no previous scene to enter from).
+          const animations: Array<Record<string, unknown>> = [];
+          if (scene_animation && scene_animation !== "none") {
+            if (scene_animation === "zoom_in") {
+              animations.push({ type: "scale", scope: "element", start_scale: "100%", end_scale: "110%", easing: "linear", fade: false, time: 0, duration: sceneDuration });
+            } else if (scene_animation === "zoom_out") {
+              animations.push({ type: "scale", scope: "element", start_scale: "110%", end_scale: "100%", easing: "linear", fade: false, time: 0, duration: sceneDuration });
+            } else if (scene_animation === "pan_left") {
+              animations.push({ type: "pan", scope: "element", start_x: "55%", start_y: "50%", end_x: "45%", end_y: "50%", easing: "linear", time: 0, duration: sceneDuration });
+            } else if (scene_animation === "pan_right") {
+              animations.push({ type: "pan", scope: "element", start_x: "45%", start_y: "50%", end_x: "55%", end_y: "50%", easing: "linear", time: 0, duration: sceneDuration });
+            } else if (scene_animation === "pan_up") {
+              animations.push({ type: "pan", scope: "element", start_x: "50%", start_y: "55%", end_x: "50%", end_y: "45%", easing: "linear", time: 0, duration: sceneDuration });
+            } else if (scene_animation === "pan_down") {
+              animations.push({ type: "pan", scope: "element", start_x: "50%", start_y: "45%", end_x: "50%", end_y: "55%", easing: "linear", time: 0, duration: sceneDuration });
+            }
+          }
+          if (scene_transition && scene_transition !== "none" && i > 0) {
+            if (scene_transition === "slide_left") {
+              animations.push({ type: "slide", transition: true, direction: "180°", time: 0, duration: 1 });
+            } else if (scene_transition === "slide_right") {
+              animations.push({ type: "slide", transition: true, direction: "0°", time: 0, duration: 1 });
+            } else if (scene_transition === "slide_up") {
+              animations.push({ type: "slide", transition: true, direction: "90°", time: 0, duration: 1 });
+            } else if (scene_transition === "slide_down") {
+              animations.push({ type: "slide", transition: true, direction: "270°", time: 0, duration: 1 });
+            } else if (scene_transition === "wipe_left") {
+              animations.push({ type: "wipe", transition: true, x_anchor: "100%", easing: "cubic-in-out", time: 0, duration: 1 });
+            } else if (scene_transition === "wipe_right") {
+              animations.push({ type: "wipe", transition: true, x_anchor: "0%", easing: "cubic-in-out", time: 0, duration: 1 });
+            }
+          }
           elements.push({
             type: "video",
             id: videoId,
             source: url,
             track: i * 2 + 1,
+            ...(animations.length > 0 ? { animations } : {}),
           });
           elements.push({
             type: "text",
@@ -616,6 +840,11 @@ SUBTITLES: burned in by default with Followr's default style (Montserrat 700, 9.
                   avatar_name: avatar.name,
                   scene_count: scripts.length,
                   aspect_ratio: finalAspectRatio,
+                  backgrounds_generated: generate_backgrounds === true,
+                  background_ai_result_ids: backgroundAiResultIds,
+                  lipsync_image_urls: lipsyncImageUrls,
+                  scene_animation: scene_animation ?? "none",
+                  scene_transition: scene_transition ?? "none",
                   audio_ai_result_ids: audioFinals.map((a) => a.id),
                   lipsync_ai_result_ids: videoFinals.map((v) => v.id),
                   individual_lipsync_urls: lipsyncUrls,

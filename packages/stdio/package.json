@@ -1,6 +1,6 @@
 {
   "name": "@followr/mcp",
-  "version": "0.3.2",
+  "version": "0.3.3",
   "description": "Followr MCP server. Connect Claude (and any MCP-compatible AI agent) to your Followr workspace to manage posts, generate AI content, work with avatars and videos, and orchestrate social media workflows from natural language.",
   "type": "module",
   "bin": {
@@ -22,8 +22,8 @@
     "zod": "^3.23.0"
   },
   "devDependencies": {
-    "@followr-mcp/mcp-core": "0.3.2",
-    "@followr-mcp/shared": "0.3.2",
+    "@followr-mcp/mcp-core": "0.3.3",
+    "@followr-mcp/shared": "0.3.3",
     "tsup": "^8.3.0"
   },
   "engines": {
