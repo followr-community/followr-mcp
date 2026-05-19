@@ -72,8 +72,8 @@ ASYNC: wait=true (default) blocks until completion. wait=false returns immediate
     "generate_image",
     {
       annotations: MUTATION_OPEN_WORLD,
-      title: "Generate an image with Followr AI",
-      description: `Generate an image using Followr's AI image endpoint.
+      title: "Generate an AI image with Followr (text-to-image, image-to-image, product photo, social creative)",
+      description: `Generate an image (creative, illustration, photo-style render, product visual, social post artwork, hero banner) using Followr's AI image endpoint. Supports text-to-image and image-to-image (pass image_url for subject consistency).
 
 CRITICAL: consumes around 25 credits per image. Before batch generations (n>1 or repeated calls), call get_credits_balance and surface the cost to the user. Don't auto-generate multiple variants without explicit user consent.
 
@@ -207,7 +207,7 @@ ASYNC: wait=true (default) blocks. wait=false returns pending id.`,
     "generate_avatar_lipsync_clip",
     {
       annotations: MUTATION_OPEN_WORLD,
-      title: "Generate one avatar lipsync clip (single scene, no subtitles or concat)",
+      title: "Generate one avatar lipsync clip (single talking-head scene, no subtitles, no concat, fast quote)",
       description: `Compound workflow that produces a single avatar lipsync video clip. Internally: 1) fetch the avatar's voice + image, 2) generate TTS audio with the avatar's voice, 3) wait for audio, 4) generate the lipsync video (avatar talking head).
 
 USE THIS WHEN: the user wants a quick single-scene clip without subtitles or multi-scene concatenation. For the standard "AI Video Avatars" multi-scene flow with burned-in subtitles, use generate_avatar_video instead.
@@ -353,7 +353,7 @@ MODEL: hardcoded to fal + veed_fabric_1.0 (the only lipsync model verified to wo
     "generate_avatar_video",
     {
       annotations: MUTATION_OPEN_WORLD,
-      title: "Generate a full multi-scene avatar video with burned-in subtitles",
+      title: "Generate a full multi-scene avatar video with burned-in subtitles (reel, short, TikTok video, talking-head explainer, promo, ad)",
       description: `Compound workflow that produces a complete multi-scene avatar video, mirroring Followr's "AI Video Avatars" UI flow. Internally:
 
 1. (Optional, when generate_backgrounds=true) For each scene: generate a unique image-to-image background that depicts the avatar in a scene matching the script context. Backgrounds are derived from a chat call that turns the scripts into visual prompts.
@@ -362,9 +362,16 @@ MODEL: hardcoded to fal + veed_fabric_1.0 (the only lipsync model verified to wo
 4. Wait for lipsync jobs.
 5. Concat all lipsync clips into one MP4 with burned-in subtitles via Creatomate (driver=creatomate, model=creatomate_video).
 
-USE THIS WHEN: the user wants a real avatar video like the one Followr UI produces from Avatar Video Creator (multi-scene, with subtitles, ready to publish to Reels/Shorts/TikTok).
+USE THIS WHEN: the user wants a real avatar video like the one Followr UI produces from Avatar Video Creator (multi-scene, with subtitles, ready to publish to Reels/Shorts/TikTok). This is the flagship video tool of Followr.
 
-USE generate_avatar_lipsync_clip INSTEAD: when the user only wants a single-scene clip without subtitles or concat.
+FLEXIBLE DURATION: total length is the sum of TTS audio across scenes (1 to 10 scenes per call). Typical: 3 scenes of ~10s of speech each = ~30-60s total; a 5-scene LinkedIn piece can reach 1-2 min. There is NO fixed duration cap from the tool. Use this whenever the user needs content longer than 8 seconds or any narrative / scripted-speech video.
+
+WHEN TO USE THE OTHER VIDEO TOOLS INSTEAD:
+- Single talking head, one scene, no subtitles: use generate_avatar_lipsync_clip.
+- Single 8-second visual clip WITHOUT a talking avatar (product motion, lifestyle moment, scenic loop): use generate_ai_video_clip.
+- The user already has footage they want to publish: skip generation, use upload_video_from_url.
+
+OUTFIT PRESERVATION: when the avatar portrait shows a specific outfit that must appear in EVERY scene (fashion brand reels, product showcase with the avatar wearing the brand, lifestyle reels for a recurring look), pass outfit_description with a precise text of the clothing (e.g. "gray bomber jacket with black collar, white tee, dark jeans"). Without this, the AI may interpret clothing differently per scene based on script context (e.g. a "beach" script may put the avatar in swimwear even if the portrait shows winter wear).
 
 CRITICAL: heavy operation. Cost is dynamic in Followr (depends on script length, aspect ratio, scene count, and whether generate_backgrounds is enabled); the UI typically shows 600-1100 credits for a 3-4 scene 9:16 video at Regular speed without backgrounds, more with backgrounds enabled. Always confirm with the user before proceeding and surface get_credits_balance first.
 
@@ -389,6 +396,7 @@ SCENE TRANSITIONS: optional transition between scenes via scene_transition. 'sli
         audio_speed: z.number().min(0.5).max(2.0).optional().describe("TTS speed applied to every scene. Default 1.0."),
         generate_backgrounds: z.boolean().optional().describe("If true, generate a unique image-to-image background per scene (using the avatar as visual reference) instead of reusing the avatar portrait. Mirrors Followr UI default. Adds latency and credits. Default false."),
         background_style: z.string().optional().describe("Optional visual style hint for generated backgrounds, applied to every scene. Examples: 'modern content studio', 'outdoor adventurous', 'minimalist office', 'cinematic moody'. Ignored when generate_backgrounds is false."),
+        outfit_description: z.string().optional().describe("Optional precise description of the clothing the avatar must wear in EVERY scene. Injected into the background-prompt chat so the AI does not reinterpret the outfit based on script context. Use for fashion brands, product showcases, or any reel where the avatar's look must stay consistent (e.g. 'gray bomber jacket with black collar, white tee, dark jeans'). Without this, the AI defers to the avatar's portrait and may drift between scenes. Ignored when generate_backgrounds is false."),
         reference_image_urls: z.array(z.string().url()).max(5).optional().describe("Optional URLs of additional reference images applied to EVERY scene's background generation. Use to show a product, logo, or wardrobe item the avatar should hold or wear. Combined with the avatar portrait as visual anchors in image-to-image mode (so the avatar stays visually consistent while incorporating the references). Examples: a product photo, a brand logo, a uniform. Up to 5 images. Ignored when generate_backgrounds is false."),
         scene_reference_images: z.record(z.string().regex(/^\d+$/), z.array(z.string().url()).max(5)).optional().describe("Optional per-scene override of reference_image_urls. Map keys are scene indices as strings ('0', '1', '2', ...); values are arrays of URLs. When a scene index is present here, those URLs REPLACE reference_image_urls for that scene. Use to show different products per scene (e.g. scene 0 holds a handbag, scene 1 holds a mug with logo). Ignored when generate_backgrounds is false."),
         scene_animation: z.enum([
@@ -439,6 +447,7 @@ Shape detail: each transition is encoded as a video-element-scoped block inside 
       audio_speed,
       generate_backgrounds,
       background_style,
+      outfit_description,
       reference_image_urls,
       scene_reference_images,
       scene_animation,
@@ -499,8 +508,23 @@ Shape detail: each transition is encoded as a video-element-scoped block inside 
         let backgroundAiResultIds: number[] = [];
         if (generate_backgrounds) {
           const styleHint = background_style ? ` Style hint: ${background_style}.` : "";
+          // Character description: prefer explicit outfit_description (precise,
+          // takes precedence) over the avatar's stored description (looser).
+          // Either of them is injected as a hard constraint into the chat
+          // prompt so every scene's background respects the avatar's identity
+          // and clothing, instead of letting the script context drift the look.
+          const characterParts: string[] = [];
+          if (avatar.description) {
+            characterParts.push(`Character description: ${avatar.description}`);
+          }
+          if (outfit_description) {
+            characterParts.push(
+              `OUTFIT CONSTRAINT (every scene MUST preserve this exactly, do not change clothes between scenes even if the script implies a different setting): ${outfit_description}`,
+            );
+          }
+          const characterHint = characterParts.length > 0 ? `\n\n${characterParts.join("\n")}` : "";
           const chatPrompt =
-            `For each of the ${scripts.length} short on-camera video scripts below, write ONE image generation prompt. Each prompt must describe a scene matching its script's tone and content, with the on-camera character (the avatar) visible from waist up in a portrait composition. Keep each prompt under 200 words. Return ONLY a JSON array of ${scripts.length} strings, no other text, no markdown code fences.${styleHint}\n\nScripts: ${JSON.stringify(scripts)}`;
+            `For each of the ${scripts.length} short on-camera video scripts below, write ONE image generation prompt. Each prompt must describe a scene matching its script's tone and content, with the on-camera character (the avatar) visible from waist up in a portrait composition. Keep each prompt under 200 words. Return ONLY a JSON array of ${scripts.length} strings, no other text, no markdown code fences.${styleHint}${characterHint}\n\nScripts: ${JSON.stringify(scripts)}`;
           const chatInitial = await client.generateChat({
             q: chatPrompt,
             company_id,
@@ -856,6 +880,102 @@ Shape detail: each transition is encoded as a video-element-scoped block inside 
             },
           ],
         };
+      } catch (err) {
+        return toolErrorFromException(err);
+      }
+    },
+  );
+
+  // Tool: generate_ai_video_clip.
+  // Text-to-video (and optionally image-to-video) single short clip via
+  // Followr's AI Videos catalog: Veo 3 family, Wan 2, SeeDance, Hailuo.
+  // Distinct from the avatar tools: NO avatar, NO lipsync, NO subtitles, NO
+  // concat. One single 8-second clip per call (length is decided by the
+  // model itself, not an input). For multi-scene / longer / talking-head
+  // content, the agent should use generate_avatar_video instead.
+  //
+  // Catalog is hardcoded because the backend does not yet expose a models
+  // listing endpoint (see docs/followr-api/_gaps.md). When that lands, swap
+  // the enum for a free string and add a list_ai_video_models tool.
+  const AI_VIDEO_MODEL_ENUM = [
+    "veo_3_1_fast",
+    "veo_3_fast",
+    "veo_3_1",
+    "veo_3",
+    "wan_2",
+    "seedance_1_1_light",
+    "seedance_1_1_pro",
+    "seedance_2_0_fast",
+    "seedance_2_0",
+    "hailuo_0_2_standard",
+    "hailuo_0_2_premium",
+  ] as const;
+
+  server.registerTool(
+    "generate_ai_video_clip",
+    {
+      annotations: MUTATION_OPEN_WORLD,
+      title: "Generate a single short AI video clip (no avatar, no lipsync)",
+      description: `Generate a single short AI video clip via Followr's AI Videos catalog (Veo, Wan, SeeDance, Hailuo). Wraps POST /api/aiResults/video for text-to-video, and image-to-video on models that support image_url.
+
+WHAT THIS IS: one single video clip, no avatar speaking, no subtitles, no scene concatenation. The model itself decides the clip length (around 8 seconds for the recommended Veo 3 family). Per-call output is one clip.
+
+WHAT THIS IS NOT:
+- NOT a multi-scene avatar reel. For that use generate_avatar_video (flexible duration, subtitles, concat handled internally).
+- NOT a talking head with lipsync. For that use generate_avatar_lipsync_clip or generate_avatar_video.
+- NOT a way to stitch multiple clips. There is no built-in concat for AI video clips today; do not promise the user a longer assembled video. If the user needs >8s, propose generate_avatar_video.
+
+RECOMMENDED MODELS (all produce ~8-second clips, the three Veo defaults for general use):
+- veo_3_1_fast (50 cr): cheapest of the recommended set. Use only for genuinely disposable content, internal tests, or quick idea checks.
+- veo_3_fast (400 cr): safer default for real social-media content. Good quality / cost balance.
+- veo_3_1 (600 cr): hero piece, launch promo, key shot. Better subject consistency and motion fidelity than veo_3_fast.
+
+ALSO AVAILABLE (the agent should NOT auto-pick these — surface them only if the user explicitly asks for a non-Veo model or a different cost point): veo_3 (1000 cr, never use without explicit user authorization), wan_2 (150), seedance_1_1_light (20), seedance_1_1_pro (40), seedance_2_0_fast (100), seedance_2_0 (175), hailuo_0_2_standard (20), hailuo_0_2_premium (30). Empirical quality / behavior of non-Veo models is not yet documented per-model.
+
+CHOOSING A MODEL: do NOT auto-pick the cheapest model to "validate" the prompt. If the result fails, you cannot tell whether the prompt or the model is at fault, and regenerating with a higher-quality model means paying twice. Instead, ASK the user about the quality bar before picking. If the user has no preference, default to veo_3_fast and surface the cost via get_credits_balance before calling. Never call veo_3 (1000 cr) without explicit user authorization of the cost.
+
+PROMPT DESIGN FOR ~8 SECONDS: each recommended model produces ONE clip of roughly 8 seconds. Write the prompt as a SINGLE visual scene with one action, NOT a narrative sequence.
+- Good: "Close-up of a person typing on a laptop in a warm café, steam rising from coffee, static camera, golden-hour light, shallow depth of field, cinematic 35mm look."
+- Bad: "Person enters café, sits down, opens laptop, sips coffee, starts typing" (that is a 20s sequence; the model will cram it and the result feels rushed).
+Describe: subject, action, setting, lighting, camera framing, mood. Avoid scene cuts, beats, or chronological steps.
+
+PRECONDITION: company_id required. If multiple companies and the user hasn't named one, call list_companies first and ask by name. Cost is charged to the company's plan.
+
+LATENCY: 2-15 minutes depending on the model. Default timeout 1200s (20 min). Set the user's expectation.
+
+IMAGE-TO-VIDEO: image_url is OPTIONAL. Pass it to seed the clip with a reference frame (image-to-video mode). Empirical per-model support is not yet verified; if a model rejects image_url the call will fail and the agent should retry without it. Do not promise the user a specific reference-fidelity outcome.`,
+      inputSchema: {
+        company_id: z.number().int().positive(),
+        prompt: z.string().min(1).describe("Visual prompt describing the single scene to generate. Keep it focused on ONE moment / action / shot — these models render ~8 seconds of video. See PROMPT DESIGN FOR ~8 SECONDS in the tool description."),
+        model: z.enum(AI_VIDEO_MODEL_ENUM).describe("AI video model. Recommended: veo_3_1_fast (50 cr), veo_3_fast (400 cr), veo_3_1 (600 cr). Confirm cost with the user before calling, especially for veo_3 (1000 cr)."),
+        aspect_ratio: z.enum(["9:16", "16:9"]).optional().describe("Default 9:16 (vertical, for Reels/Shorts/TikTok). Use 16:9 for landscape (LinkedIn, YouTube long-form thumbnails)."),
+        image_url: z.string().url().optional().describe("Optional reference frame for image-to-video mode. Per-model support varies; the call may fail on models that do not accept it."),
+        driver: z.string().optional().describe("Optional driver override. Most callers should omit; the backend resolves the driver from the model."),
+        queue: z.boolean().optional().describe("If true, run async via queue. Default true (matches SPA behavior)."),
+        wait: z.boolean().optional().default(true).describe("If true (default), block until the clip is completed or failed. If false, return the pending result id for later polling via get_ai_result / wait_for_ai_result."),
+        timeout_seconds: z.number().int().positive().max(1800).optional().describe("Max seconds to wait when wait=true. Default 1200 (20 min). Veo 3 / Sora-class models can take 10-15 min."),
+      },
+    },
+    async ({ company_id, prompt, model, aspect_ratio, image_url, driver, queue, wait, timeout_seconds }) => {
+      try {
+        const initial = await client.generateAiVideoClip({
+          type: "video",
+          q: prompt,
+          company_id,
+          aspect_ratio: aspect_ratio ?? "9:16",
+          model,
+          ...(driver ? { driver } : {}),
+          ...(image_url ? { image_url } : {}),
+          ...(queue !== undefined ? { queue } : { queue: true }),
+          chargeable: 1,
+        });
+        if (!wait || initial.status === "completed" || initial.status === "failed") {
+          return { content: [{ type: "text", text: JSON.stringify(sanitizeAiResult(initial), null, 2) }] };
+        }
+        const final = await client.waitForAiResult(initial.id, {
+          timeoutMs: (timeout_seconds ?? 1200) * 1000,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(sanitizeAiResult(final), null, 2) }] };
       } catch (err) {
         return toolErrorFromException(err);
       }

@@ -85,35 +85,46 @@ USE FOR: confirming a freshly created avatar has its image and voice attached; i
     "create_avatar_full_flow",
     {
       annotations: MUTATION_OPEN_WORLD,
-      title: "Create an avatar end-to-end (image gen + resource + upload)",
-      description: `Compound workflow that creates a custom avatar from a single prompt. Internally: 1) generates an image with Followr AI from the prompt, 2) creates the avatar resource linked to the given voice_id, 3) attaches the generated image to the avatar via the 3-step upload pattern.
+      title: "Create a new avatar end-to-end (text, image-to-image, or direct photo)",
+      description: `Compound workflow that creates a NEW avatar in the company and attaches an image to it. Three input modes (mutually exclusive, EXACTLY ONE required):
 
-CRITICAL: This consumes credits (~25+ for the image generation alone). Before calling:
-1. Confirm with the user verbatim (avatar name, voice, visual prompt) since the result is not reversible via MCP.
-2. Call get_credits_balance if the user is on a tight budget or if running this repeatedly. Surface remaining credits to the user proactively.
+INPUT MODES:
+- prompt: text-only. Followr AI generates a portrait from scratch matching the prompt. Use when there is no real person to base the avatar on (generic spokesperson, fictional character, stylized look).
+- reference_image_url: image-to-image generation. Followr AI uses the URL as visual reference and produces a "clean" avatar portrait (centered face, neutral framing) that resembles the reference person. Use when the brand has a model / owner / employee / recurring face the avatar should look like. The original photo is NOT reused as-is; a new portrait is generated based on it.
+- use_image_directly_url: SKIP image generation entirely. The URL is uploaded as the avatar's image directly. Use only when the URL already points to a photo properly framed for avatar use (face centered and clear, neutral background, no overlaid logos or text). Saves ~25 credits and 30-90s of latency. If unsure whether the photo qualifies, fall back to reference_image_url.
+
+CHECK FIRST (avatar discovery): BEFORE calling this tool, ALWAYS call list_avatars(company_id) and present the existing avatars to the user by NAME. If any existing avatar fits the use case, use that avatar's id directly in the video tool instead of creating a new one. Creating a new avatar consumes credits and clutters the library. Only call create_avatar_full_flow when no existing avatar matches OR the user explicitly asks for a new one.
+
+CRITICAL: This consumes credits (~25-70 depending on image model and the chosen input mode; use_image_directly_url avoids the image-generation cost). Before calling:
+1. Confirm with the user verbatim (avatar name, voice, input mode, prompt or reference URL).
+2. Call get_credits_balance if the user is on a tight budget or if running this repeatedly.
 3. Confirm the voice_id by name; the wrong voice means future avatar videos sound wrong.
 
 PRECONDITION: company_id required. If multiple companies, confirm company by name. voice_id required (use list_voices to find one, or list_elevenlabs_voices + create_voice_from_elevenlabs to create one).
 
-LATENCY: image generation can take 30-300 seconds. The tool blocks until completion (or timeout_seconds expires). Set the user's expectation that this is a non-instant operation.
+LATENCY: image generation can take 30-300 seconds when using prompt or reference_image_url. The tool blocks until completion (or timeout_seconds expires). use_image_directly_url is fast: ~5-15s for the download + upload only. Set the user's expectation accordingly.
 
-NOT UNDOABLE VIA MCP: there is no delete_avatar tool. The created avatar persists in the company. Use update_avatar with default=false to demote it, or delete manually in the Followr UI.`,
+NOT UNDOABLE VIA MCP: there is no delete_avatar tool exposed here. The created avatar persists in the company. Use update_avatar with default=false to demote it, or delete it from the Followr UI.`,
       inputSchema: {
         company_id: z.number().int().positive(),
-        prompt: z.string().min(1).describe("Visual prompt describing the avatar (e.g. 'professional female news anchor in studio')."),
         voice_id: z.number().int().positive().describe("Existing Voice.id from list_voices or a voice freshly created via create_voice_from_elevenlabs."),
         name: z.string().min(1).max(50).describe("Display name for the avatar."),
-        description: z.string().optional().describe("Optional description. Defaults to a truncated form of the prompt."),
-        aspect_ratio: z.enum(["1:1", "4:3", "16:9", "3:4", "9:16"]).optional().describe("Aspect ratio of the generated portrait. Matches Followr UI options for image generation. Default 1:1."),
+        prompt: z.string().min(1).optional().describe("Text-to-image mode. Visual prompt describing the avatar (e.g. 'professional female news anchor in studio'). Mutually exclusive with reference_image_url and use_image_directly_url."),
+        reference_image_url: z.string().url().optional().describe("Image-to-image mode. URL of a real photo the avatar should resemble (brand owner, model, employee). A clean avatar portrait is generated based on this reference. Mutually exclusive with prompt and use_image_directly_url."),
+        use_image_directly_url: z.string().url().optional().describe("Skip-generation mode. URL of a photo already framed for avatar use (face centered, neutral background). Uploaded as the avatar's image as-is, no AI generation. Mutually exclusive with prompt and reference_image_url."),
+        description: z.string().optional().describe("Optional description. Defaults to a truncated form of the prompt (or a brief auto-generated note for image modes)."),
+        aspect_ratio: z.enum(["1:1", "4:3", "16:9", "3:4", "9:16"]).optional().describe("Aspect ratio of the generated portrait. Ignored when use_image_directly_url is set. Default 1:1."),
         default: z.boolean().optional().describe("If true, marks this avatar as the company default. Default false."),
-        image_driver: z.string().optional().describe("Optional image generation driver override. e.g. fal, recraft, openai."),
-        image_model: z.string().optional().describe("Optional image model override. e.g. nano_banana_2."),
-        timeout_seconds: z.number().int().positive().max(900).optional().describe("Max seconds for image generation to complete. Default 300."),
+        image_driver: z.string().optional().describe("Optional image generation driver override (e.g. fal, recraft, openai). Ignored when use_image_directly_url is set."),
+        image_model: z.string().optional().describe("Optional image model override (e.g. nano_banana_2). Ignored when use_image_directly_url is set."),
+        timeout_seconds: z.number().int().positive().max(900).optional().describe("Max seconds for image generation to complete. Default 300. Ignored when use_image_directly_url is set (that path is fast and bounded by the CDN download)."),
       },
     },
     async ({
       company_id,
       prompt,
+      reference_image_url,
+      use_image_directly_url,
       voice_id,
       name,
       description,
@@ -124,30 +135,137 @@ NOT UNDOABLE VIA MCP: there is no delete_avatar tool. The created avatar persist
       timeout_seconds,
     }) => {
       try {
-        // Apply the company's AI image preferences (driver/model/aspect_ratio)
-        // when the caller does not override. The /api/aiResults/image endpoint
-        // does NOT auto-apply ai_preferences when driver/model are omitted,
-        // so we resolve them client-side here. We only force `fal` as driver
-        // when we're also using the hardcoded fallback model.
+        // Enforce exactly-one-of {prompt, reference_image_url, use_image_directly_url}.
+        const modeFlags = [Boolean(prompt), Boolean(reference_image_url), Boolean(use_image_directly_url)];
+        const modeCount = modeFlags.filter(Boolean).length;
+        if (modeCount === 0) {
+          return toolError({
+            reason: "missing_input_mode",
+            user_message:
+              "create_avatar_full_flow requires exactly one of: prompt, reference_image_url, or use_image_directly_url. Pick the input mode based on what the user can provide (text description, photo of a real person to resemble, or a ready-to-use avatar portrait).",
+            suggested_actions: [
+              {
+                rationale:
+                  "If the brand has a real person whose face the avatar should resemble, ask for a photo URL and pass it as reference_image_url.",
+              },
+              {
+                rationale: "If there is no real person to base on, write a visual prompt and pass it as prompt.",
+              },
+            ],
+            details: {},
+          });
+        }
+        if (modeCount > 1) {
+          return toolError({
+            reason: "ambiguous_input_mode",
+            user_message:
+              "create_avatar_full_flow accepts only ONE of prompt, reference_image_url, or use_image_directly_url. Choose the input mode that best matches the user's request and pass only that field.",
+            suggested_actions: [],
+            details: {
+              prompt_set: Boolean(prompt),
+              reference_image_url_set: Boolean(reference_image_url),
+              use_image_directly_url_set: Boolean(use_image_directly_url),
+            },
+          });
+        }
+
+        // Resolve avatar.description default per mode.
+        const resolvedDescription =
+          description ??
+          (prompt
+            ? prompt.slice(0, 340)
+            : reference_image_url
+              ? `Avatar based on reference image: ${reference_image_url}`
+              : `Avatar uploaded directly: ${use_image_directly_url}`);
+
+        // === Mode: use_image_directly_url ===
+        // Skip image generation. Create the avatar resource, download the image
+        // from the provided URL, and upload it via the 3-step pattern.
+        if (use_image_directly_url) {
+          const downloadResp = await fetch(use_image_directly_url);
+          if (!downloadResp.ok) {
+            return toolError({
+              reason: "url_download_failed",
+              user_message: `Could not download the avatar image from "${use_image_directly_url}" (HTTP ${downloadResp.status} ${downloadResp.statusText}). Check that the URL is reachable and serves raw image bytes.`,
+              suggested_actions: [
+                {
+                  rationale: "Verify the URL in a browser. For Google Drive / Dropbox shares, replace with a direct file URL.",
+                },
+                {
+                  rationale: "Fall back to reference_image_url if the URL serves an image that just needs to be regenerated for avatar framing.",
+                },
+              ],
+              details: {
+                source_url: use_image_directly_url,
+                http_status: downloadResp.status,
+                http_status_text: downloadResp.statusText,
+              },
+            });
+          }
+          const contentType = downloadResp.headers.get("content-type") ?? "image/jpeg";
+          const buffer = await downloadResp.arrayBuffer();
+          const avatar = await client.createAvatar(company_id, {
+            name,
+            description: resolvedDescription,
+            voice_id,
+            default: isDefault ?? false,
+          });
+          const filename = `avatar-${avatar.id}-${Date.now()}.jpg`;
+          const uploadInfo = await client.requestAvatarImageUpload(avatar.id, {
+            filename,
+            type: "image",
+            visibility: "public",
+          });
+          await client.uploadToBlob(uploadInfo.presigned_url, buffer, contentType);
+          const finalAvatar = await client.getAvatar(avatar.id, { include: DEFAULT_INCLUDE });
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    input_mode: "use_image_directly_url",
+                    source_image_url: use_image_directly_url,
+                    avatar: sanitizeAvatar(finalAvatar),
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+
+        // === Modes: prompt OR reference_image_url ===
+        // Both go through generateImage. reference_image_url additionally passes
+        // image_url + image_urls to enable image-to-image mode. Prompt text for
+        // image-to-image is derived from the user-provided prompt if any, or
+        // synthesized from a generic "avatar portrait" template otherwise.
         const prefs = await getAiPreferences(client, company_id);
         const resolvedModel = image_model ?? prefs.image_model ?? "nano_banana_2";
         const resolvedDriver =
           image_driver ?? prefs.image_driver ?? (resolvedModel === "nano_banana_2" ? "fal" : undefined);
-        const initialImage = await client.generateImage({
-          q: prompt,
+        const generationPrompt =
+          prompt ??
+          "Clean professional portrait suitable as an avatar: subject centered, visible from waist up, neutral plain background, soft even lighting, sharp face, no overlaid text or logos. Match the reference image's identity (face, build, hair).";
+        const imageBody: Parameters<FollowrClient["generateImage"]>[0] = {
+          q: generationPrompt,
           company_id,
           aspect_ratio: aspect_ratio ?? prefs.image_aspect_ratio ?? "1:1",
           n: 1,
           chargeable: 1,
           queue: true,
-          ...(resolvedDriver ? { driver: resolvedDriver } : {}),
           model: resolvedModel,
-        });
+          ...(resolvedDriver ? { driver: resolvedDriver } : {}),
+        };
+        if (reference_image_url) {
+          imageBody.image_url = reference_image_url;
+          imageBody.image_urls = [reference_image_url];
+        }
+        const initialImage = await client.generateImage(imageBody);
         const completedImage = await client.waitForAiResult(initialImage.id, {
           timeoutMs: (timeout_seconds ?? 300) * 1000,
         });
-        // For aiResults with type=image, the CDN URL of the generated image is
-        // returned in the `response` field (not in an `image_url` field).
         const generatedImageUrl = completedImage.response ?? "";
         if (completedImage.status !== "completed" || !generatedImageUrl) {
           return toolError({
@@ -161,19 +279,20 @@ NOT UNDOABLE VIA MCP: there is no delete_avatar tool. The created avatar persist
               },
               {
                 rationale:
-                  "Retry create_avatar_full_flow with the same prompt. Image generation models occasionally fail transiently.",
+                  "Retry create_avatar_full_flow with the same input. Image generation models occasionally fail transiently.",
               },
             ],
             details: {
               ai_result_id: completedImage.id,
               status: completedImage.status,
               status_message: completedImage.status_message ?? null,
+              input_mode: reference_image_url ? "reference_image_url" : "prompt",
             },
           });
         }
         const avatar = await client.createAvatar(company_id, {
           name,
-          description: description ?? prompt.slice(0, 340),
+          description: resolvedDescription,
           voice_id,
           default: isDefault ?? false,
         });
@@ -216,8 +335,10 @@ NOT UNDOABLE VIA MCP: there is no delete_avatar tool. The created avatar persist
               type: "text",
               text: JSON.stringify(
                 {
+                  input_mode: reference_image_url ? "reference_image_url" : "prompt",
                   image_ai_result_id: completedImage.id,
                   source_image_url: generatedImageUrl,
+                  ...(reference_image_url ? { reference_image_url } : {}),
                   avatar: sanitizeAvatar(finalAvatar),
                 },
                 null,

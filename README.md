@@ -10,7 +10,7 @@ Followr workspace and operate it from natural language: schedule posts, generate
 content with AI, manage avatars and lipsync videos, run automations, triage the
 social inbox, and more.
 
-**Status:** v0.3.3. API surface is stabilizing; expect occasional changes
+**Status:** v0.4.0. API surface is stabilizing; expect occasional changes
 between minor versions until v1.0.
 
 ## What it does

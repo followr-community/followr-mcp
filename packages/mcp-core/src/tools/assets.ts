@@ -7,6 +7,30 @@ import type { RegisterOptions } from "../index.js";
 import { DESTRUCTIVE, MUTATION_OPEN_WORLD, READ_ONLY } from "../lib/annotations.js";
 import { toolError, ToolErrorException, toolErrorFromException } from "../lib/tool-error.js";
 
+/**
+ * Run an async task over each item with a fixed concurrency cap. Preserves
+ * input order in the returned array. Used by the bulk upload tools so we
+ * upload many URLs in parallel without hammering blob storage.
+ */
+async function runConcurrent<T, R>(
+  items: T[],
+  concurrency: number,
+  task: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (true) {
+      const i = next++;
+      if (i >= items.length) return;
+      const item = items[i] as T;
+      results[i] = await task(item, i);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 function filenameFromUrl(url: string, fallbackExt: string): string {
   try {
     const u = new URL(url);
@@ -78,8 +102,8 @@ export function registerAssetTools(
     "upload_image_from_url",
     {
       annotations: MUTATION_OPEN_WORLD,
-      title: "Upload an image to a company from a public URL",
-      description: `Download an image from a public URL and upload it to the company's asset library via the 3-step pattern (create asset placeholder, request presigned URL, PUT binary).
+      title: "Upload an image to a company asset library from a public URL (ingest, attach, prepare for posts)",
+      description: `Download an image (photo, picture, product shot, thumbnail, banner, creative) from a public URL and upload it to the company's asset library via the 3-step pattern (create asset placeholder, request presigned URL, PUT binary). The resulting asset id is what create_post / create_post_group_with_posts expect in assets_ids.
 
 PRECONDITION: company_id required. If multiple companies and the user hasn't named one, call list_companies first and ask by name.
 
@@ -108,6 +132,105 @@ RETURNS: an Asset object with id and url. Use the id for create_post's assets_id
       } catch (err) {
         return toolErrorFromException(err);
       }
+    },
+  );
+
+  // Tool: upload_images_from_urls (bulk).
+  // Batched version of upload_image_from_url for the common "armar un plan
+  // semanal con N imágenes del catálogo" flow. Runs uploads in parallel with
+  // a fixed concurrency cap to avoid hammering the company's blob storage.
+  // Returns assets[] in input order plus failures[] for URLs that did not
+  // ingest; the caller decides whether to retry the failures.
+  server.registerTool(
+    "upload_images_from_urls",
+    {
+      annotations: MUTATION_OPEN_WORLD,
+      title: "Upload multiple images to a company from public URLs (bulk)",
+      description: `Bulk version of upload_image_from_url. Downloads each URL and uploads it to the company's asset library via the 3-step pattern, in parallel (concurrency capped at 5 to be polite to blob storage).
+
+PRECONDITION: company_id required. If multiple companies and the user hasn't named one, call list_companies first and ask by name.
+
+USE FOR: campaigns that need many product images at once (e.g. planning a week of posts off a product catalog). Reduces N round-trips to 1.
+
+URL REQUIREMENTS: each URL must be reachable and must serve raw image bytes (not an HTML wrapper). Failing URLs are returned in a failures[] array; successful uploads are in assets[]. Partial success is allowed (the tool does not fail the whole batch if one URL fails).
+
+RETURNS: { assets: Asset[], failures: [{url, reason, http_status?}] }. Use the assets' ids in create_post's assets_ids array.
+
+DEDUPE: call list_assets first if duplicates matter; Followr does not auto-dedupe.`,
+      inputSchema: {
+        company_id: z.number().int().positive(),
+        urls: z
+          .array(
+            z.union([
+              z.string().url(),
+              z.object({
+                url: z.string().url(),
+                name: z.string().optional(),
+              }),
+            ]),
+          )
+          .min(1)
+          .max(50)
+          .describe("List of image URLs to ingest. Each item is either a URL string or {url, name?}. 1 to 50 per call."),
+        visibility: z.enum(["public", "private"]).optional().describe("Default public, applied to every asset in the batch."),
+      },
+    },
+    async ({ company_id, urls, visibility }) => {
+      const normalized = urls.map((u) => (typeof u === "string" ? { url: u } : u));
+      const results = await runConcurrent(normalized, 5, async (item) => {
+        try {
+          const asset = await uploadFromUrl(client, {
+            companyId: company_id,
+            url: item.url,
+            type: "image",
+            ...(item.name ? { name: item.name } : {}),
+            ...(visibility ? { visibility } : {}),
+          });
+          return { ok: true as const, asset, url: item.url };
+        } catch (err) {
+          const details =
+            err instanceof ToolErrorException
+              ? (err.result.details as Record<string, unknown> | undefined)
+              : undefined;
+          return {
+            ok: false as const,
+            url: item.url,
+            reason:
+              err instanceof ToolErrorException
+                ? err.result.reason
+                : err instanceof Error
+                  ? err.message
+                  : String(err),
+            http_status: typeof details?.["http_status"] === "number" ? (details["http_status"] as number) : undefined,
+          };
+        }
+      });
+      const assets = results.filter((r) => r.ok).map((r) => (r.ok ? r.asset : null)).filter(Boolean);
+      const failures = results
+        .filter((r): r is { ok: false; url: string; reason: string; http_status?: number } => !r.ok)
+        .map((r) => ({
+          url: r.url,
+          reason: r.reason,
+          ...(r.http_status !== undefined ? { http_status: r.http_status } : {}),
+        }));
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                requested: urls.length,
+                uploaded: assets.length,
+                failed: failures.length,
+                assets,
+                failures,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
     },
   );
 
@@ -145,6 +268,97 @@ RETURNS: an Asset object with id and url. Use the id for create_post's assets_id
       } catch (err) {
         return toolErrorFromException(err);
       }
+    },
+  );
+
+  server.registerTool(
+    "upload_videos_from_urls",
+    {
+      annotations: MUTATION_OPEN_WORLD,
+      title: "Upload multiple videos to a company from public URLs (bulk)",
+      description: `Bulk version of upload_video_from_url. Downloads each URL and uploads it to the company's asset library via the 3-step pattern, in parallel (concurrency capped at 3 because video uploads are heavier than images).
+
+PRECONDITION: company_id required. If multiple companies and the user hasn't named one, call list_companies first and ask by name.
+
+URL REQUIREMENTS: each URL must be reachable and must serve raw video bytes (not a YouTube / Vimeo player page). Failing URLs are returned in a failures[] array; successful uploads are in assets[]. Partial success allowed.
+
+NETWORK CONSTRAINTS: different networks have strict video specs (aspect ratio, duration, codec). Call validate_against_specs after upload and before scheduling, especially for Reels / TikTok / Stories.
+
+RETURNS: { assets: Asset[], failures: [{url, reason, http_status?}] }.`,
+      inputSchema: {
+        company_id: z.number().int().positive(),
+        urls: z
+          .array(
+            z.union([
+              z.string().url(),
+              z.object({
+                url: z.string().url(),
+                name: z.string().optional(),
+              }),
+            ]),
+          )
+          .min(1)
+          .max(20)
+          .describe("List of video URLs to ingest. Each item is either a URL string or {url, name?}. 1 to 20 per call."),
+        visibility: z.enum(["public", "private"]).optional(),
+      },
+    },
+    async ({ company_id, urls, visibility }) => {
+      const normalized = urls.map((u) => (typeof u === "string" ? { url: u } : u));
+      const results = await runConcurrent(normalized, 3, async (item) => {
+        try {
+          const asset = await uploadFromUrl(client, {
+            companyId: company_id,
+            url: item.url,
+            type: "video",
+            ...(item.name ? { name: item.name } : {}),
+            ...(visibility ? { visibility } : {}),
+          });
+          return { ok: true as const, asset, url: item.url };
+        } catch (err) {
+          const details =
+            err instanceof ToolErrorException
+              ? (err.result.details as Record<string, unknown> | undefined)
+              : undefined;
+          return {
+            ok: false as const,
+            url: item.url,
+            reason:
+              err instanceof ToolErrorException
+                ? err.result.reason
+                : err instanceof Error
+                  ? err.message
+                  : String(err),
+            http_status: typeof details?.["http_status"] === "number" ? (details["http_status"] as number) : undefined,
+          };
+        }
+      });
+      const assets = results.filter((r) => r.ok).map((r) => (r.ok ? r.asset : null)).filter(Boolean);
+      const failures = results
+        .filter((r): r is { ok: false; url: string; reason: string; http_status?: number } => !r.ok)
+        .map((r) => ({
+          url: r.url,
+          reason: r.reason,
+          ...(r.http_status !== undefined ? { http_status: r.http_status } : {}),
+        }));
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                requested: urls.length,
+                uploaded: assets.length,
+                failed: failures.length,
+                assets,
+                failures,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
     },
   );
 

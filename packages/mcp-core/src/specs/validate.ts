@@ -279,6 +279,26 @@ function validateMedia(
 
   if (assets.length === 0) return warnings;
 
+  // Product-type-driven asset type check.
+  // Reels and Shorts require a VIDEO asset by the social network's own rules
+  // (Instagram Reels, Facebook Reels, YouTube Shorts). Image-only payloads
+  // would be rejected at publish time. Surface as a hard_fail so callers can
+  // block creation up front.
+  if (payload.product_type === "reel" || payload.product_type === "short") {
+    const videoCount = assets.filter((a) => a.type === "video").length;
+    if (videoCount === 0) {
+      warnings.push({
+        spec_key: specKey,
+        field: "assets.types",
+        rule: "video_required_for_product_type",
+        current_value: assets.map((a) => a.type),
+        expected: "at least one asset with type=video",
+        severity: "hard_fail",
+        suggestion: `${payload.network} ${payload.product_type} requires a video asset. Generate one via generate_avatar_video / generate_avatar_lipsync_clip / generate_ai_video_clip, or upload one via upload_video_from_url, then attach the resulting asset id as { id, type: "video" }.`,
+      });
+    }
+  }
+
   // Mixed types not allowed
   if (m.allow_multiple_types === false) {
     const types = new Set(assets.map((a) => a.type));

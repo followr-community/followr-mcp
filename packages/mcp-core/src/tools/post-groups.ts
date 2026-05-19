@@ -4,7 +4,59 @@ import { z } from "zod";
 
 import type { RegisterOptions } from "../index.js";
 import { DESTRUCTIVE, MUTATION, READ_ONLY } from "../lib/annotations.js";
-import { toolErrorFromException } from "../lib/tool-error.js";
+import { toolError, toolErrorFromException } from "../lib/tool-error.js";
+import { gatherRuntimeContext } from "../specs/runtime-context.js";
+import type { NetworkType, ProductType, SpecWarning } from "../specs/types.js";
+import { validateAgainstSpec } from "../specs/validate.js";
+
+const BULK_NETWORK_ENUM = [
+  "medium",
+  "pinterest",
+  "twitter",
+  "facebook",
+  "instagram",
+  "tiktok",
+  "linkedin",
+  "youtube",
+  "threads",
+  "bluesky",
+] as const satisfies readonly NetworkType[];
+
+const BULK_PRODUCT_TYPE_ENUM = ["feed", "reel", "story", "short"] as const satisfies readonly ProductType[];
+
+const BULK_NETWORKS_NEEDING_MEDIA_PRODUCT_TYPE: ReadonlySet<NetworkType> = new Set([
+  "instagram",
+  "facebook",
+  "youtube",
+]);
+
+const BULK_PRODUCT_TYPE_TO_FOLLOWR: Record<ProductType, string> = {
+  feed: "FEED",
+  reel: "REEL",
+  story: "STORY",
+  short: "SHORT",
+};
+
+const BULK_BLOCKING_VALIDATION_RULES: ReadonlySet<string> = new Set([
+  "required",
+  "video_required_for_product_type",
+  "no_mixed_media",
+  "max_total_exceeded",
+  "max_count_exceeded",
+  "max_size_exceeded",
+  "video_too_long",
+  "video_too_short",
+  "video_max_width_exceeded",
+  "video_min_width_below",
+  "aspect_ratio_out_of_range",
+  "not_supported",
+]);
+
+function pickBulkBlockingWarnings(warnings: SpecWarning[]): SpecWarning[] {
+  return warnings.filter(
+    (w) => w.severity === "hard_fail" && BULK_BLOCKING_VALIDATION_RULES.has(w.rule),
+  );
+}
 
 export function registerPostGroupTools(
   server: McpServer,
@@ -135,14 +187,16 @@ USE BEFORE: update_post_group (especially when patching tags_ids, which has REPL
     "create_post_group",
     {
       annotations: MUTATION,
-      title: "Create a new PostGroup (draft or ready-to-schedule)",
-      description: `Create a PostGroup (the container for one or more cross-network posts) in a specific company.
+      title: "Create a new PostGroup (cross-network campaign container, draft or scheduled publication)",
+      description: `Create a PostGroup, the container that groups one or more per-network social media posts (publication, content piece, campaign entry, draft) so they share the same caption seed, scheduling, tags, and topic across Instagram, TikTok, Facebook, Twitter/X, LinkedIn, YouTube, Pinterest, Threads, Bluesky, or Medium.
 
 PRECONDITION: company_id must be explicit. If the user has more than one company and hasn't named one for this task, call list_companies first and ask the user to choose by name before calling this tool. Never default silently. Company mistakes are expensive because content can end up published in the wrong account.
 
 DEFAULT BEHAVIOR: PostGroup is created with draft=true. It is NOT scheduled or published by this call. To schedule, follow with create_post (per target network), validate_against_specs (per post), and update_post_group (to set publish_at and toggle draft=false).
 
-NEXT STEPS: After this returns an id, call create_post once per target social network. Posts inherit content context from the PostGroup but can override per-network specifics (caption, assets, preferences).
+NEXT STEPS: After this returns an id, call create_post once per target social network. Posts inherit content context from the PostGroup but can override per-network specifics (caption, assets, preferences). When the group targets Reels / Shorts / TikTok and the user has no footage yet, propose a video generation flow (generate_avatar_video, generate_avatar_lipsync_clip, or generate_ai_video_clip) BEFORE calling create_post.
+
+BULK ALTERNATIVE: When creating a PostGroup plus multiple per-network Posts in one shot (typical for a cross-network campaign), prefer create_post_group_with_posts. It runs validation across all sub-posts, fails atomically if any has a blocker, and avoids leaving an empty PostGroup behind.
 
 OPTIONAL topic / publish_at: passing topic at creation seeds the AI-driven content suggestions for downstream create_post calls. Passing publish_at here ALSO sets the schedule (skips a follow-up update_post_group). If you pass publish_at but leave draft=true, the schedule is stored but the group stays parked until you flip draft=false later.`,
       inputSchema: {
@@ -349,6 +403,206 @@ IRREVERSIBILITY: Followr cannot un-publish. The user would have to delete the po
       try {
         const result = await client.publishPostGroup(post_group_id, social_network_type);
         return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      } catch (err) {
+        return toolErrorFromException(err);
+      }
+    },
+  );
+
+  // Tool: create_post_group_with_posts (bulk).
+  // One-shot creation of a PostGroup plus N per-network Posts. Reduces the
+  // 2N+1 round-trips of the manual flow (one create_post_group + N create_post)
+  // down to ~N+1 backend calls (post creations still happen one per network)
+  // and adds atomic-failure semantics: if ANY sub-post has a validation
+  // blocker, NOTHING is created (no orphan PostGroup left behind).
+  const BulkAssetSchema = z.object({
+    id: z.number().int().positive(),
+    type: z.enum(["image", "video", "gif"]),
+    width: z.number().positive().optional(),
+    height: z.number().positive().optional(),
+    size_bytes: z.number().nonnegative().optional(),
+    duration_seconds: z.number().positive().optional(),
+  });
+
+  const BulkPostInputSchema = z.object({
+    social_network_type: z.enum(BULK_NETWORK_ENUM),
+    product_type: z.enum(BULK_PRODUCT_TYPE_ENUM),
+    description: z.string().optional(),
+    title: z.string().optional(),
+    link: z.string().optional(),
+    assets: z.array(BulkAssetSchema).optional(),
+    preferences: z.record(z.string(), z.unknown()).optional(),
+    comments_to_create: z.array(z.unknown()).optional(),
+  });
+
+  server.registerTool(
+    "create_post_group_with_posts",
+    {
+      annotations: MUTATION,
+      title: "Create a PostGroup plus all its per-network Posts in one shot (bulk)",
+      description: `Create a PostGroup AND all its per-network Posts in a single tool call. Equivalent to create_post_group followed by N create_post calls, but with two important differences:
+
+1. ATOMIC VALIDATION: every per-network Post is validated against the network's spec BEFORE any record is created. If ANY sub-post has a blocking warning (missing required asset, wrong asset type for product_type, asset over size limit, video duration out of range, aspect ratio out of range, mixed media not allowed, exceeded count caps, caption sent to a network that doesn't accept it), the tool aborts without creating the PostGroup. No orphan group is left behind. Override with acknowledge_validation_errors=true to force creation against the user's explicit instruction.
+2. FEWER ROUND-TRIPS: one tool call instead of 1 + N. Best for cross-network campaigns where you build the group + posts together.
+
+PRECONDITION: company_id required. If multiple companies, confirm by name (rule 1).
+
+USE FOR: planning a cross-network campaign ("Instagram feed + Instagram reel + TikTok video + LinkedIn post, same theme"). The agent builds the spec for each network and submits all at once.
+
+DO NOT USE: when only one network is involved (use create_post_group + create_post instead, simpler). When the posts need iterative review between creation steps. When asset uploads need to happen in between (do those first via upload_image_from_url / upload_video_from_url / upload_images_from_urls).
+
+VIDEO WORKFLOW: if any sub-post targets a reel / short, the validator requires assets[].type=video for that sub-post. Generate or upload the video FIRST (generate_avatar_video, generate_ai_video_clip, upload_video_from_url) and pass the resulting asset id in the corresponding sub-post.
+
+SCHEDULING: pass publish_at on the PostGroup-level fields if the group should be scheduled at creation; same semantics as create_post_group (draft=true + publish_at parks the schedule).
+
+RETURNS: { post_group, posts: Post[], validation: { warnings_by_post: SpecWarning[][] }, runtime_context }.`,
+      inputSchema: {
+        company_id: z.number().int().positive(),
+        draft: z.boolean().optional().default(true),
+        auto_publish: z.boolean().optional().default(false),
+        title: z.string().optional(),
+        description: z.string().optional(),
+        topic: z.string().optional(),
+        publish_at: z.string().optional().describe("Optional ISO 8601 UTC datetime. Same semantics as create_post_group.publish_at."),
+        posts: z
+          .array(BulkPostInputSchema)
+          .min(1)
+          .max(10)
+          .describe("Per-network Posts to create inside the new PostGroup. 1 to 10 per call. Each follows the same shape as create_post's input (minus post_group_id and company_id, which are inherited)."),
+        acknowledge_validation_errors: z
+          .boolean()
+          .optional()
+          .describe(
+            "Default false. When false, the whole batch aborts before any record is created if ANY sub-post has a blocking warning. Set to true ONLY to force creation against the user's explicit instruction after they were told about the blockers.",
+          ),
+      },
+    },
+    async (input) => {
+      try {
+        // 1. Pre-validate every sub-post BEFORE creating anything.
+        const runtimeContextByNetwork = new Map<NetworkType, Awaited<ReturnType<typeof gatherRuntimeContext>>>();
+        const warningsByPost: SpecWarning[][] = [];
+        const mergedPreferencesByPost: Record<string, unknown>[] = [];
+        for (const post of input.posts) {
+          let ctx = runtimeContextByNetwork.get(post.social_network_type);
+          if (!ctx) {
+            ctx = await gatherRuntimeContext(input.company_id, post.social_network_type, client);
+            runtimeContextByNetwork.set(post.social_network_type, ctx);
+          }
+          const mergedPreferences: Record<string, unknown> = { ...(post.preferences ?? {}) };
+          if (
+            BULK_NETWORKS_NEEDING_MEDIA_PRODUCT_TYPE.has(post.social_network_type) &&
+            !("media_product_type" in mergedPreferences)
+          ) {
+            mergedPreferences["media_product_type"] = BULK_PRODUCT_TYPE_TO_FOLLOWR[post.product_type];
+          }
+          mergedPreferencesByPost.push(mergedPreferences);
+          const warnings = validateAgainstSpec(
+            {
+              network: post.social_network_type,
+              product_type: post.product_type,
+              description: post.description,
+              title: post.title,
+              link: post.link,
+              assets: post.assets,
+              preferences: mergedPreferences,
+            },
+            ctx,
+          );
+          warningsByPost.push(warnings);
+        }
+
+        // 2. Collect blockers across all sub-posts. If any and not acknowledged,
+        // abort BEFORE creating the PostGroup so no orphan record is left.
+        const blockersByPost = warningsByPost.map(pickBulkBlockingWarnings);
+        const hasAnyBlocker = blockersByPost.some((bs) => bs.length > 0);
+        if (hasAnyBlocker && input.acknowledge_validation_errors !== true) {
+          const summary = blockersByPost
+            .map((blockers, i) => {
+              if (blockers.length === 0) return null;
+              const post = input.posts[i]!;
+              const lines = blockers
+                .map((w) => `    - ${w.field}: ${w.suggestion ?? w.rule}`)
+                .join("\n");
+              return `  posts[${i}] (${post.social_network_type} ${post.product_type}):\n${lines}`;
+            })
+            .filter((s): s is string => s !== null)
+            .join("\n");
+          return toolError({
+            reason: "validation_blockers",
+            user_message: `Cannot create the PostGroup: ${blockersByPost.reduce((acc, bs) => acc + bs.length, 0)} blocking validation issue(s) across the sub-posts. No record was created. Fix the issues below and retry:\n${summary}`,
+            suggested_actions: [
+              {
+                tool: "generate_avatar_video",
+                rationale: "Use this for any reel/short sub-post that is missing a video asset.",
+              },
+              {
+                tool: "generate_ai_video_clip",
+                rationale: "Or generate a single 8-second AI video clip for a reel/short.",
+              },
+              {
+                tool: "upload_video_from_url",
+                rationale: "If the user has footage, upload it first and pass the asset id.",
+              },
+            ],
+            details: {
+              blockers_by_post: blockersByPost,
+              all_warnings_by_post: warningsByPost,
+              override_hint:
+                "Pass acknowledge_validation_errors=true to create the batch anyway (not recommended; the network will reject the broken sub-posts).",
+            },
+          });
+        }
+
+        // 3. Create the PostGroup.
+        const group = await client.createPostGroup(input.company_id, {
+          draft: (input.draft ?? true) ? 1 : 0,
+          auto_publish: (input.auto_publish ?? false) ? 1 : 0,
+          ...(input.title ? { title: input.title } : {}),
+          ...(input.description ? { description: input.description } : {}),
+          ...(input.topic ? { topic: input.topic } : {}),
+          ...(input.publish_at ? { publish_at: input.publish_at } : {}),
+        });
+
+        // 4. Create per-network Posts in parallel.
+        const createdPosts = await Promise.all(
+          input.posts.map((post, i) => {
+            const mergedPreferences = mergedPreferencesByPost[i] ?? {};
+            const body: Parameters<FollowrClient["createPost"]>[1] = {
+              social_network_type: post.social_network_type,
+            };
+            if (post.description !== undefined) body.description = post.description;
+            if (post.title !== undefined) body.title = post.title;
+            if (post.link !== undefined) body.link = post.link;
+            if (post.assets && post.assets.length > 0) {
+              body.assets_ids = post.assets.map((a) => a.id);
+            }
+            if (Object.keys(mergedPreferences).length > 0) body.preferences = mergedPreferences;
+            if (post.comments_to_create !== undefined) body.comments_to_create = post.comments_to_create;
+            return client.createPost(group.id, body);
+          }),
+        );
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  post_group: group,
+                  posts: createdPosts,
+                  validation: {
+                    warnings_by_post: warningsByPost,
+                    total_warnings: warningsByPost.reduce((acc, w) => acc + w.length, 0),
+                  },
+                  runtime_context_by_network: Object.fromEntries(runtimeContextByNetwork),
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
       } catch (err) {
         return toolErrorFromException(err);
       }

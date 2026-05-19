@@ -761,6 +761,30 @@ export class FollowrClient {
   }
 
   /**
+   * POST /api/aiResults/video for TEXT-TO-VIDEO (no avatar, no lipsync).
+   * Body shape: { type:"video", q:prompt, model, driver?, aspect_ratio,
+   * company_id, image_url?, queue?, chargeable? }. No audio_url, no image_url
+   * for lipsync (the lipsync flavor uses `generateVideo`). Verified shape
+   * empirically 2026-05-18 against `/api/aiResults/video` with Veo models.
+   * image_url is optional and enables image-to-video mode on models that
+   * support it (not fully verified per model).
+   */
+  async generateAiVideoClip(body: {
+    type: "video";
+    q: string;
+    aspect_ratio: string;
+    model: string;
+    driver?: string;
+    company_id: number;
+    image_url?: string;
+    queue?: boolean;
+    chargeable?: number;
+  }): Promise<AiResult> {
+    const result = await this.request<ApiSingle<AiResult>>("POST", "/api/aiResults/video", { body });
+    return result.data;
+  }
+
+  /**
    * POST /api/aiResults/video in Creatomate mode.
    * Used to concat N pre-rendered lipsync clips into one final video with
    * burned-in subtitles. Different body shape than `generateVideo` (no
