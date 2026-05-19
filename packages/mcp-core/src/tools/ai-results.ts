@@ -193,36 +193,42 @@ ASYNC: wait=true (default) blocks. wait=false returns pending id.`,
     },
   );
 
+  // Tool: generate_avatar_lipsync_clip (renamed from generate_avatar_video in v0.3.2).
+  // Produces ONE lipsync clip of ONE scene. For full multi-scene videos with
+  // burned-in subtitles + concat, use generate_avatar_video.
+  //
+  // BUG FIX in v0.3.2: previous implementation merged
+  // `model: model ?? ai_preferences.video_model ?? "veed_fabric_1.0"`. If a
+  // company had `ai_preferences.video_model` set to a text-to-video model
+  // (veo_3_1_fast, sora_2_pro, etc.) the endpoint silently switched modes and
+  // ignored audio_url/image_url, producing a Veo/Sora text-to-video instead
+  // of an avatar lipsync. Now we hardcode the lipsync model and driver.
   server.registerTool(
-    "generate_avatar_video",
+    "generate_avatar_lipsync_clip",
     {
       annotations: MUTATION_OPEN_WORLD,
-      title: "Generate a lipsync video using an existing avatar",
-      description: `Compound workflow that produces a single avatar lipsync video clip. Internally: 1) fetch the avatar's voice and image, 2) generate TTS audio with the avatar's voice, 3) wait for audio, 4) generate the lipsync video.
+      title: "Generate one avatar lipsync clip (single scene, no subtitles or concat)",
+      description: `Compound workflow that produces a single avatar lipsync video clip. Internally: 1) fetch the avatar's voice + image, 2) generate TTS audio with the avatar's voice, 3) wait for audio, 4) generate the lipsync video (avatar talking head).
 
-CRITICAL: VERY HEAVY OPERATION. ~775 credits per video (Regular driver), 930 with Fast. Before calling:
-1. Confirm the script content verbatim with the user.
-2. Call get_credits_balance and surface remaining credits + cost.
-3. For multi-scene videos, multiply by scene count and confirm total cost.
-4. Confirm avatar (by name, not id) and aspect_ratio.
+USE THIS WHEN: the user wants a quick single-scene clip without subtitles or multi-scene concatenation. For the standard "AI Video Avatars" multi-scene flow with burned-in subtitles, use generate_avatar_video instead.
 
-PRECONDITION: company_id required. avatar_id required, and the avatar MUST have a voice and an image attached (list_avatars to verify, or create_avatar_full_flow if needed). The tool throws clearly if either is missing.
+CRITICAL: heavy operation. Cost is dynamic in Followr; roughly 200-500 credits per clip depending on script length and aspect ratio. Call get_credits_balance before to confirm the user has budget.
 
-LATENCY: 60-600 seconds typical. Set the user's expectation; this is not interactive.
+PRECONDITION: company_id required. avatar_id required, and the avatar MUST have a voice and an image attached (list_avatars to verify, or create_avatar_full_flow if needed).
 
-DEFAULTS: applies the company's ai_preferences (video_driver, video_model, video_aspect_ratio) configured in Followr UI > Company Settings > AI Videos. If the company has no preferences set, falls back to fal + veed_fabric_1.0 + 9:16. Passing driver/model/aspect_ratio in the call overrides both.`,
+LATENCY: 60-180 seconds typical.
+
+MODEL: hardcoded to fal + veed_fabric_1.0 (the only lipsync model verified to work for avatar videos in Followr). The company's ai_preferences.video_model is NOT applied here on purpose: that preference targets text-to-video generation (Veo, Sora, SeeDance), which is incompatible with lipsync and would produce a completely different output.`,
       inputSchema: {
         company_id: z.number().int().positive(),
         avatar_id: z.number().int().positive().describe("The avatar to use (must have a voice and image already set)."),
-        script: z.string().min(1).describe("Text the avatar will say in this scene. Typical 100-150 chars."),
-        aspect_ratio: z.enum(["16:9", "9:16"]).optional().describe("Followr's UI offers only 16:9 (landscape) and 9:16 (portrait, viral short) for video. Default 9:16 if neither tool call nor company prefs specify."),
-        driver: z.string().optional().describe("Default fal."),
-        model: z.string().optional().describe("Lipsync model id (provider-specific)."),
+        script: z.string().min(1).describe("Text the avatar will say in this scene. Typical 100-150 chars. May include ElevenLabs emotion tags like [excited] [confident] [whispers] [pause]."),
+        aspect_ratio: z.enum(["16:9", "9:16"]).optional().describe("9:16 (vertical, default, for Reels/Shorts/TikTok) or 16:9 (landscape). Default 9:16."),
         audio_speed: z.number().min(0.5).max(2.0).optional().describe("TTS speed. Default 1.0."),
         timeout_seconds: z.number().int().positive().max(900).optional().describe("Max seconds for video to complete. Default 600."),
       },
     },
-    async ({ company_id, avatar_id, script, aspect_ratio, driver, model, audio_speed, timeout_seconds }) => {
+    async ({ company_id, avatar_id, script, aspect_ratio, audio_speed, timeout_seconds }) => {
       try {
         const avatar: Avatar = await client.getAvatar(avatar_id, {
           include: "image,voice,voice.audio",
@@ -294,27 +300,16 @@ DEFAULTS: applies the company's ai_preferences (video_driver, video_model, video
             },
           });
         }
-        // Generate lipsync video.
-        // Resolution: explicit tool param > company ai_preferences > hardcoded.
-        // Same nuance as generate_image: ai_preferences only stores `_model`,
-        // no `_driver`. We only force `fal` when we're also using the hardcoded
-        // model veed_fabric_1.0.
-        const videoPrefs = await getAiPreferences(client, company_id);
-        const resolvedVideoModel = model ?? videoPrefs.video_model ?? "veed_fabric_1.0";
-        const resolvedVideoDriver =
-          driver ?? videoPrefs.video_driver ?? (resolvedVideoModel === "veed_fabric_1.0" ? "fal" : undefined);
-        const resolvedVideoAspectRatio = aspect_ratio ?? videoPrefs.video_aspect_ratio ?? "9:16";
+        // Lipsync render. HARDCODED to fal + veed_fabric_1.0. See description
+        // for why we deliberately do NOT read ai_preferences here.
         const videoInitial = await client.generateVideo({
           type: "video",
           q: script,
           audio_url: audioUrl,
           image_url: imageUrl,
-          aspect_ratio: resolvedVideoAspectRatio,
-          driver: resolvedVideoDriver ?? "fal",
-          // Empirically verified default: veed_fabric_1.0 is what Followr uses
-          // in production for avatar lipsync renders (company 8 historical
-          // aiResults with type=video on 2026-05-13).
-          model: resolvedVideoModel,
+          aspect_ratio: aspect_ratio ?? "9:16",
+          driver: "fal",
+          model: "veed_fabric_1.0",
           company_id,
           chargeable: 1,
         });
@@ -332,6 +327,299 @@ DEFAULTS: applies the company's ai_preferences (video_driver, video_model, video
                   audio_url: audioUrl,
                   image_url: imageUrl,
                   video: sanitizeAiResult(videoFinal),
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (err) {
+        return toolErrorFromException(err);
+      }
+    },
+  );
+
+  // Tool: generate_avatar_video (NEW in v0.3.2).
+  // Mirrors Followr's "AI Video Avatars" UI flow: N TTS audio jobs, then N
+  // lipsync renders, then one Creatomate concat with burned-in subtitles.
+  // Simplification vs UI: uses the avatar's portrait directly as the visual
+  // for each scene instead of generating image-to-image backgrounds per scene
+  // (that's a v0.4 feature).
+  //
+  // Render_script shape was verified empirically on 2026-05-19 via Chrome
+  // capture of the production UI. See docs/followr-api/avatars.md.
+  server.registerTool(
+    "generate_avatar_video",
+    {
+      annotations: MUTATION_OPEN_WORLD,
+      title: "Generate a full multi-scene avatar video with burned-in subtitles",
+      description: `Compound workflow that produces a complete multi-scene avatar video, mirroring Followr's "AI Video Avatars" UI flow. Internally:
+
+1. For each scene script (in parallel): generate TTS audio with the avatar's voice.
+2. Wait for audio jobs.
+3. For each scene (in parallel): generate avatar lipsync video using audio + avatar portrait.
+4. Wait for lipsync jobs.
+5. Concat all lipsync clips into one MP4 with burned-in subtitles via Creatomate (driver=creatomate, model=creatomate_video).
+
+USE THIS WHEN: the user wants a real avatar video like the one Followr UI produces from Avatar Video Creator (multi-scene, with subtitles, ready to publish to Reels/Shorts/TikTok).
+
+USE generate_avatar_lipsync_clip INSTEAD: when the user only wants a single-scene clip without subtitles or concat.
+
+CRITICAL: heavy operation. Cost is dynamic in Followr (depends on script length, aspect ratio, scene count); the UI typically shows 600-1100 credits for a 3-4 scene 9:16 video at Regular speed. Always confirm with the user before proceeding and surface get_credits_balance first.
+
+PRECONDITION: company_id + avatar_id required. The avatar MUST have a voice and an image attached. Verify with get_avatar before calling.
+
+SIMPLIFICATION vs Followr UI: this tool uses the avatar's portrait as the visual for every scene (talking head). The Followr UI generates a unique image-to-image background per scene; that level of visual variety is a future enhancement.
+
+LATENCY: typically 3-5 minutes for a 3-4 scene video. Configurable via timeout_seconds.
+
+SUBTITLES: burned in by default with Followr's default style (Montserrat 700, 9.29 vmin font size, white text + #0095a6 highlight color, dark stroke, highlight effect, 14 char max per line, positioned at 82% from top). Override via subtitle_* params.`,
+      inputSchema: {
+        company_id: z.number().int().positive(),
+        avatar_id: z.number().int().positive().describe("Avatar with voice + image attached."),
+        scripts: z.array(z.string().min(1).max(500)).min(1).max(10).describe("One script per scene. 1 to 10 scenes. Typical 80-150 chars each. May include ElevenLabs emotion tags like [excited] [confident] [whispers] [pause]. Each script becomes one scene in the final video."),
+        aspect_ratio: z.enum(["16:9", "9:16"]).optional().describe("9:16 (vertical, default, for Reels/Shorts/TikTok) or 16:9 (landscape). Default 9:16."),
+        audio_speed: z.number().min(0.5).max(2.0).optional().describe("TTS speed applied to every scene. Default 1.0."),
+        subtitle_text_color: z.string().optional().describe("Hex color for subtitle text. Default #ffffff (white)."),
+        subtitle_highlight_color: z.string().optional().describe("Hex color for the active highlighted word. Default #0095a6 (Followr brand teal)."),
+        subtitle_max_chars: z.number().int().min(8).max(40).optional().describe("Max characters shown at once in subtitles. Default 14."),
+        subtitle_font: z.string().optional().describe("Font family. Default Montserrat. Other supported (per Followr UI): Inter, Poppins, Roboto, Open Sans, Playfair Display, Bebas Neue."),
+        timeout_seconds: z.number().int().positive().max(1200).optional().describe("Max seconds for the entire flow. Default 900 (15 min)."),
+      },
+    },
+    async ({
+      company_id,
+      avatar_id,
+      scripts,
+      aspect_ratio,
+      audio_speed,
+      subtitle_text_color,
+      subtitle_highlight_color,
+      subtitle_max_chars,
+      subtitle_font,
+      timeout_seconds,
+    }) => {
+      try {
+        const avatar: Avatar = await client.getAvatar(avatar_id, {
+          include: "image,voice,voice.audio",
+        });
+        if (!avatar.voice?.platform_external_id) {
+          return toolError({
+            reason: "avatar_missing_voice",
+            user_message: `Avatar "${avatar.name}" has no voice configured. A voice is required to generate avatar videos.`,
+            suggested_actions: [
+              {
+                tool: "update_avatar",
+                rationale: "Assign a voice_id to this avatar.",
+              },
+            ],
+            details: { avatar_id, avatar_name: avatar.name },
+          });
+        }
+        if (!avatar.image?.url) {
+          return toolError({
+            reason: "avatar_missing_image",
+            user_message: `Avatar "${avatar.name}" has no image attached.`,
+            suggested_actions: [
+              {
+                tool: "create_avatar_full_flow",
+                rationale: "Re-create the avatar with an image, or attach one manually via the Followr UI.",
+              },
+            ],
+            details: { avatar_id, avatar_name: avatar.name },
+          });
+        }
+        const voicePlatformId = avatar.voice.platform_external_id;
+        const avatarImageUrl = avatar.image.url;
+        const totalTimeoutMs = (timeout_seconds ?? 900) * 1000;
+        // Per-job timeout: a quarter of the total, with 60s floor. Audio is
+        // fast (~10-15s) but lipsync renders can take 60-120s each in parallel.
+        const perJobTimeoutMs = Math.max(60_000, Math.floor(totalTimeoutMs / 4));
+        const finalAspectRatio = aspect_ratio ?? "9:16";
+
+        // === Phase 1: TTS audio per scene (parallel submit + parallel wait). ===
+        const audioInitials = await Promise.all(
+          scripts.map((script) =>
+            client.generateAudio({
+              q: script,
+              company_id,
+              type: "audio",
+              voice: voicePlatformId,
+              ...(audio_speed !== undefined ? { speed: audio_speed } : {}),
+              driver: "fal",
+              model: "elevenlabs_tts_3",
+            }),
+          ),
+        );
+        const audioFinals = await Promise.all(
+          audioInitials.map((init) =>
+            client.waitForAiResult(init.id, { timeoutMs: perJobTimeoutMs }),
+          ),
+        );
+        const failedAudioIdx = audioFinals.findIndex(
+          (a) => a.status !== "completed" || !a.response,
+        );
+        if (failedAudioIdx >= 0) {
+          const failed = audioFinals[failedAudioIdx]!;
+          return toolError({
+            reason: "audio_generation_failed",
+            user_message: `Audio for scene ${failedAudioIdx + 1} of ${scripts.length} failed (status=${failed.status})${failed.status_message ? `: ${failed.status_message}` : ""}.`,
+            suggested_actions: [
+              {
+                tool: "get_credits_balance",
+                rationale: "Check credit balance.",
+              },
+            ],
+            details: {
+              failed_scene_index: failedAudioIdx,
+              failed_script: scripts[failedAudioIdx] ?? null,
+              ai_result_id: failed.id,
+              status: failed.status,
+              status_message: failed.status_message ?? null,
+            },
+          });
+        }
+        const audioUrls = audioFinals.map((a) => a.response!);
+
+        // === Phase 2: Lipsync render per scene (parallel). HARDCODE model. ===
+        const videoInitials = await Promise.all(
+          scripts.map((script, i) =>
+            client.generateVideo({
+              type: "video",
+              q: script,
+              audio_url: audioUrls[i]!,
+              image_url: avatarImageUrl,
+              aspect_ratio: finalAspectRatio,
+              driver: "fal",
+              model: "veed_fabric_1.0",
+              company_id,
+              chargeable: 1,
+            }),
+          ),
+        );
+        const videoFinals = await Promise.all(
+          videoInitials.map((init) =>
+            client.waitForAiResult(init.id, { timeoutMs: perJobTimeoutMs }),
+          ),
+        );
+        const failedVideoIdx = videoFinals.findIndex(
+          (v) => v.status !== "completed" || !v.response,
+        );
+        if (failedVideoIdx >= 0) {
+          const failed = videoFinals[failedVideoIdx]!;
+          return toolError({
+            reason: "lipsync_generation_failed",
+            user_message: `Lipsync for scene ${failedVideoIdx + 1} of ${scripts.length} failed (status=${failed.status})${failed.status_message ? `: ${failed.status_message}` : ""}. Audio jobs already completed successfully; you can retry the lipsync step or fall back to generate_avatar_lipsync_clip per scene.`,
+            suggested_actions: [
+              {
+                rationale: "Retry the call. Lipsync jobs occasionally fail transiently.",
+              },
+            ],
+            details: {
+              failed_scene_index: failedVideoIdx,
+              ai_result_id: failed.id,
+              status: failed.status,
+              audio_urls: audioUrls,
+            },
+          });
+        }
+        const lipsyncUrls = videoFinals.map((v) => v.response!);
+
+        // === Phase 3: Build Creatomate render_script and submit concat. ===
+        // Shape verified empirically 2026-05-19 (sesión 7). For each scene
+        // we emit two elements: a video (the lipsync clip) and a text overlay
+        // (subtitles generated by Creatomate from the video's embedded
+        // transcript via transcript_source linking by id). Tracks alternate
+        // so elements don't overlap on the timeline: scene 0 = tracks 1+2,
+        // scene 1 = tracks 3+4, ... Time and duration are intentionally
+        // omitted; Creatomate infers them from the source video.
+        const isPortrait = finalAspectRatio === "9:16";
+        const renderWidth = isPortrait ? 768 : 1376;
+        const renderHeight = isPortrait ? 1376 : 768;
+        const elements: Array<Record<string, unknown>> = [];
+        lipsyncUrls.forEach((url, i) => {
+          const videoId = `video-scene-${i + 1}`;
+          elements.push({
+            type: "video",
+            id: videoId,
+            source: url,
+            track: i * 2 + 1,
+          });
+          elements.push({
+            type: "text",
+            transcript_source: videoId,
+            transcript_effect: "highlight",
+            transcript_maximum_length: subtitle_max_chars ?? 14,
+            y: "82%",
+            width: "81%",
+            height: "35%",
+            x_alignment: "50%",
+            y_alignment: "50%",
+            fill_color: subtitle_text_color ?? "#ffffff",
+            transcript_color: subtitle_highlight_color ?? "#0095a6",
+            stroke_color: "rgba(0,0,0,1)",
+            stroke_width: "1.6 vmin",
+            font_family: subtitle_font ?? "Montserrat",
+            font_weight: "700",
+            font_size: "9.29 vmin",
+            background_color: "rgba(216,216,216,0)",
+            background_x_padding: "31%",
+            background_y_padding: "10%",
+            background_border_radius: "27%",
+            track: i * 2 + 2,
+          });
+        });
+        const concatInitial = await client.generateVideoConcat({
+          type: "video",
+          q: "creatomate",
+          aspect_ratio: finalAspectRatio,
+          driver: "creatomate",
+          model: "creatomate_video",
+          render_script: {
+            output_format: "mp4",
+            width: renderWidth,
+            height: renderHeight,
+            elements,
+          },
+          company_id,
+          chargeable: 1,
+        });
+        const concatFinal = await client.waitForAiResult(concatInitial.id, {
+          timeoutMs: perJobTimeoutMs,
+        });
+        if (concatFinal.status !== "completed" || !concatFinal.response) {
+          return toolError({
+            reason: "concat_failed",
+            user_message: `Final video concat failed (status=${concatFinal.status})${concatFinal.status_message ? `: ${concatFinal.status_message}` : ""}. Individual lipsync clips were generated successfully (URLs in details). You can either retry the concat by calling this tool again with the same scripts (lipsyncs will regenerate, costing credits) or build a final video manually from the individual URLs.`,
+            suggested_actions: [
+              {
+                tool: "list_ai_results",
+                rationale: "Inspect the individual lipsync aiResults to confirm they're usable.",
+              },
+            ],
+            details: {
+              concat_ai_result_id: concatFinal.id,
+              status: concatFinal.status,
+              scene_count: scripts.length,
+              individual_lipsync_urls: lipsyncUrls,
+            },
+          });
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  avatar_id,
+                  avatar_name: avatar.name,
+                  scene_count: scripts.length,
+                  aspect_ratio: finalAspectRatio,
+                  audio_ai_result_ids: audioFinals.map((a) => a.id),
+                  lipsync_ai_result_ids: videoFinals.map((v) => v.id),
+                  individual_lipsync_urls: lipsyncUrls,
+                  final_video: sanitizeAiResult(concatFinal),
                 },
                 null,
                 2,

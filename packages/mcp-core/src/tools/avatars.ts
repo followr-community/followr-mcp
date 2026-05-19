@@ -267,9 +267,9 @@ IMAGE: this does NOT change the avatar's image. Re-creating with a new image req
     {
       annotations: READ_ONLY,
       title: "List scenes attached to an avatar",
-      description: `Return the scenes (video clips) associated with an avatar. Internally fetches the avatar with the scenes include chain and returns just the scenes array.
+      description: `Return the scenes (pre-recorded motion clips) associated with an avatar in Followr. These are an internal Followr concept (clips that some avatars come bundled with) and are NOT required by generate_avatar_video or generate_avatar_lipsync_clip — those tools build new scenes from script + audio at call time.
 
-USE BEFORE: generate_avatar_video, to inspect what motion clips are available for combining. If the avatar has no scenes, generate_avatar_video will fail or produce a static-image video; surface this to the user before consuming credits.`,
+USE FOR: introspection of bundled-clip avatars or diagnosing the avatar's setup. Most callers do not need this.`,
       inputSchema: {
         avatar_id: z.number().int().positive(),
       },

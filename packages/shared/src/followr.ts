@@ -760,6 +760,32 @@ export class FollowrClient {
     return result.data;
   }
 
+  /**
+   * POST /api/aiResults/video in Creatomate mode.
+   * Used to concat N pre-rendered lipsync clips into one final video with
+   * burned-in subtitles. Different body shape than `generateVideo` (no
+   * audio_url/image_url; instead a `render_script` timeline). Verified empirically
+   * 2026-05-19 via Chrome capture of the Avatar Video Creator UI.
+   */
+  async generateVideoConcat(body: {
+    type: "video";
+    q: "creatomate";
+    aspect_ratio: string;
+    driver: "creatomate";
+    model: "creatomate_video";
+    render_script: {
+      output_format: "mp4";
+      width: number;
+      height: number;
+      elements: Array<Record<string, unknown>>;
+    };
+    company_id: number;
+    chargeable?: number;
+  }): Promise<AiResult> {
+    const result = await this.request<ApiSingle<AiResult>>("POST", "/api/aiResults/video", { body });
+    return result.data;
+  }
+
   /** GET /api/aiResults/{id}. Polling endpoint. */
   async getAiResult(aiResultId: number): Promise<AiResult> {
     const result = await this.request<ApiSingle<AiResult>>("GET", `/api/aiResults/${aiResultId}`);

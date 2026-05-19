@@ -1,6 +1,6 @@
 {
   "name": "@followr-mcp/shared",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "private": true,
   "description": "Followr API client + types. Reusable across MCP packages.",
   "type": "module",

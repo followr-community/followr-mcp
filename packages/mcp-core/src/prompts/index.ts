@@ -150,7 +150,7 @@ export function registerFollowrPrompts(
               `Procedure:\n` +
               `1. Read brand voice via followr://company/${company_id}/brand.\n` +
               `2. With generate_text, brainstorm N distinct episode angles for the topic, each with a 100-150 character on-camera script.\n` +
-              `3. For each episode, call generate_avatar_video with avatar_id and the script. WARNING: each render costs ~775 credits. Confirm credit balance via get_credits_balance BEFORE proceeding if uncertain.\n` +
+              `3. For each episode, call generate_avatar_video with avatar_id and scripts=[<the script>] (single-scene video with burned-in subtitles + concat). WARNING: each render costs ~600-900 credits depending on script length and aspect ratio (cost is dynamic in Followr). Confirm credit balance via get_credits_balance BEFORE proceeding if uncertain. For raw single-clip lipsync without subtitles, use generate_avatar_lipsync_clip instead.\n` +
               `4. After each video completes, create_post_group + create_post(network) with the video asset attached, then update_post_group with publish_at.\n` +
               `5. Return a manifest of { episode_n, post_group_id, publish_at, ai_result_id, networks }.`,
           },

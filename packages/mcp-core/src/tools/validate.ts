@@ -47,7 +47,7 @@ export function registerValidateTools(
 
 CALL EARLY: as soon as the user describes intent (network + format + assets, even before creating the PostGroup). Surfacing blocking issues at intent time (e.g. "Instagram requires at least one image, and the user mentioned no image") avoids creating a PostGroup that can't be scheduled. Don't wait until create_post runs validation post-hoc.
 
-ALSO CALL BEFORE: expensive operations (generate_avatar_video at 775+ credits, generate_image, create_avatar_full_flow) to avoid spending credits on outputs the platform will reject anyway.
+ALSO CALL BEFORE: expensive operations (generate_avatar_video at 600-1100+ credits per video depending on duration and scene count, generate_avatar_lipsync_clip at 200-500+, generate_image, create_avatar_full_flow) to avoid spending credits on outputs the platform will reject anyway. Followr's cost is dynamic; surface get_credits_balance before any heavy job.
 
 WARNINGS HANDLING: severity="error" warnings will likely cause publish to fail; raise these to the user immediately and resolve before proceeding. severity="warning" and "info" are advisory; present them and let the user decide.
 
