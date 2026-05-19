@@ -177,6 +177,7 @@ export class FollowrClient {
       socialNetworkTypes?: string[];
       ignoreTags?: string;
       hasRelation?: boolean;
+      postsDescription?: string;
     },
   ): Promise<PostGroup[]> {
     const query: Query = {
@@ -194,6 +195,7 @@ export class FollowrClient {
     }
     if (options?.ignoreTags !== undefined) query["filter[ignoreTags]"] = options.ignoreTags;
     if (options?.hasRelation !== undefined) query["filter[has_relation]"] = options.hasRelation ? 1 : 0;
+    if (options?.postsDescription) query["filter[posts.description]"] = options.postsDescription;
     const result = await this.request<ApiCollection<PostGroup>>(
       "GET",
       `/api/companies/${companyId}/postGroups`,
@@ -214,9 +216,24 @@ export class FollowrClient {
   }
 
   /** POST /api/companies/{id}/postGroups */
+  /**
+   * POST /api/companies/{companyId}/postGroups
+   *
+   * Verified empirically 2026-05-17: the create endpoint accepts `topic` and
+   * `publish_at` directly in the body (no separate followup update needed).
+   * Earlier versions of this client omitted those fields from the body type,
+   * causing the tool MCP to silently drop them. Fixed.
+   */
   async createPostGroup(
     companyId: number,
-    body: { draft?: 0 | 1 | boolean; auto_publish?: 0 | 1 | boolean; title?: string; description?: string },
+    body: {
+      draft?: 0 | 1 | boolean;
+      auto_publish?: 0 | 1 | boolean;
+      title?: string;
+      description?: string;
+      topic?: string;
+      publish_at?: string;
+    },
   ): Promise<PostGroup> {
     const result = await this.request<ApiSingle<PostGroup>>(
       "POST",
@@ -339,10 +356,18 @@ export class FollowrClient {
     return result.data;
   }
 
+  /**
+   * POST /api/ruleGroups.
+   *
+   * Body field is `active` (boolean), NOT `is_active`. Earlier versions of
+   * this client used `is_active`, which the backend silently ignored, leaving
+   * the created rule group with `active: null` regardless of caller intent.
+   * Verified empirically 2026-05-17 and fixed.
+   */
   async createRuleGroup(body: {
     name: string;
     company_id: number;
-    is_active?: boolean;
+    active?: boolean;
     description?: string;
     random_minutes?: number;
   }): Promise<RuleGroup> {
@@ -471,6 +496,16 @@ export class FollowrClient {
   /** DELETE /api/avatars/{id}. Verified empirically 2026-05-13 (same ModelNotFoundException probe pattern). */
   async deleteAvatar(avatarId: number): Promise<void> {
     await this.request<void>("DELETE", `/api/avatars/${avatarId}`);
+  }
+
+  /** DELETE /api/voices/{id}. Verified empirically 2026-05-17 with curl (HTTP 204 No Content). */
+  async deleteVoice(voiceId: number): Promise<void> {
+    await this.request<void>("DELETE", `/api/voices/${voiceId}`);
+  }
+
+  /** DELETE /api/assets/{id}. Verified empirically 2026-05-17 with curl (HTTP 204 No Content). */
+  async deleteAsset(assetId: number): Promise<void> {
+    await this.request<void>("DELETE", `/api/assets/${assetId}`);
   }
 
   /** POST /api/avatars/{id}/image. Step 1 of 3-step image upload for avatar. Returns presigned URL. */
@@ -788,11 +823,25 @@ export class FollowrClient {
     return result.data;
   }
 
+  /**
+   * Start a Canva design export.
+   *
+   * Body shape verified empirically 2026-05-17 by capturing the SPA network
+   * payload: `{design_id, format: {type, quality?}}` where `format` is an OBJECT,
+   * not a string, and `quality` is OPTIONAL and FORMAT-SPECIFIC:
+   * - jpg: stringified integer 1-100 (e.g. "75", "100"); default 92 server-side.
+   * - mp4: size preset string like "horizontal_1080p", "horizontal_720p".
+   * - png/pdf/gif: do NOT pass quality (server rejects with
+   *   "The selected format.quality is invalid.").
+   *
+   * Response unwrapped from `{data: {id, status}}`. The job id is `id`, not
+   * `job_id` as a prior version of this method declared.
+   */
   async startCanvaDesignExport(
     companyId: number,
-    body: { design_id: string; format: { quality: string; type: string } },
-  ): Promise<{ job_id: string; status: string }> {
-    const result = await this.request<ApiSingle<{ job_id: string; status: string }>>(
+    body: { design_id: string; format: { type: string; quality?: string } },
+  ): Promise<{ id: string; status: string }> {
+    const result = await this.request<ApiSingle<{ id: string; status: string }>>(
       "POST",
       `/api/companies/${companyId}/canva/designExportJob`,
       { body },
