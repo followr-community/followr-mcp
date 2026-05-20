@@ -31,6 +31,7 @@ import { registerFolderTools } from "./tools/folders.js";
 import { registerPostGroupTools } from "./tools/post-groups.js";
 import { registerPostTools } from "./tools/posts.js";
 import { registerPromptTools } from "./tools/prompts.js";
+import { registerResearchTools } from "./tools/research.js";
 import { registerRuleGroupTools } from "./tools/rule-groups.js";
 import { registerSocialHubTools } from "./tools/social-hub.js";
 import { registerSubscriptionTools } from "./tools/subscription.js";
@@ -72,6 +73,7 @@ export function registerFollowrTools(
   registerAssetTools(server, client, options);
   registerCanvaTools(server, client, options);
   registerContentPlanTools(server, client, options);
+  registerResearchTools(server, client, options);
   registerFollowrResources(server, client, options);
   registerFollowrPrompts(server, client, options);
   // v0.1 coverage complete. Future batches:

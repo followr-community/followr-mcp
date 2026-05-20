@@ -1,0 +1,1029 @@
+// Industry-aware deep research tools.
+//
+// Two tools:
+//
+//   deep_research(company_id, depth?, user_industry_hint?, force_refresh?)
+//     End-to-end: fetches the company website, classifies the industry,
+//     runs the matching IndustryProfile's extractors, returns a
+//     normalized DeepResearchResult with detected_industry, common
+//     fields (name, description, logo, contact, social), industry-
+//     specific data (products, menu, articles, etc), suggested content
+//     pillars, sufficiency score, and meta diagnostics.
+//
+//   classify_industry(website_url? OR text_sample?)
+//     Lighter: only classification, no extractors, no fetch needed when
+//     text_sample is provided. Useful when the agent wants to disambiguate
+//     without paying the deep_research cost.
+//
+// Architecture:
+//   - The MCP server is stateless. We do NOT call an LLM from this tool.
+//     When the heuristic classifier is ambiguous, we surface candidates
+//     plus signals_for_classification and let the LLM client decide.
+//   - We do NOT mutate Company.description directly. When caching the
+//     detected industry would help future calls, we surface a
+//     cache_suggestion that the agent can apply via update_company.
+//   - Extraction is per-profile declarative: IndustryProfile.extractors
+//     tells us what fields to fetch and how. The actual extraction logic
+//     lives in lib/extractors and is industry-agnostic.
+
+import type { Company, FollowrClient } from "@followr-mcp/shared";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { z } from "zod";
+
+import type { RegisterOptions } from "../index.js";
+import { READ_ONLY } from "../lib/annotations.js";
+import {
+  bodyTextExcerpt,
+  extractArticles,
+  extractContact,
+  extractImages,
+  extractJsonLd,
+  extractMenu,
+  extractOgMeta,
+  extractProducts,
+  parseHtml,
+  type ArticleEntry,
+  type ContactInfo,
+  type ExtractedProduct,
+  type MenuItem,
+  type OgMetaResult,
+  type ParsedHtml,
+} from "../lib/extractors/index.js";
+import {
+  ALL_INDUSTRY_IDS,
+  getProfile,
+  INDUSTRY_PROFILES,
+  type ExtractorSpec,
+  type IndustryId,
+  type IndustryProfile,
+} from "../lib/industry-profiles/index.js";
+import { detectSpa, type SpaDetectionResult } from "../lib/spa-detector.js";
+import { toolError, toolErrorFromException } from "../lib/tool-error.js";
+
+// ── Depth modes ─────────────────────────────────────────────────────────────
+
+interface DepthSettings {
+  fetch_timeout_ms: number;
+  max_bytes: number;
+  max_extra_paths: number;
+  use_sitemap: boolean;
+}
+
+const DEPTH_SETTINGS: Record<"fast" | "standard" | "thorough", DepthSettings> = {
+  fast: { fetch_timeout_ms: 5_000, max_bytes: 500_000, max_extra_paths: 0, use_sitemap: false },
+  standard: { fetch_timeout_ms: 10_000, max_bytes: 2_000_000, max_extra_paths: 2, use_sitemap: false },
+  thorough: { fetch_timeout_ms: 15_000, max_bytes: 5_000_000, max_extra_paths: 6, use_sitemap: true },
+};
+
+// ── Classifier ─────────────────────────────────────────────────────────────
+
+interface ClassificationCandidate {
+  id: IndustryId;
+  score: number;
+  matched_keywords: string[];
+}
+
+interface ClassificationOutcome {
+  best: ClassificationCandidate;
+  candidates: ClassificationCandidate[];
+  confidence: "high" | "medium" | "low" | "ambiguous";
+  reasoning: string;
+}
+
+/**
+ * Score a text sample against every IndustryProfile. Returns the full
+ * candidate list sorted desc + a chosen confidence level based on the
+ * gap between best and runner-up.
+ */
+function classifyText(text: string): ClassificationOutcome {
+  const lowerText = text.toLowerCase();
+  const scored: ClassificationCandidate[] = [];
+
+  for (const id of ALL_INDUSTRY_IDS) {
+    if (id === "generic_business") continue;
+    const profile = INDUSTRY_PROFILES[id];
+    if (!profile) continue;
+
+    let score = 0;
+    const matched: string[] = [];
+
+    for (const kw of profile.keywords.strong) {
+      if (containsWord(lowerText, kw)) {
+        score += 3;
+        matched.push(kw);
+      }
+    }
+    for (const kw of profile.keywords.weak) {
+      if (containsWord(lowerText, kw)) {
+        score += 1;
+        matched.push(kw);
+      }
+    }
+    if (profile.negative_keywords) {
+      for (const kw of profile.negative_keywords) {
+        if (containsWord(lowerText, kw)) score -= 2;
+      }
+    }
+
+    scored.push({ id, score, matched_keywords: matched });
+  }
+
+  scored.sort((a, b) => b.score - a.score);
+
+  const best = scored[0] ?? { id: "generic_business" as IndustryId, score: 0, matched_keywords: [] };
+  const runnerUp = scored[1] ?? { id: "generic_business" as IndustryId, score: 0, matched_keywords: [] };
+
+  let confidence: ClassificationOutcome["confidence"];
+  let reasoning: string;
+  if (best.score >= 6 && runnerUp.score * 2 <= best.score) {
+    confidence = "high";
+    reasoning = `Strong match: ${best.id} with score ${best.score}, runner-up ${runnerUp.id} at ${runnerUp.score}`;
+  } else if (best.score >= 3 && runnerUp.score * 1.5 <= best.score) {
+    confidence = "medium";
+    reasoning = `Moderate match: ${best.id} with score ${best.score}, gap to runner-up ${runnerUp.id} at ${runnerUp.score}`;
+  } else if (best.score >= 2) {
+    confidence = "ambiguous";
+    reasoning = `Ambiguous: ${best.id} and ${runnerUp.id} have comparable scores (${best.score} vs ${runnerUp.score})`;
+  } else {
+    confidence = "low";
+    reasoning = "No industry profile scored above the floor; falling back to generic_business";
+  }
+
+  return { best, candidates: scored, confidence, reasoning };
+}
+
+/** Word-boundary containment so we do not match "art" inside "earth". */
+function containsWord(haystack: string, needle: string): boolean {
+  if (!needle) return false;
+  const n = needle.toLowerCase();
+  // Multi-word needles: substring match is fine (spaces are word boundaries).
+  if (n.includes(" ")) return haystack.includes(n);
+  // Single-word: use a regex with \b on both sides.
+  const escaped = n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  try {
+    return new RegExp(`\\b${escaped}\\b`, "i").test(haystack);
+  } catch {
+    return haystack.includes(n);
+  }
+}
+
+// ── Cache helpers ──────────────────────────────────────────────────────────
+
+const CACHE_SUFFIX_RE = /\[industry:([a-z_]+)@(\d{4}-\d{2}-\d{2})\]/i;
+const CACHE_TTL_DAYS = 30;
+
+interface CachedIndustry {
+  id: IndustryId;
+  cached_at: string;
+  age_days: number;
+  fresh: boolean;
+}
+
+function readCachedIndustry(description: string | null | undefined): CachedIndustry | null {
+  if (!description) return null;
+  const m = description.match(CACHE_SUFFIX_RE);
+  if (!m) return null;
+  const id = m[1] as IndustryId;
+  const cachedAt = m[2];
+  if (!cachedAt || !ALL_INDUSTRY_IDS.includes(id)) return null;
+  const cachedMs = Date.parse(cachedAt);
+  if (Number.isNaN(cachedMs)) return null;
+  const ageDays = Math.floor((Date.now() - cachedMs) / (1000 * 60 * 60 * 24));
+  return {
+    id,
+    cached_at: cachedAt,
+    age_days: ageDays,
+    fresh: ageDays <= CACHE_TTL_DAYS,
+  };
+}
+
+function buildCacheSuffix(id: IndustryId): string {
+  const today = new Date().toISOString().slice(0, 10);
+  return `[industry:${id}@${today}]`;
+}
+
+// ── Fetch with budget ──────────────────────────────────────────────────────
+
+interface FetchResult {
+  ok: boolean;
+  status: number;
+  body: string;
+  truncated: boolean;
+  error?: string;
+}
+
+async function fetchWithBudget(url: string, settings: DepthSettings): Promise<FetchResult> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), settings.fetch_timeout_ms);
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      redirect: "follow",
+      headers: {
+        "User-Agent": "FollowrMCP-DeepResearch/1.0 (contact: marcos@followr.ai)",
+        Accept: "text/html,application/xhtml+xml",
+      },
+    });
+    if (!res.ok) {
+      return { ok: false, status: res.status, body: "", truncated: false, error: `HTTP ${res.status}` };
+    }
+    // Read up to max_bytes. We stream when available, otherwise read text and truncate.
+    const text = await res.text();
+    const truncated = text.length > settings.max_bytes;
+    const body = truncated ? text.slice(0, settings.max_bytes) : text;
+    return { ok: true, status: res.status, body, truncated };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { ok: false, status: 0, body: "", truncated: false, error: msg };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// ── Extractor runner ───────────────────────────────────────────────────────
+
+interface ExtractorRunReport {
+  succeeded: string[];
+  failed: { name: string; reason: string }[];
+}
+
+interface IndustrySpecificData {
+  // Discriminated union shape; emitted as a plain object so the LLM client
+  // can read whatever subset of fields the profile filled in.
+  industry: IndustryId;
+  data: Record<string, unknown>;
+}
+
+/**
+ * Run a profile's primary extractors against the parsed HTML and return
+ * the assembled industry_specific data + a per-extractor report.
+ *
+ * This function does not crawl additional paths; the caller decides
+ * whether to invoke it once per fetched page.
+ */
+function runProfileExtractors(
+  parsed: ParsedHtml,
+  profile: IndustryProfile,
+): { data: Record<string, unknown>; report: ExtractorRunReport } {
+  const data: Record<string, unknown> = {};
+  const report: ExtractorRunReport = { succeeded: [], failed: [] };
+
+  const allSpecs = [...profile.extractors.primary, ...profile.extractors.secondary];
+
+  for (const spec of allSpecs) {
+    try {
+      const value = runOneExtractor(parsed, spec);
+      if (value === undefined || value === null) {
+        if (spec.required) {
+          report.failed.push({ name: `${spec.field}:${spec.strategy}`, reason: "no result" });
+        }
+        continue;
+      }
+      // Merge: lists get concatenated, scalars get last-write-wins.
+      const existing = data[spec.field];
+      if (Array.isArray(value) && Array.isArray(existing)) {
+        data[spec.field] = [...existing, ...value];
+      } else {
+        data[spec.field] = value;
+      }
+      report.succeeded.push(`${spec.field}:${spec.strategy}`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      report.failed.push({ name: `${spec.field}:${spec.strategy}`, reason: msg });
+    }
+  }
+
+  return { data, report };
+}
+
+function runOneExtractor(parsed: ParsedHtml, spec: ExtractorSpec): unknown {
+  switch (spec.strategy) {
+    case "json_ld": {
+      const entries = extractJsonLd(parsed, spec.jsonld_types);
+      if (entries.length === 0) return null;
+      return entries.slice(0, spec.max_items ?? 30);
+    }
+    case "og_meta": {
+      // og_meta extractors typically target a single common field; we
+      // return the full og meta object so the planner can pick what it
+      // needs. The data.og_meta key is always set when this runs.
+      return extractOgMeta(parsed);
+    }
+    case "css_selector": {
+      // For images, products, menu, articles, etc. We route via the
+      // declared field name to the right extractor.
+      if (!spec.selectors || spec.selectors.length === 0) return null;
+      switch (spec.field) {
+        case "products":
+          return extractProducts(parsed, { selectors: spec.selectors, maxItems: spec.max_items ?? 30 });
+        case "menu_items":
+        case "dish_photos":
+          return extractMenu(parsed, { selectors: spec.selectors, maxItems: spec.max_items ?? 50 });
+        case "latest_articles":
+        case "top_stories":
+        case "recent_content":
+        case "case_studies":
+        case "thought_leadership":
+        case "past_events_gallery":
+        case "current_campaigns":
+        case "transformation_gallery":
+        case "portfolio_projects":
+        case "premises_photos":
+        case "model_photos":
+        case "product_images":
+        case "clients_logos":
+        case "gallery":
+        case "logo_url":
+          return extractImagesField(parsed, spec);
+        case "social_links":
+          return extractSocialLinks(parsed, spec.selectors);
+        default:
+          return extractGenericText(parsed, spec.selectors, spec.max_items ?? 10);
+      }
+    }
+    case "regex_text": {
+      if (!spec.regex) return null;
+      try {
+        const re = new RegExp(spec.regex, "g");
+        const matches = parsed.body_text.match(re) ?? [];
+        const dedup = Array.from(new Set(matches.map((s) => s.trim())));
+        return dedup.slice(0, spec.max_items ?? 10);
+      } catch {
+        return null;
+      }
+    }
+    case "rss_feed":
+    case "sitemap_path":
+      // Async strategies are handled at a higher level (with their own
+      // fetch). Skip here.
+      return null;
+  }
+}
+
+function extractImagesField(parsed: ParsedHtml, spec: ExtractorSpec): string[] | null {
+  if (!spec.selectors || spec.selectors.length === 0) return null;
+  const urls = extractImages(parsed, {
+    selectors: spec.selectors,
+    maxItems: spec.max_items ?? 30,
+  });
+  return urls.length > 0 ? urls : null;
+}
+
+interface SocialLink {
+  type: string;
+  url: string;
+}
+
+function extractSocialLinks(parsed: ParsedHtml, selectors: string[]): SocialLink[] {
+  const seen = new Set<string>();
+  const out: SocialLink[] = [];
+  for (const node of parsed.querySelectorAll(selectors)) {
+    const href = node.getAttribute("href");
+    if (!href) continue;
+    const absolute = parsed.resolveUrl(href);
+    if (!absolute || seen.has(absolute)) continue;
+    seen.add(absolute);
+    const type = inferSocialType(absolute);
+    out.push({ type, url: absolute });
+    if (out.length >= 20) break;
+  }
+  return out;
+}
+
+function inferSocialType(url: string): string {
+  if (url.includes("instagram.com")) return "instagram";
+  if (url.includes("tiktok.com")) return "tiktok";
+  if (url.includes("facebook.com")) return "facebook";
+  if (url.includes("linkedin.com")) return "linkedin";
+  if (url.includes("twitter.com") || url.includes("x.com")) return "x";
+  if (url.includes("youtube.com")) return "youtube";
+  if (url.includes("threads.net")) return "threads";
+  if (url.includes("pinterest.com")) return "pinterest";
+  if (url.includes("bluesky.app") || url.includes("bsky.app")) return "bluesky";
+  return "other";
+}
+
+function extractGenericText(parsed: ParsedHtml, selectors: string[], maxItems: number): string[] | null {
+  const out: string[] = [];
+  for (const node of parsed.querySelectorAll(selectors)) {
+    const txt = node.textContent?.trim();
+    if (txt && txt.length > 0 && txt.length < 500) {
+      out.push(txt);
+    }
+    if (out.length >= maxItems) break;
+  }
+  return out.length > 0 ? out : null;
+}
+
+// ── Content pillars + sufficiency ──────────────────────────────────────────
+
+interface InferredPillar {
+  pillar: string;
+  rationale: string;
+  sample_post_idea: string;
+}
+
+function inferContentPillars(profile: IndustryProfile, data: Record<string, unknown>): InferredPillar[] {
+  return profile.content_pillars_suggested.map((pillar) => ({
+    pillar,
+    rationale: `Suggested by the ${profile.id} profile; surfaces a common content angle for this kind of brand.`,
+    sample_post_idea: sampleIdeaFor(pillar, data),
+  }));
+}
+
+function sampleIdeaFor(pillar: string, data: Record<string, unknown>): string {
+  const products = data["products"];
+  if (Array.isArray(products) && products.length > 0) {
+    const first = products[0] as { name?: string };
+    if (first?.name) return `${pillar} featuring ${first.name}`;
+  }
+  return `${pillar} post tailored to the brand context surfaced in industry_specific.data`;
+}
+
+interface Sufficiency {
+  score: "complete" | "partial" | "thin";
+  missing_for_high_quality_plan: string[];
+  recommendations: string[];
+}
+
+function scoreSufficiency(
+  profile: IndustryProfile,
+  data: Record<string, unknown>,
+  report: ExtractorRunReport,
+): Sufficiency {
+  const required = profile.extractors.primary.filter((s) => s.required);
+  const missingRequired = required.filter((s) => !data[s.field] || isEmpty(data[s.field]));
+
+  const missing: string[] = missingRequired.map((s) => s.field);
+  const recommendations: string[] = [];
+
+  if (missing.length === 0 && report.succeeded.length >= 3) {
+    return { score: "complete", missing_for_high_quality_plan: [], recommendations: [] };
+  }
+  if (missingRequired.length === 0) {
+    return {
+      score: "partial",
+      missing_for_high_quality_plan: missing,
+      recommendations: ["consider uploading additional brand assets (logo, product photos, lifestyle shots) to enrich plans"],
+    };
+  }
+  return {
+    score: "thin",
+    missing_for_high_quality_plan: missing,
+    recommendations: [
+      "ask the user for product photos or a Google Sheet with catalog data",
+      "consider re-running with depth: thorough to crawl more pages",
+    ],
+  };
+}
+
+function isEmpty(value: unknown): boolean {
+  if (value === null || value === undefined) return true;
+  if (Array.isArray(value) && value.length === 0) return true;
+  if (typeof value === "object" && value !== null && Object.keys(value).length === 0) return true;
+  return false;
+}
+
+// ── Tool registrations ────────────────────────────────────────────────────
+
+export function registerResearchTools(
+  server: McpServer,
+  client: FollowrClient,
+  _options: RegisterOptions,
+): void {
+  server.registerTool(
+    "deep_research",
+    {
+      annotations: READ_ONLY,
+      title: "Deep research on a company website with industry-aware extraction",
+      description: `Fetches the company website, classifies the industry, runs the matching IndustryProfile's extractors, and returns a normalized payload the planning agent uses to ground content plans in the brand's real assets and context.
+
+WHEN TO CALL: at the start of any non-trivial content task (a week of posts, a campaign, a launch). One call per conversation per company is enough; cache the result.
+
+DEPTH MODES:
+- fast: home page only, 5s timeout, 500KB cap, no sub-page crawl. Use when iterating quickly.
+- standard (default): home page + up to 2 profile-suggested sub-paths, 10s timeout, 2MB cap. Recommended.
+- thorough: + sitemap top URLs, 15s timeout, 5MB cap. Use for onboarding a new company.
+
+CLASSIFIER: a heuristic keyword scorer matches the page text against 16 industry profiles plus a generic fallback. When confidence is "ambiguous" the tool returns the top candidates plus signals_for_classification ({title, description, body_excerpt, og_type, social_links_types}) and the LLM client decides. The MCP itself never calls an external LLM for classification.
+
+OUTPUT:
+- detected_industry: id + confidence + reasoning + (when ambiguous) candidates + signals.
+- common: company_name, title, description, language, logo_url, contact (emails, phones), social_links.
+- industry_specific: { industry, data } where data is industry-specific (products, menu_items, latest_articles, properties, etc).
+- content_pillars_inferred: suggested pillars with sample post ideas.
+- sufficiency: complete | partial | thin, with recommendations to enrich data.
+- meta: extractors_succeeded, extractors_failed, parser_used, requires_js_render, duration_ms.
+- cache_suggestion (optional): when the agent decides to persist the detected industry across conversations, it can append the provided suffix to Company.description via update_company. The MCP does NOT mutate Company itself.
+
+LIMITATIONS:
+- SPA-only sites (Shopify Hydrogen, Next.js CSR-heavy, React without SSR) return mostly empty data in fast / standard. The tool flags requires_js_render in meta; the agent can offer to re-run thorough or ask the user for assets directly.
+- The classifier works best in es / en. Other languages: the heuristic still runs on universal keywords (most strong keywords have es+en synonyms) but confidence may be lower; the LLM client handles the ambiguous case.`,
+      inputSchema: {
+        company_id: z.number().int().positive(),
+        website_url: z
+          .string()
+          .url()
+          .optional()
+          .describe("Override the company's website URL. Default reads Company.website."),
+        user_industry_hint: z
+          .string()
+          .optional()
+          .describe("Free-text hint from the user (e.g. 'my restaurant' or 'soy una SaaS'). Used to bias the classifier."),
+        depth: z.enum(["fast", "standard", "thorough"]).optional().describe("Depth of crawl and extraction. Default standard."),
+        force_refresh: z.boolean().optional().describe("Ignore the cached industry suffix on Company.description and re-classify."),
+      },
+    },
+    async ({ company_id, website_url, user_industry_hint, depth, force_refresh }) => {
+      const startedAt = Date.now();
+      const depthMode: "fast" | "standard" | "thorough" = depth ?? "standard";
+      const settings = DEPTH_SETTINGS[depthMode];
+
+      try {
+        // 1. Load company (need website + description for cache).
+        const company = await client.getCompany(company_id);
+        const websiteFromCompany = (company as Company & { website?: string | null }).website ?? null;
+        const description = (company as Company & { description?: string | null }).description ?? null;
+        const effectiveUrl = website_url ?? websiteFromCompany ?? null;
+
+        if (!effectiveUrl) {
+          return ok(buildNoWebsiteResult(company, depthMode, startedAt));
+        }
+
+        // 2. Cache check.
+        const cached = readCachedIndustry(description);
+        if (cached && cached.fresh && !force_refresh && !user_industry_hint) {
+          return ok(
+            buildCachedResult(company, cached, depthMode, startedAt, effectiveUrl),
+          );
+        }
+
+        // 3. Fetch home page.
+        const fetched = await fetchWithBudget(effectiveUrl, settings);
+        if (!fetched.ok) {
+          return ok(buildFetchFailedResult(company, effectiveUrl, fetched.error ?? "unknown", depthMode, startedAt));
+        }
+
+        const parsed = parseHtml(fetched.body, effectiveUrl);
+        const og = extractOgMeta(parsed);
+        const spa = detectSpa(parsed);
+
+        // 4. SPA short-circuit: if requires_js_render and we are not in
+        //    thorough mode, return what little we have plus a hint.
+        if (spa.requires_js_render && depthMode !== "thorough") {
+          return ok(buildSpaShortCircuitResult(company, effectiveUrl, parsed, og, spa, depthMode, startedAt));
+        }
+
+        // 5. Classify.
+        const classification = classifyWithHint(parsed, og, user_industry_hint);
+        const profile = getProfile(classification.best.id);
+
+        // 6. Run extractors on the home page.
+        const { data: home_data, report } = runProfileExtractors(parsed, profile);
+
+        // 7. Strategy 3 fallback: contact + images from home regardless
+        //    of profile so common shapes are always present.
+        const contact = extractContact(parsed);
+
+        // 8. Extra page crawl in standard / thorough.
+        const extraPages = await crawlExtraPages(profile, effectiveUrl, settings);
+        for (const { parsed: extraParsed } of extraPages) {
+          const { data: extraData, report: extraReport } = runProfileExtractors(extraParsed, profile);
+          mergeData(home_data, extraData);
+          report.succeeded.push(...extraReport.succeeded);
+          report.failed.push(...extraReport.failed);
+        }
+
+        // 9. Async strategies (RSS for news_media).
+        if (profile.id === "news_media" && og.rss_url) {
+          try {
+            const articles = await extractArticles(parsed, {
+              rss_url: og.rss_url,
+              selectors: profile.extractors.primary
+                .filter((s) => s.field === "latest_articles" && s.strategy === "css_selector")
+                .flatMap((s) => s.selectors ?? []),
+              maxItems: 30,
+            });
+            home_data["latest_articles"] = articles;
+            report.succeeded.push("latest_articles:rss_feed");
+          } catch (err) {
+            report.failed.push({ name: "latest_articles:rss_feed", reason: err instanceof Error ? err.message : String(err) });
+          }
+        }
+
+        // 10. Build response.
+        const response = buildFullResult({
+          company,
+          effectiveUrl,
+          parsed,
+          og,
+          contact,
+          spa,
+          classification,
+          profile,
+          data: home_data,
+          report,
+          depthMode,
+          startedAt,
+          extraPagesCount: extraPages.length,
+        });
+
+        return ok(response);
+      } catch (err) {
+        return toolErrorFromException(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "classify_industry",
+    {
+      annotations: READ_ONLY,
+      title: "Classify a website or a free-text sample into a Followr industry profile",
+      description: `Light classification: scores 16 industry profiles plus a fallback against the input text. Returns the top candidates with matched keywords and a recommended pick with confidence level.
+
+USE THIS when the agent wants to disambiguate a company's industry without paying the cost of a full deep_research crawl. Useful for:
+- Asking the user "is your business X or Y?" with two top candidates.
+- Pre-flight before deep_research to bias the user_industry_hint.
+
+INPUT: provide EITHER website_url (the tool fetches the home page and reads text from it, with the same 10s/2MB budget as deep_research standard) OR text_sample (skip the fetch entirely and classify against the provided text).
+
+OUTPUT: candidates[] sorted by score, recommended { id, confidence }, reasoning. Never throws; falls back to generic_business on any error.`,
+      inputSchema: {
+        website_url: z.string().url().optional(),
+        text_sample: z.string().min(20).optional().describe("Plain text to classify. Use when website_url is not available or for cheap testing."),
+      },
+    },
+    async ({ website_url, text_sample }) => {
+      if (!website_url && !text_sample) {
+        return toolError({
+          reason: "missing_input",
+          user_message: "Provide either website_url or text_sample to classify.",
+        });
+      }
+
+      let textToClassify = text_sample ?? "";
+      let fetchedFrom: string | null = null;
+      let parsedOg: OgMetaResult | null = null;
+
+      if (!textToClassify && website_url) {
+        const fetched = await fetchWithBudget(website_url, DEPTH_SETTINGS.standard);
+        if (!fetched.ok) {
+          return ok({
+            candidates: [],
+            recommended: { id: "generic_business", confidence: "low" },
+            reasoning: `Could not fetch ${website_url}: ${fetched.error ?? "unknown"}. Falling back to generic_business.`,
+          });
+        }
+        fetchedFrom = website_url;
+        const parsed = parseHtml(fetched.body, website_url);
+        parsedOg = extractOgMeta(parsed);
+        textToClassify = [
+          parsedOg.title ?? "",
+          parsedOg.description ?? "",
+          parsedOg.og_description ?? "",
+          bodyTextExcerpt(parsed, 4000),
+        ]
+          .filter(Boolean)
+          .join("\n");
+      }
+
+      const outcome = classifyText(textToClassify);
+      return ok({
+        candidates: outcome.candidates.slice(0, 5),
+        recommended: { id: outcome.best.id, confidence: outcome.confidence },
+        reasoning: outcome.reasoning,
+        fetched_from: fetchedFrom,
+        ...(parsedOg ? { signals: { title: parsedOg.title, description: parsedOg.description, og_type: parsedOg.og_type } } : {}),
+      });
+    },
+  );
+}
+
+// ── Helpers for the full deep_research response shape ──────────────────────
+
+function ok(payload: unknown) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(payload, null, 2) }],
+  };
+}
+
+function classifyWithHint(parsed: ParsedHtml, og: OgMetaResult, hint: string | undefined): ClassificationOutcome {
+  const textParts: string[] = [];
+  if (hint) textParts.push(hint);
+  if (og.title) textParts.push(og.title);
+  if (og.description) textParts.push(og.description);
+  if (og.og_description) textParts.push(og.og_description);
+  textParts.push(bodyTextExcerpt(parsed, 6000));
+  const combined = textParts.join("\n");
+  return classifyText(combined);
+}
+
+async function crawlExtraPages(
+  profile: IndustryProfile,
+  baseUrl: string,
+  settings: DepthSettings,
+): Promise<{ url: string; parsed: ParsedHtml }[]> {
+  if (settings.max_extra_paths === 0) return [];
+
+  const paths = new Set<string>();
+  for (const spec of profile.extractors.primary) {
+    if (spec.paths_to_crawl) {
+      for (const p of spec.paths_to_crawl) paths.add(p);
+    }
+  }
+
+  const out: { url: string; parsed: ParsedHtml }[] = [];
+  let count = 0;
+  for (const path of paths) {
+    if (count >= settings.max_extra_paths) break;
+    let url: string;
+    try {
+      url = new URL(path, baseUrl).toString();
+    } catch {
+      continue;
+    }
+    if (url === baseUrl) continue;
+    const fetched = await fetchWithBudget(url, settings);
+    if (!fetched.ok) continue;
+    const parsed = parseHtml(fetched.body, url);
+    out.push({ url, parsed });
+    count += 1;
+  }
+  return out;
+}
+
+function mergeData(target: Record<string, unknown>, source: Record<string, unknown>): void {
+  for (const [key, value] of Object.entries(source)) {
+    const existing = target[key];
+    if (Array.isArray(existing) && Array.isArray(value)) {
+      target[key] = [...existing, ...value];
+    } else if (!existing) {
+      target[key] = value;
+    }
+  }
+}
+
+function buildNoWebsiteResult(company: Company, depth: string, startedAt: number) {
+  return {
+    detected_industry: {
+      id: "generic_business" as IndustryId,
+      display_name: "Negocio genérico / sin clasificación específica",
+      confidence: "low",
+      reasoning: "No website is set on the company. Falling back to generic_business with thin sufficiency.",
+      detection_method: "fallback",
+    },
+    common: {
+      company_name: company.name,
+      title: null,
+      description: (company as Company & { description?: string | null }).description ?? null,
+      language: null,
+      logo_url: null,
+      contact: { emails: [], phones: [], addresses: [] },
+      social_links: [],
+    },
+    industry_specific: { industry: "generic_business" as IndustryId, data: {} },
+    content_pillars_inferred: [],
+    sufficiency: {
+      score: "thin" as const,
+      missing_for_high_quality_plan: ["website not set"],
+      recommendations: [
+        "ask the user for the company website URL and update Company.website via update_company",
+        "if no website exists, ask the user to upload brand assets (logo, product photos) and to describe the business in Company.description",
+      ],
+    },
+    meta: {
+      pages_crawled: [],
+      duration_ms: Date.now() - startedAt,
+      extractors_succeeded: [],
+      extractors_failed: [],
+      parser_used: "none" as const,
+      requires_js_render: false,
+      depth,
+    },
+  };
+}
+
+function buildCachedResult(
+  company: Company,
+  cached: CachedIndustry,
+  depth: string,
+  startedAt: number,
+  effectiveUrl: string,
+) {
+  const profile = getProfile(cached.id);
+  return {
+    detected_industry: {
+      id: cached.id,
+      display_name: profile.display_name,
+      confidence: "high",
+      reasoning: `Cached classification from ${cached.cached_at} (${cached.age_days} days old, within ${CACHE_TTL_DAYS}-day TTL). Pass force_refresh: true to reclassify.`,
+      detection_method: "cached",
+    },
+    common: {
+      company_name: company.name,
+      title: null,
+      description: (company as Company & { description?: string | null }).description ?? null,
+      language: null,
+      logo_url: null,
+      contact: { emails: [], phones: [], addresses: [] },
+      social_links: [],
+    },
+    industry_specific: { industry: cached.id, data: {} },
+    content_pillars_inferred: inferContentPillars(profile, {}),
+    sufficiency: {
+      score: "partial" as const,
+      missing_for_high_quality_plan: ["cached result returns only the industry id; call with force_refresh to repopulate data"],
+      recommendations: ["call deep_research with force_refresh: true to re-fetch website data"],
+    },
+    meta: {
+      pages_crawled: [],
+      duration_ms: Date.now() - startedAt,
+      extractors_succeeded: [],
+      extractors_failed: [],
+      parser_used: "cache" as const,
+      requires_js_render: false,
+      depth,
+      effective_url: effectiveUrl,
+    },
+  };
+}
+
+function buildFetchFailedResult(
+  company: Company,
+  url: string,
+  error: string,
+  depth: string,
+  startedAt: number,
+) {
+  return {
+    detected_industry: {
+      id: "generic_business" as IndustryId,
+      display_name: "Negocio genérico / sin clasificación específica",
+      confidence: "low",
+      reasoning: `Could not fetch ${url}: ${error}. Falling back to generic_business.`,
+      detection_method: "fallback",
+    },
+    common: {
+      company_name: company.name,
+      title: null,
+      description: (company as Company & { description?: string | null }).description ?? null,
+      language: null,
+      logo_url: null,
+      contact: { emails: [], phones: [], addresses: [] },
+      social_links: [],
+    },
+    industry_specific: { industry: "generic_business" as IndustryId, data: {} },
+    content_pillars_inferred: [],
+    sufficiency: {
+      score: "thin" as const,
+      missing_for_high_quality_plan: ["website unreachable"],
+      recommendations: [
+        "verify the company website URL is correct",
+        "ask the user to provide brand assets directly",
+      ],
+    },
+    meta: {
+      pages_crawled: [],
+      duration_ms: Date.now() - startedAt,
+      extractors_succeeded: [],
+      extractors_failed: [{ name: "fetch", reason: error }],
+      parser_used: "none" as const,
+      requires_js_render: false,
+      depth,
+      effective_url: url,
+    },
+  };
+}
+
+function buildSpaShortCircuitResult(
+  company: Company,
+  url: string,
+  parsed: ParsedHtml,
+  og: OgMetaResult,
+  spa: SpaDetectionResult,
+  depth: string,
+  startedAt: number,
+) {
+  return {
+    detected_industry: {
+      id: "generic_business" as IndustryId,
+      display_name: "Negocio genérico / sin clasificación específica",
+      confidence: "low",
+      reasoning: `${spa.reason}. The current depth (${depth}) does not include JS rendering; re-run with depth: thorough to invoke a headless render pipeline.`,
+      detection_method: "fallback",
+    },
+    common: {
+      company_name: og.og_site_name ?? company.name,
+      title: og.title,
+      description: og.description ?? og.og_description,
+      language: og.html_lang,
+      logo_url: og.og_image ?? og.favicon,
+      contact: { emails: [], phones: [], addresses: [] },
+      social_links: [],
+    },
+    industry_specific: { industry: "generic_business" as IndustryId, data: { value_props: [og.og_description ?? og.description].filter(Boolean) as string[] } },
+    content_pillars_inferred: [],
+    sufficiency: {
+      score: "thin" as const,
+      missing_for_high_quality_plan: ["JS-rendered content not extracted"],
+      recommendations: [
+        "re-run deep_research with depth: thorough",
+        "ask the user for brand assets directly (logo, product photos, copy)",
+      ],
+    },
+    meta: {
+      pages_crawled: [url],
+      duration_ms: Date.now() - startedAt,
+      extractors_succeeded: ["og_meta"],
+      extractors_failed: [],
+      parser_used: "html" as const,
+      requires_js_render: true,
+      depth,
+      effective_url: url,
+      spa_detection: spa,
+    },
+  };
+}
+
+interface BuildFullResultInput {
+  company: Company;
+  effectiveUrl: string;
+  parsed: ParsedHtml;
+  og: OgMetaResult;
+  contact: ContactInfo;
+  spa: SpaDetectionResult;
+  classification: ClassificationOutcome;
+  profile: IndustryProfile;
+  data: Record<string, unknown>;
+  report: ExtractorRunReport;
+  depthMode: "fast" | "standard" | "thorough";
+  startedAt: number;
+  extraPagesCount: number;
+}
+
+function buildFullResult(input: BuildFullResultInput) {
+  const social = extractSocialLinks(input.parsed, [
+    "a[href*='instagram.com']",
+    "a[href*='facebook.com']",
+    "a[href*='tiktok.com']",
+    "a[href*='youtube.com']",
+    "a[href*='linkedin.com']",
+    "a[href*='twitter.com']",
+    "a[href*='x.com']",
+    "a[href*='threads.net']",
+    "a[href*='pinterest.com']",
+  ]);
+
+  const ambiguous = input.classification.confidence === "ambiguous";
+
+  return {
+    detected_industry: {
+      id: input.profile.id,
+      display_name: input.profile.display_name,
+      confidence: input.classification.confidence,
+      reasoning: input.classification.reasoning,
+      detection_method: "heuristic" as const,
+      ...(ambiguous
+        ? {
+            candidates: input.classification.candidates.slice(0, 3),
+            signals_for_classification: {
+              title: input.og.title,
+              description: input.og.description ?? input.og.og_description,
+              body_excerpt: bodyTextExcerpt(input.parsed, 2000),
+              og_type: input.og.og_type,
+              social_links_types: Array.from(new Set(social.map((s) => s.type))),
+            },
+          }
+        : {}),
+    },
+    common: {
+      company_name: input.og.og_site_name ?? input.company.name,
+      title: input.og.title,
+      description: input.og.description ?? input.og.og_description,
+      language: input.og.html_lang,
+      logo_url: input.og.og_image ?? input.og.favicon,
+      contact: { emails: input.contact.emails, phones: input.contact.phones, addresses: [] },
+      social_links: social,
+    },
+    industry_specific: { industry: input.profile.id, data: input.data } as IndustrySpecificData,
+    content_pillars_inferred: inferContentPillars(input.profile, input.data),
+    sufficiency: scoreSufficiency(input.profile, input.data, input.report),
+    meta: {
+      pages_crawled: [input.effectiveUrl],
+      duration_ms: Date.now() - input.startedAt,
+      extractors_succeeded: input.report.succeeded,
+      extractors_failed: input.report.failed,
+      parser_used: "html" as const,
+      requires_js_render: input.spa.requires_js_render,
+      depth: input.depthMode,
+      effective_url: input.effectiveUrl,
+      extra_pages_crawled: input.extraPagesCount,
+    },
+    cache_suggestion: {
+      field: "description",
+      suffix_to_append: buildCacheSuffix(input.profile.id),
+      note: "Append this suffix to Company.description via update_company to cache the classification for 30 days. Optional; deep_research will re-classify if missing or expired.",
+    },
+  };
+}
