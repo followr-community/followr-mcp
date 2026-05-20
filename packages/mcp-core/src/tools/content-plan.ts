@@ -772,215 +772,18 @@ AFTER THIS RETURNS: show the summary table to the user verbatim, list any warnin
         });
       }
 
-      // 2. Per-item validation (intra) + collect cross-data.
-      const blockers: Array<Record<string, unknown>> = [];
-      const warnings: Array<Record<string, unknown>> = [];
-      const slugSeen = new Set<string>();
-      const slotMap = new Map<string, Array<{ slug: string; network: SocialNetwork }>>();
+      // 2. Run the validation pipeline (extracted helper so update_content_plan
+      // can re-use it).
+      const v = await runValidation({
+        plan_items: input.plan_items as PlanItem[],
+        time_window: input.time_window,
+        ctx,
+        client,
+        use_brand_voice: input.use_brand_voice ?? true,
+      });
 
-      let totalImagesAiCost = 0;
-      let totalImagesAiCount = 0;
-      let totalVideosAiCost = 0;
-      let totalVideosAiCount = 0;
-      let totalUploadsCount = 0;
-      let totalExistingAssetReuse = 0;
-
-      for (const item of input.plan_items) {
-        // Unique slug across items.
-        if (slugSeen.has(item.slug)) {
-          blockers.push({
-            issue: "duplicate_slug",
-            slug: item.slug,
-            detail: `Slug "${item.slug}" appears more than once. Each plan_item needs a unique slug.`,
-          });
-        }
-        slugSeen.add(item.slug);
-
-        // Date in window.
-        if (item.date < input.time_window.start || item.date > input.time_window.end) {
-          warnings.push({
-            issue: "date_out_of_window",
-            item: item.slug,
-            detail: `Item date ${item.date} is outside the requested window ${input.time_window.start}..${input.time_window.end}.`,
-          });
-        }
-
-        // Per-sub-post validation.
-        for (let i = 0; i < item.sub_posts.length; i++) {
-          const sp = item.sub_posts[i] as SubPost;
-          const slotKey = `${item.date}T${item.publish_at_time_local}`;
-          (slotMap.get(slotKey) ?? slotMap.set(slotKey, []).get(slotKey))!.push({
-            slug: item.slug,
-            network: sp.social_network,
-          });
-
-          // Network connected on this company?
-          if (!ctx.networks_connected.includes(sp.social_network)) {
-            warnings.push({
-              issue: "network_not_connected",
-              item: item.slug,
-              sub_post_index: i,
-              network: sp.social_network,
-              detail: `${sp.social_network} is not connected to this company. Ask the user to connect it in Followr settings or remove it from the plan.`,
-            });
-          }
-
-          // social_network + product_type + asset_layout compatibility.
-          const slotSpec = NETWORK_FORMAT_COMPATIBILITY[`${sp.social_network}:${sp.product_type}`];
-          if (!slotSpec) {
-            blockers.push({
-              issue: "incompatible_product_type_for_network",
-              item: item.slug,
-              sub_post_index: i,
-              network: sp.social_network,
-              product_type: sp.product_type,
-              detail: `${sp.social_network} does not accept product_type ${sp.product_type}. See network_format_compatibility_matrix from prepare_content_plan_context.`,
-              resolution_options: networkResolutionOptions(sp.social_network, sp.product_type),
-            });
-            continue;
-          }
-          const slotAcceptsLayout = slotSpec.accepts.some(
-            (a) => a.product_type === sp.product_type && a.asset_layouts.includes(sp.asset_layout),
-          );
-          if (!slotAcceptsLayout) {
-            blockers.push({
-              issue: "incompatible_asset_layout_for_network",
-              item: item.slug,
-              sub_post_index: i,
-              network: sp.social_network,
-              product_type: sp.product_type,
-              asset_layout: sp.asset_layout,
-              detail: `${slotSpec.display_name} (${sp.product_type}) does not accept asset_layout=${sp.asset_layout}. Allowed: ${slotSpec.accepts
-                .filter((a) => a.product_type === sp.product_type)
-                .flatMap((a) => a.asset_layouts)
-                .join(", ")}.`,
-              resolution_options: layoutResolutionOptions(sp.social_network, sp.product_type, sp.asset_layout),
-            });
-            continue;
-          }
-
-          // asset_layout vs assets_strategy shape.
-          const shapeBlocker = validateLayoutShape(sp.asset_layout, sp.assets_strategy, slotSpec.max_images_in_carousel);
-          if (shapeBlocker) {
-            blockers.push({
-              issue: "asset_strategy_mismatch_for_layout",
-              item: item.slug,
-              sub_post_index: i,
-              network: sp.social_network,
-              asset_layout: sp.asset_layout,
-              detail: shapeBlocker,
-            });
-            continue;
-          }
-
-          // Cost estimation per sub_post.
-          const cost = estimateSubPostCost(sp);
-          totalImagesAiCost += cost.image_ai_cost;
-          totalImagesAiCount += cost.image_ai_count;
-          totalVideosAiCost += cost.video_ai_cost;
-          totalVideosAiCount += cost.video_ai_count;
-          totalUploadsCount += cost.upload_count;
-          totalExistingAssetReuse += cost.reuse_count;
-
-          // Rationale ↔ layout coherence soft warning.
-          if (
-            sp.asset_layout === "single_image" &&
-            /(carrusel|carousel|comparativa|comparison|múltiples?|multiples?|step.?by.?step|antes\s*\/\s*despu[eé]s|before\s*\/\s*after|\b\d+\s+looks?\b|\b\d+\s+formas?\b|\b\d+\s+tips?\b)/i.test(item.rationale + " " + sp.caption_concept)
-          ) {
-            warnings.push({
-              issue: "rationale_suggests_carousel_but_layout_is_single",
-              item: item.slug,
-              sub_post_index: i,
-              detail:
-                "El rationale o caption sugieren múltiples items pero el asset_layout es single_image. Considerá cambiar a carousel_images.",
-            });
-          }
-        }
-      }
-
-      // 3. Cross-items: duplicate network per slot.
-      for (const [slotKey, entries] of slotMap) {
-        const counts = new Map<SocialNetwork, string[]>();
-        for (const e of entries) {
-          (counts.get(e.network) ?? counts.set(e.network, []).get(e.network))!.push(e.slug);
-        }
-        for (const [network, slugs] of counts) {
-          if (slugs.length > 1) {
-            blockers.push({
-              issue: "duplicate_network_same_slot",
-              slot: slotKey,
-              network,
-              involved_items: slugs,
-              detail: `Slot ${slotKey} has ${slugs.length} sub_posts targeting ${network}. Posting twice to the same network at the same time is invalid.`,
-              resolution_options: [
-                {
-                  id: "consolidate",
-                  description:
-                    "Merge the duplicate sub_posts into ONE plan_item with heterogeneous sub_posts (a single PostGroup with multiple per-network children).",
-                },
-                {
-                  id: "drop_duplicate",
-                  description: `Remove ${network} from one of the duplicate items, leaving only the remaining sub_posts in that item.`,
-                },
-                {
-                  id: "different_time",
-                  description:
-                    "Change the publish_at_time_local of one of the duplicate items so the two posts to ${network} land at different moments.",
-                },
-              ],
-            });
-          }
-        }
-      }
-
-      // 4. Budget check.
-      const totalAiCost = totalImagesAiCost + totalVideosAiCost;
-      // We can't introspect the live budget here without a fresh API call; use
-      // the snapshot pattern: re-fetch a budget summary so the agent surfaces
-      // an up-to-date number. If budget cannot be loaded, skip the hard check.
-      let budgetRemaining: number | null = null;
-      try {
-        const budget = await loadBudgets(client);
-        budgetRemaining = budget?.ai_image_and_video_budget.remaining ?? null;
-      } catch {
-        budgetRemaining = null;
-      }
-      if (budgetRemaining !== null && totalAiCost > budgetRemaining) {
-        blockers.push({
-          issue: "budget_exceeded",
-          requested: totalAiCost,
-          available: budgetRemaining,
-          shortage: totalAiCost - budgetRemaining,
-          detail: `This plan needs ${totalAiCost} credits of ai_image_and_video_budget but the company has ${budgetRemaining}. Shortage: ${totalAiCost - budgetRemaining}.`,
-          resolution_options: [
-            {
-              id: "switch_to_cheaper_models",
-              description:
-                "Switch ai_generate video models to cheaper alternatives (SeeDance 1.1 Light at 20 cr/s instead of Veo 3.1 Fast at 50, or Hailuo Standard at 20). Check available_video_models from prepare_content_plan_context for affordable: true models.",
-            },
-            {
-              id: "reduce_ai_generations",
-              description:
-                "Replace some ai_generate sub_posts with use_existing_urls or upload_from_website strategies. Photos from the company's site cost 0 credits.",
-            },
-            {
-              id: "shrink_time_window",
-              description: "Reduce the number of plan_items, the time_window or the posts_per_day.",
-            },
-          ],
-        });
-      }
-
-      // 5. Brand voice missing soft warning.
-      if (!ctx.brand_has_voice_prompt && input.use_brand_voice) {
-        warnings.push({
-          issue: "brand_voice_missing",
-          detail:
-            "use_brand_voice is true but this company has no brand voice prompt loaded. Copies will fall back to Followr default voice. Offer the user to create one with create_prompt BEFORE executing.",
-        });
-      }
-
-      // 6. Persist plan (even with blockers, so update_content_plan can fix fields).
+      // 3. Persist plan (even with blockers, so update_content_plan can fix
+      // fields without resending the whole structure).
       const plan = createPlan({
         context_id: input.context_id,
         company_id: ctx.company_id,
@@ -991,33 +794,264 @@ AFTER THIS RETURNS: show the summary table to the user verbatim, list any warnin
         ...(input.auto_publish_schedule ? { auto_publish_schedule: input.auto_publish_schedule } : {}),
       });
 
-      // 7. Build summary table for the user.
+      // 4. Build summary table for the user.
       const summaryRows = buildSummaryTable(plan);
 
       const response = {
         plan_id: plan.plan_id,
-        status: blockers.length > 0 ? "needs_revision" : "ready_for_execution",
+        status: v.blockers.length > 0 ? "needs_revision" : "ready_for_execution",
         summary_for_user: summaryRows,
         totals: {
           plan_items_count: input.plan_items.length,
           sub_posts_count: input.plan_items.reduce((a, it) => a + it.sub_posts.length, 0),
-          estimated_ai_image_generations: totalImagesAiCount,
-          estimated_ai_video_generations: totalVideosAiCount,
-          estimated_asset_uploads: totalUploadsCount,
-          estimated_existing_asset_reuse: totalExistingAssetReuse,
-          estimated_total_credits_cost: totalAiCost,
-          budget_remaining_before_execution: budgetRemaining,
+          estimated_ai_image_generations: v.totals.image_ai_count,
+          estimated_ai_video_generations: v.totals.video_ai_count,
+          estimated_asset_uploads: v.totals.upload_count,
+          estimated_existing_asset_reuse: v.totals.reuse_count,
+          estimated_total_credits_cost: v.totals.total_ai_cost,
+          budget_remaining_before_execution: v.budget_remaining,
           budget_remaining_after_execution:
-            budgetRemaining !== null ? budgetRemaining - totalAiCost : null,
+            v.budget_remaining !== null ? v.budget_remaining - v.totals.total_ai_cost : null,
         },
-        warnings,
-        blockers,
+        warnings: v.warnings,
+        blockers: v.blockers,
         next_step_instructions:
-          blockers.length > 0
+          v.blockers.length > 0
             ? "There are blockers (listed above). Surface them to the user with the resolution_options for each, then call update_content_plan(plan_id, changes) with the chosen fixes. Do NOT call execute_content_plan until status is ready_for_execution."
             : "Show summary_for_user to the user (translate display_name fields, never expose ids). List any warnings. Ask for explicit approval ('lo ejecuto?' / 'cambio algo?'). When the user confirms, call execute_content_plan(plan_id, confirm: true). If the user wants to change a specific item, call update_content_plan(plan_id, changes) instead.",
       };
 
+      return { content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }] };
+    },
+  );
+
+  // ────────────────────────────────────────────────────────────────────────
+  // update_content_plan
+  // ────────────────────────────────────────────────────────────────────────
+
+  const ChangeReplaceItem = z.object({
+    action: z.literal("replace_item"),
+    slug: z.string().min(1),
+    new_item: PlanItemSchema,
+  });
+  const ChangeUpdateField = z.object({
+    action: z.literal("update_field"),
+    slug: z.string().min(1),
+    field: z.enum([
+      "date",
+      "publish_at_time_local",
+      "timezone",
+      "concept_shared",
+      "rationale",
+    ]),
+    value: z.string().min(1),
+  });
+  const ChangeAddItem = z.object({
+    action: z.literal("add_item"),
+    new_item: PlanItemSchema,
+  });
+  const ChangeRemoveItem = z.object({
+    action: z.literal("remove_item"),
+    slug: z.string().min(1),
+  });
+  const ChangeShiftDates = z.object({
+    action: z.literal("shift_dates"),
+    days_offset: z.number().int(),
+  });
+  const ChangeSetGlobal = z.object({
+    action: z.literal("set_global"),
+    field: z.enum(["use_brand_voice", "auto_publish_schedule"]),
+    value: z.union([
+      z.boolean(),
+      z.object({
+        timezone: z.string().min(1),
+        time_per_day: z.string().regex(/^\d{2}:\d{2}$/),
+      }),
+    ]),
+  });
+  const ChangeReplaceSubPost = z.object({
+    action: z.literal("replace_sub_post"),
+    slug: z.string().min(1),
+    sub_post_index: z.number().int().nonnegative(),
+    new_sub_post: SubPostSchema,
+  });
+  const ChangeAddSubPost = z.object({
+    action: z.literal("add_sub_post"),
+    slug: z.string().min(1),
+    new_sub_post: SubPostSchema,
+  });
+  const ChangeRemoveSubPost = z.object({
+    action: z.literal("remove_sub_post"),
+    slug: z.string().min(1),
+    sub_post_index: z.number().int().nonnegative(),
+  });
+  const ChangeSplitByNetwork = z.object({
+    action: z.literal("split_subposts_by_network"),
+    slug: z.string().min(1),
+    new_items: z
+      .array(
+        z.object({
+          slug: z
+            .string()
+            .min(1)
+            .max(80)
+            .regex(/^[a-z0-9\-_]+$/i),
+          publish_at_time_local: z.string().regex(/^\d{2}:\d{2}$/),
+          networks: z.array(SocialNetworkEnum).min(1),
+        }),
+      )
+      .min(2)
+      .max(8)
+      .describe(
+        "Each entry takes a subset of the original item's sub_posts (matched by social_network), turns it into a new plan_item with its own publish_at_time_local. Used to separate a heterogeneous plan_item into per-network siblings with different publish times.",
+      ),
+  });
+  const ChangeConvertToCarousel = z.object({
+    action: z.literal("convert_to_carousel"),
+    slug: z.string().min(1),
+    sub_post_index: z.number().int().nonnegative(),
+    new_carousel_sources: z
+      .array(z.union([AssetSourceUrlSchema, AssetSourceAssetIdSchema, AssetSourceAiImageSchema]))
+      .min(2)
+      .max(20),
+  });
+
+  const ChangeSchema = z.discriminatedUnion("action", [
+    ChangeReplaceItem,
+    ChangeUpdateField,
+    ChangeAddItem,
+    ChangeRemoveItem,
+    ChangeShiftDates,
+    ChangeSetGlobal,
+    ChangeReplaceSubPost,
+    ChangeAddSubPost,
+    ChangeRemoveSubPost,
+    ChangeSplitByNetwork,
+    ChangeConvertToCarousel,
+  ]);
+
+  server.registerTool(
+    "update_content_plan",
+    {
+      annotations: MUTATION_IDEMPOTENT,
+      title: "Apply mutations to a draft content plan and re-validate the result",
+      description: `Mutate a draft plan held in session memory. Takes an ordered array of changes that target individual plan_items (by slug) or the whole plan, applies them, and re-runs the full validation pipeline against the new state.
+
+PRECONDITION: plan_id must exist (created by draft_content_plan and not yet executed/expired).
+
+AVAILABLE CHANGES:
+- replace_item: replace one full plan_item by slug.
+- update_field: change date / publish_at_time_local / timezone / concept_shared / rationale on a plan_item.
+- add_item: append a new plan_item.
+- remove_item: delete a plan_item by slug.
+- shift_dates: shift all dates by N days (positive = later, negative = earlier).
+- set_global: change use_brand_voice or auto_publish_schedule.
+- replace_sub_post / add_sub_post / remove_sub_post: surgical edits inside one plan_item.
+- split_subposts_by_network: separate a heterogeneous plan_item into multiple plan_items by network grouping with different publish_at_time_local. Use this when the user wants the photo and the reel on different times instead of the default single PostGroup.
+- convert_to_carousel: change a single_image sub_post into carousel_images by providing new_carousel_sources.
+
+OUTPUT: same shape as draft_content_plan (plan_id stays the same; status reflects post-change validation; full blocker / warning lists; refreshed budget snapshot).
+
+NO MUTATIONS TO FOLLOWR: this tool only edits in-memory plan state. Executes nothing in Followr until execute_content_plan is called.
+
+AFTER THIS: same flow as draft. Show the updated table, await explicit approval, then execute.`,
+      inputSchema: {
+        plan_id: z.string().min(1),
+        changes: z.array(ChangeSchema).min(1).max(40),
+      },
+    },
+    async ({ plan_id, changes }) => {
+      const plan = getPlan(plan_id);
+      if (!plan) {
+        return toolError({
+          reason: "plan_id_not_found",
+          user_message:
+            "No encuentro ese plan. Puede haber expirado (2 hs en memoria) o nunca fue creado. Llamá draft_content_plan para crear uno nuevo.",
+          blocking: true,
+        });
+      }
+      const ctx = getContext(plan.context_id);
+      if (!ctx) {
+        return toolError({
+          reason: "context_id_invalid_or_expired",
+          user_message:
+            "El context del plan expiró. Llamá prepare_content_plan_context de nuevo, después draft_content_plan con el plan corregido.",
+          blocking: true,
+        });
+      }
+
+      // Apply changes IN ORDER, mutating a working copy.
+      const working = {
+        plan_items: plan.plan_items.map((it) => ({ ...it, sub_posts: it.sub_posts.map((sp) => ({ ...sp })) })),
+        use_brand_voice: plan.use_brand_voice,
+        auto_publish_schedule: plan.auto_publish_schedule ?? undefined,
+      };
+
+      const changeErrors: Array<{ change_index: number; reason: string }> = [];
+
+      for (let idx = 0; idx < changes.length; idx++) {
+        const change = changes[idx]!;
+        try {
+          applyChange(working, change);
+        } catch (e) {
+          changeErrors.push({
+            change_index: idx,
+            reason: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+
+      // Update the persisted plan with the working state.
+      const updatedPlan: ContentPlan = {
+        ...plan,
+        plan_items: working.plan_items as PlanItem[],
+        use_brand_voice: working.use_brand_voice,
+        ...(working.auto_publish_schedule
+          ? { auto_publish_schedule: working.auto_publish_schedule }
+          : {}),
+      };
+      // Persist by mutating the entry in the state map. We can do this safely
+      // because createPlan / getPlan operate on the same map and we own the
+      // session lifecycle.
+      // Use the lower-level updatePlan helper.
+      const { updatePlan: persist } = await import("../lib/content-plan-state.js");
+      persist(plan_id, updatedPlan);
+
+      // Re-validate.
+      const v = await runValidation({
+        plan_items: updatedPlan.plan_items,
+        time_window: updatedPlan.time_window,
+        ctx,
+        client,
+        use_brand_voice: updatedPlan.use_brand_voice,
+      });
+
+      const summaryRows = buildSummaryTable(updatedPlan);
+      const response = {
+        plan_id,
+        status: v.blockers.length > 0 ? "needs_revision" : "ready_for_execution",
+        applied_changes: changes.length - changeErrors.length,
+        change_errors: changeErrors,
+        summary_for_user: summaryRows,
+        totals: {
+          plan_items_count: updatedPlan.plan_items.length,
+          sub_posts_count: updatedPlan.plan_items.reduce((a, it) => a + it.sub_posts.length, 0),
+          estimated_ai_image_generations: v.totals.image_ai_count,
+          estimated_ai_video_generations: v.totals.video_ai_count,
+          estimated_asset_uploads: v.totals.upload_count,
+          estimated_existing_asset_reuse: v.totals.reuse_count,
+          estimated_total_credits_cost: v.totals.total_ai_cost,
+          budget_remaining_before_execution: v.budget_remaining,
+          budget_remaining_after_execution:
+            v.budget_remaining !== null ? v.budget_remaining - v.totals.total_ai_cost : null,
+        },
+        warnings: v.warnings,
+        blockers: v.blockers,
+        next_step_instructions:
+          v.blockers.length > 0
+            ? "Plan still has blockers. Surface to the user, then call update_content_plan again."
+            : "Plan is valid. Surface the updated table and ask the user for explicit approval before calling execute_content_plan.",
+      };
       return { content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }] };
     },
   );
@@ -1268,5 +1302,402 @@ function displayAssetStrategy(strategy: AssetsStrategy, layout: AssetLayout): st
     if (vs.type === "ai_avatar_lipsync") return "Avatar lipsync";
     if (vs.type === "ai_avatar_video") return `Avatar video (${vs.scripts.length} escenas)`;
   }
-  return "—";
+  return "-";
+}
+
+// ── Shared validation pipeline ──────────────────────────────────────────────
+
+interface ValidationCtx {
+  networks_connected: SocialNetwork[];
+  brand_has_voice_prompt: boolean;
+}
+
+interface ValidationTotals {
+  image_ai_count: number;
+  image_ai_cost: number;
+  video_ai_count: number;
+  video_ai_cost: number;
+  upload_count: number;
+  reuse_count: number;
+  total_ai_cost: number;
+}
+
+interface ValidationResult {
+  blockers: Array<Record<string, unknown>>;
+  warnings: Array<Record<string, unknown>>;
+  totals: ValidationTotals;
+  budget_remaining: number | null;
+}
+
+async function runValidation(args: {
+  plan_items: PlanItem[];
+  time_window: { start: string; end: string };
+  ctx: ValidationCtx;
+  client: FollowrClient;
+  use_brand_voice: boolean;
+}): Promise<ValidationResult> {
+  const { plan_items, time_window, ctx, client, use_brand_voice } = args;
+  const blockers: Array<Record<string, unknown>> = [];
+  const warnings: Array<Record<string, unknown>> = [];
+  const slugSeen = new Set<string>();
+  const slotMap = new Map<string, Array<{ slug: string; network: SocialNetwork }>>();
+
+  const totals: ValidationTotals = {
+    image_ai_count: 0,
+    image_ai_cost: 0,
+    video_ai_count: 0,
+    video_ai_cost: 0,
+    upload_count: 0,
+    reuse_count: 0,
+    total_ai_cost: 0,
+  };
+
+  for (const item of plan_items) {
+    if (slugSeen.has(item.slug)) {
+      blockers.push({
+        issue: "duplicate_slug",
+        slug: item.slug,
+        detail: `Slug "${item.slug}" appears more than once. Each plan_item needs a unique slug.`,
+      });
+    }
+    slugSeen.add(item.slug);
+
+    if (item.date < time_window.start || item.date > time_window.end) {
+      warnings.push({
+        issue: "date_out_of_window",
+        item: item.slug,
+        detail: `Item date ${item.date} is outside the requested window ${time_window.start}..${time_window.end}.`,
+      });
+    }
+
+    for (let i = 0; i < item.sub_posts.length; i++) {
+      const sp = item.sub_posts[i] as SubPost;
+      const slotKey = `${item.date}T${item.publish_at_time_local}`;
+      const slotEntries = slotMap.get(slotKey) ?? [];
+      slotEntries.push({ slug: item.slug, network: sp.social_network });
+      slotMap.set(slotKey, slotEntries);
+
+      if (!ctx.networks_connected.includes(sp.social_network)) {
+        warnings.push({
+          issue: "network_not_connected",
+          item: item.slug,
+          sub_post_index: i,
+          network: sp.social_network,
+          detail: `${sp.social_network} is not connected to this company. Ask the user to connect it in Followr settings or remove it from the plan.`,
+        });
+      }
+
+      const slotSpec = NETWORK_FORMAT_COMPATIBILITY[`${sp.social_network}:${sp.product_type}`];
+      if (!slotSpec) {
+        blockers.push({
+          issue: "incompatible_product_type_for_network",
+          item: item.slug,
+          sub_post_index: i,
+          network: sp.social_network,
+          product_type: sp.product_type,
+          detail: `${sp.social_network} does not accept product_type ${sp.product_type}. See network_format_compatibility_matrix from prepare_content_plan_context.`,
+          resolution_options: networkResolutionOptions(sp.social_network, sp.product_type),
+        });
+        continue;
+      }
+      const slotAcceptsLayout = slotSpec.accepts.some(
+        (a) => a.product_type === sp.product_type && a.asset_layouts.includes(sp.asset_layout),
+      );
+      if (!slotAcceptsLayout) {
+        blockers.push({
+          issue: "incompatible_asset_layout_for_network",
+          item: item.slug,
+          sub_post_index: i,
+          network: sp.social_network,
+          product_type: sp.product_type,
+          asset_layout: sp.asset_layout,
+          detail: `${slotSpec.display_name} (${sp.product_type}) does not accept asset_layout=${sp.asset_layout}. Allowed: ${slotSpec.accepts
+            .filter((a) => a.product_type === sp.product_type)
+            .flatMap((a) => a.asset_layouts)
+            .join(", ")}.`,
+          resolution_options: layoutResolutionOptions(sp.social_network, sp.product_type, sp.asset_layout),
+        });
+        continue;
+      }
+
+      const shapeBlocker = validateLayoutShape(sp.asset_layout, sp.assets_strategy, slotSpec.max_images_in_carousel);
+      if (shapeBlocker) {
+        blockers.push({
+          issue: "asset_strategy_mismatch_for_layout",
+          item: item.slug,
+          sub_post_index: i,
+          network: sp.social_network,
+          asset_layout: sp.asset_layout,
+          detail: shapeBlocker,
+        });
+        continue;
+      }
+
+      const cost = estimateSubPostCost(sp);
+      totals.image_ai_cost += cost.image_ai_cost;
+      totals.image_ai_count += cost.image_ai_count;
+      totals.video_ai_cost += cost.video_ai_cost;
+      totals.video_ai_count += cost.video_ai_count;
+      totals.upload_count += cost.upload_count;
+      totals.reuse_count += cost.reuse_count;
+
+      if (
+        sp.asset_layout === "single_image" &&
+        /(carrusel|carousel|comparativa|comparison|múltiples?|multiples?|step.?by.?step|antes\s*\/\s*despu[eé]s|before\s*\/\s*after|\b\d+\s+looks?\b|\b\d+\s+formas?\b|\b\d+\s+tips?\b)/i.test(
+          item.rationale + " " + sp.caption_concept,
+        )
+      ) {
+        warnings.push({
+          issue: "rationale_suggests_carousel_but_layout_is_single",
+          item: item.slug,
+          sub_post_index: i,
+          detail:
+            "El rationale o caption sugieren múltiples items pero el asset_layout es single_image. Considerá cambiar a carousel_images.",
+        });
+      }
+    }
+  }
+
+  // Cross-items: duplicate network per slot.
+  for (const [slotKey, entries] of slotMap) {
+    const counts = new Map<SocialNetwork, string[]>();
+    for (const e of entries) {
+      const list = counts.get(e.network) ?? [];
+      list.push(e.slug);
+      counts.set(e.network, list);
+    }
+    for (const [network, slugs] of counts) {
+      if (slugs.length > 1) {
+        blockers.push({
+          issue: "duplicate_network_same_slot",
+          slot: slotKey,
+          network,
+          involved_items: slugs,
+          detail: `Slot ${slotKey} has ${slugs.length} sub_posts targeting ${network}. Posting twice to the same network at the same time is invalid.`,
+          resolution_options: [
+            {
+              id: "consolidate",
+              description:
+                "Merge the duplicate sub_posts into ONE plan_item with heterogeneous sub_posts (a single PostGroup with multiple per-network children).",
+            },
+            {
+              id: "drop_duplicate",
+              description: `Remove ${network} from one of the duplicate items, leaving only the remaining sub_posts in that item.`,
+            },
+            {
+              id: "different_time",
+              description: `Change the publish_at_time_local of one of the duplicate items so the two posts to ${network} land at different moments.`,
+            },
+          ],
+        });
+      }
+    }
+  }
+
+  // Budget.
+  totals.total_ai_cost = totals.image_ai_cost + totals.video_ai_cost;
+  let budgetRemaining: number | null = null;
+  try {
+    const budget = await loadBudgets(client);
+    budgetRemaining = budget?.ai_image_and_video_budget.remaining ?? null;
+  } catch {
+    budgetRemaining = null;
+  }
+  if (budgetRemaining !== null && totals.total_ai_cost > budgetRemaining) {
+    blockers.push({
+      issue: "budget_exceeded",
+      requested: totals.total_ai_cost,
+      available: budgetRemaining,
+      shortage: totals.total_ai_cost - budgetRemaining,
+      detail: `This plan needs ${totals.total_ai_cost} credits of ai_image_and_video_budget but the company has ${budgetRemaining}. Shortage: ${totals.total_ai_cost - budgetRemaining}.`,
+      resolution_options: [
+        {
+          id: "switch_to_cheaper_models",
+          description:
+            "Switch ai_generate video models to cheaper alternatives (SeeDance 1.1 Light at 20 cr/s instead of Veo 3.1 Fast at 50, or Hailuo Standard at 20). Check available_video_models from prepare_content_plan_context for affordable: true models.",
+        },
+        {
+          id: "reduce_ai_generations",
+          description:
+            "Replace some ai_generate sub_posts with use_existing_urls or upload_from_website strategies. Photos from the company's site cost 0 credits.",
+        },
+        {
+          id: "shrink_time_window",
+          description: "Reduce the number of plan_items, the time_window or the posts_per_day.",
+        },
+      ],
+    });
+  }
+
+  if (!ctx.brand_has_voice_prompt && use_brand_voice) {
+    warnings.push({
+      issue: "brand_voice_missing",
+      detail:
+        "use_brand_voice is true but this company has no brand voice prompt loaded. Copies will fall back to Followr default voice. Offer the user to create one with create_prompt BEFORE executing.",
+    });
+  }
+
+  return { blockers, warnings, totals, budget_remaining: budgetRemaining };
+}
+
+// ── update_content_plan: apply individual changes to a working plan state ──
+
+type WorkingState = {
+  plan_items: Array<PlanItem & { sub_posts: SubPost[] }>;
+  use_brand_voice: boolean;
+  auto_publish_schedule?: { timezone: string; time_per_day: string };
+};
+
+type Change =
+  | { action: "replace_item"; slug: string; new_item: PlanItem }
+  | {
+      action: "update_field";
+      slug: string;
+      field: "date" | "publish_at_time_local" | "timezone" | "concept_shared" | "rationale";
+      value: string;
+    }
+  | { action: "add_item"; new_item: PlanItem }
+  | { action: "remove_item"; slug: string }
+  | { action: "shift_dates"; days_offset: number }
+  | { action: "set_global"; field: "use_brand_voice" | "auto_publish_schedule"; value: unknown }
+  | { action: "replace_sub_post"; slug: string; sub_post_index: number; new_sub_post: SubPost }
+  | { action: "add_sub_post"; slug: string; new_sub_post: SubPost }
+  | { action: "remove_sub_post"; slug: string; sub_post_index: number }
+  | {
+      action: "split_subposts_by_network";
+      slug: string;
+      new_items: Array<{ slug: string; publish_at_time_local: string; networks: SocialNetwork[] }>;
+    }
+  | {
+      action: "convert_to_carousel";
+      slug: string;
+      sub_post_index: number;
+      new_carousel_sources: NonNullable<AssetsStrategy["carousel_sources"]>;
+    };
+
+function applyChange(state: WorkingState, change: Change): void {
+  switch (change.action) {
+    case "replace_item": {
+      const idx = state.plan_items.findIndex((it) => it.slug === change.slug);
+      if (idx < 0) throw new Error(`replace_item: slug ${change.slug} not found.`);
+      state.plan_items[idx] = { ...change.new_item, sub_posts: [...change.new_item.sub_posts] };
+      return;
+    }
+    case "update_field": {
+      const it = state.plan_items.find((x) => x.slug === change.slug);
+      if (!it) throw new Error(`update_field: slug ${change.slug} not found.`);
+      (it as unknown as Record<string, unknown>)[change.field] = change.value;
+      return;
+    }
+    case "add_item": {
+      if (state.plan_items.some((x) => x.slug === change.new_item.slug)) {
+        throw new Error(`add_item: slug ${change.new_item.slug} already exists.`);
+      }
+      state.plan_items.push({ ...change.new_item, sub_posts: [...change.new_item.sub_posts] });
+      return;
+    }
+    case "remove_item": {
+      const idx = state.plan_items.findIndex((it) => it.slug === change.slug);
+      if (idx < 0) throw new Error(`remove_item: slug ${change.slug} not found.`);
+      state.plan_items.splice(idx, 1);
+      return;
+    }
+    case "shift_dates": {
+      const offsetMs = change.days_offset * 24 * 60 * 60 * 1000;
+      for (const it of state.plan_items) {
+        const d = new Date(`${it.date}T00:00:00Z`);
+        d.setTime(d.getTime() + offsetMs);
+        it.date = d.toISOString().slice(0, 10);
+      }
+      return;
+    }
+    case "set_global": {
+      if (change.field === "use_brand_voice") {
+        if (typeof change.value !== "boolean") throw new Error("set_global use_brand_voice expects boolean.");
+        state.use_brand_voice = change.value;
+      } else if (change.field === "auto_publish_schedule") {
+        const v = change.value as { timezone?: string; time_per_day?: string } | null;
+        if (!v || typeof v.timezone !== "string" || typeof v.time_per_day !== "string") {
+          throw new Error("set_global auto_publish_schedule expects {timezone, time_per_day}.");
+        }
+        state.auto_publish_schedule = { timezone: v.timezone, time_per_day: v.time_per_day };
+      }
+      return;
+    }
+    case "replace_sub_post": {
+      const it = state.plan_items.find((x) => x.slug === change.slug);
+      if (!it) throw new Error(`replace_sub_post: slug ${change.slug} not found.`);
+      if (change.sub_post_index < 0 || change.sub_post_index >= it.sub_posts.length) {
+        throw new Error(`replace_sub_post: index ${change.sub_post_index} out of range.`);
+      }
+      it.sub_posts[change.sub_post_index] = { ...change.new_sub_post };
+      return;
+    }
+    case "add_sub_post": {
+      const it = state.plan_items.find((x) => x.slug === change.slug);
+      if (!it) throw new Error(`add_sub_post: slug ${change.slug} not found.`);
+      it.sub_posts.push({ ...change.new_sub_post });
+      return;
+    }
+    case "remove_sub_post": {
+      const it = state.plan_items.find((x) => x.slug === change.slug);
+      if (!it) throw new Error(`remove_sub_post: slug ${change.slug} not found.`);
+      if (change.sub_post_index < 0 || change.sub_post_index >= it.sub_posts.length) {
+        throw new Error(`remove_sub_post: index ${change.sub_post_index} out of range.`);
+      }
+      it.sub_posts.splice(change.sub_post_index, 1);
+      if (it.sub_posts.length === 0) {
+        // Empty plan_item is invalid; remove it.
+        state.plan_items = state.plan_items.filter((x) => x.slug !== change.slug);
+      }
+      return;
+    }
+    case "split_subposts_by_network": {
+      const idx = state.plan_items.findIndex((x) => x.slug === change.slug);
+      if (idx < 0) throw new Error(`split_subposts_by_network: slug ${change.slug} not found.`);
+      const original = state.plan_items[idx]!;
+      const partition = new Map<SocialNetwork, SubPost[]>();
+      for (const sp of original.sub_posts) partition.set(sp.social_network, [
+        ...(partition.get(sp.social_network) ?? []),
+        sp,
+      ]);
+      const newItems: PlanItem[] = [];
+      const pairedSlugs = change.new_items.map((n) => n.slug);
+      for (const ni of change.new_items) {
+        const collectedSubPosts: SubPost[] = [];
+        for (const net of ni.networks) {
+          const sps = partition.get(net) ?? [];
+          collectedSubPosts.push(...sps);
+        }
+        if (collectedSubPosts.length === 0) {
+          throw new Error(
+            `split_subposts_by_network: no sub_posts found in original "${change.slug}" matching networks ${ni.networks.join(", ")}.`,
+          );
+        }
+        newItems.push({
+          slug: ni.slug,
+          date: original.date,
+          publish_at_time_local: ni.publish_at_time_local,
+          timezone: original.timezone,
+          concept_shared: original.concept_shared,
+          rationale: original.rationale,
+          paired_with: pairedSlugs.filter((s) => s !== ni.slug),
+          sub_posts: collectedSubPosts,
+        });
+      }
+      state.plan_items.splice(idx, 1, ...newItems);
+      return;
+    }
+    case "convert_to_carousel": {
+      const it = state.plan_items.find((x) => x.slug === change.slug);
+      if (!it) throw new Error(`convert_to_carousel: slug ${change.slug} not found.`);
+      const sp = it.sub_posts[change.sub_post_index];
+      if (!sp) throw new Error(`convert_to_carousel: sub_post_index out of range.`);
+      sp.asset_layout = "carousel_images";
+      sp.assets_strategy = {
+        carousel_sources: [...change.new_carousel_sources],
+      };
+      return;
+    }
+  }
 }
