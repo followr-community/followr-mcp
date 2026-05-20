@@ -33,43 +33,20 @@ zsh -ic "cd /Users/marcosplazadeayala/Documents/Claude/proyectos/Followr/followr
 
 The `zsh -ic` wrapper sources `~/.zshrc` so `CLOUDFLARE_API_TOKEN` is available.
 
-## How to add this landing to `followr-fan-club`
+## How this landing is wired into `followr-fan-club`
 
-Once `followr-mcp.pages.dev` is live, drop a new product card in the fan club:
+Already done. The fan club hosts a product card pointing at `https://followr-mcp.pages.dev`. Quick map so future edits know where each piece lives:
 
-1. Copy `assets/mcp-mark.svg` to `followr-fan-club/assets/products/mcp-mark.svg`.
-2. Open `followr-fan-club/index.html`, find `<section class="products">`, append a new `<a class="product-card">` between the existing two. Use the existing cards as a template:
+- `followr-fan-club/index.html` has the `<a class="product-card">` inside `<section class="products">`. Click target is `https://followr-mcp.pages.dev`, tags are `mcp` / `claude` / `cursor`, sticker is `sticker-live`.
+- `followr-fan-club/i18n.js` has `card.mcp.tagline` translated for EN and ES.
+- `followr-fan-club/assets/products/mcp-mark.svg` is the icon used on the card. It is NOT a copy of `landing/assets/mcp-mark.svg` (that one is the chat bubble + Followr star, used for the favicon and the nav of this landing). The fan-club mark is a different design: the Claude starburst (the same path data as `landing/assets/claude-mark.svg`) scaled 0.34x and centered inside the dark rounded square used by the other fan-club product marks. The reason: the Claude starburst reads as "AI / Claude-y" in a product grid faster than the chat bubble, and visually differentiates from PostApprove (green gradient `P`) and Bulk Uploader (upload arrow).
 
-   ```html
-   <a class="product-card" href="https://followr-mcp.pages.dev" target="_blank" rel="noopener noreferrer">
-     <div class="card-top">
-       <img class="product-mark" src="assets/products/mcp-mark.svg" alt="" width="48" height="48" />
-       <span class="sticker sticker-live" data-i18n="sticker.live">live</span>
-     </div>
-     <h3>Followr MCP</h3>
-     <p class="product-tagline" data-i18n="card.mcp.tagline">Run Followr from Claude, Cursor and any MCP client.</p>
-     <div class="card-tags">
-       <span class="tag">mcp</span>
-       <span class="tag">claude</span>
-       <span class="tag">cursor</span>
-     </div>
-     <div class="card-cta">
-       <span data-i18n="card.cta">Visit</span>
-       <span class="card-cta-arrow" aria-hidden="true">&rarr;</span>
-     </div>
-   </a>
-   ```
+If the mark needs to change (the Claude logo evolves, the design shifts):
 
-3. Open `followr-fan-club/i18n.js`, add the tagline key to both EN and ES blocks:
-   ```js
-   "card.mcp.tagline": "Run Followr from Claude, Cursor and any MCP client.",
-   ```
-   ES:
-   ```js
-   "card.mcp.tagline": "Manejá Followr desde Claude, Cursor y cualquier cliente MCP.",
-   ```
+1. Edit `followr-fan-club/assets/products/mcp-mark.svg` directly.
+2. Redeploy the fan club: `zsh -ic "cd /Users/marcosplazadeayala/Documents/Claude/proyectos/Followr/followr-fan-club && npx wrangler pages deploy . --project-name=followr-fan-club --branch=main"`.
 
-4. Redeploy the fan club.
+If the tagline or tags need to change, the source of truth is `followr-fan-club/i18n.js` for the tagline (the English string in `index.html` is only a fallback) and `followr-fan-club/index.html` for the tags.
 
 ## Editing copy
 
@@ -104,9 +81,11 @@ landing/
   _headers                Cloudflare Pages headers (cache + CSP)
   README.md               this file
   assets/
-    favicon.svg
-    og-image.svg
-    mcp-mark.svg          the product mark (chat bubble + Followr star)
+    favicon.svg           same as mcp-mark.svg (browser tab icon)
+    og-image.svg          social share card (1200x630)
+    mcp-mark.svg          chat bubble + Followr star (favicon + nav)
+    claude-mark.svg       11-ray coral starburst (chat bubble label, Claude
+                          client badges, hero watermark, fan-club product card)
 ```
 
 ## Pages
