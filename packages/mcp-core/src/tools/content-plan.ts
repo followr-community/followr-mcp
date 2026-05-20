@@ -34,7 +34,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import type { RegisterOptions } from "../index.js";
-import { READ_ONLY } from "../lib/annotations.js";
+import { MUTATION_IDEMPOTENT, READ_ONLY } from "../lib/annotations.js";
 import {
   FOLLOWR_CAPABILITIES_SUMMARY,
   IMAGE_MODELS,
@@ -43,9 +43,20 @@ import {
   VIDEO_MODELS,
   compatibilityFor,
 } from "../lib/content-plan-catalog.js";
-import { createContext } from "../lib/content-plan-state.js";
-import type { SocialNetwork } from "../lib/content-plan-state.js";
-import { toolErrorFromException } from "../lib/tool-error.js";
+import {
+  type AssetLayout,
+  type AssetsStrategy,
+  type ContentPlan,
+  type PlanItem,
+  type ProductType,
+  type SocialNetwork,
+  type SubPost,
+  createContext,
+  createPlan,
+  getContext,
+  getPlan,
+} from "../lib/content-plan-state.js";
+import { toolError, toolErrorFromException } from "../lib/tool-error.js";
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -591,4 +602,671 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
       return { content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }] };
     },
   );
+
+  // ────────────────────────────────────────────────────────────────────────
+  // draft_content_plan
+  // ────────────────────────────────────────────────────────────────────────
+
+  const SocialNetworkEnum = z.enum([
+    "instagram",
+    "tiktok",
+    "facebook",
+    "linkedin",
+    "x",
+    "pinterest",
+    "threads",
+    "youtube",
+    "bluesky",
+  ]);
+
+  const ProductTypeEnum = z.enum(["feed", "reel", "story", "short", "long_video"]);
+  const AssetLayoutEnum = z.enum([
+    "single_image",
+    "carousel_images",
+    "single_video",
+    "carousel_mixed",
+    "single_gif",
+  ]);
+
+  const AssetSourceUrlSchema = z.object({
+    type: z.literal("url"),
+    url: z.string().url(),
+  });
+  const AssetSourceAssetIdSchema = z.object({
+    type: z.literal("asset_id"),
+    id: z.number().int().positive(),
+  });
+  const AssetSourceAiImageSchema = z.object({
+    type: z.literal("ai_generate"),
+    prompt: z.string().min(1).max(2000),
+    reference_image_url: z.string().url().optional(),
+    model: z.string().optional(),
+  });
+  const AssetSourceAiVideoSchema = z.object({
+    type: z.literal("ai_generate"),
+    model: z.string().min(1),
+    prompt: z.string().min(1).max(2000),
+    reference_image_url: z.string().url().optional(),
+    duration_seconds: z.number().positive().max(60).default(8),
+  });
+  const AssetSourceAvatarLipsyncSchema = z.object({
+    type: z.literal("ai_avatar_lipsync"),
+    script: z.string().min(1).max(500),
+    avatar_id: z.number().int().positive(),
+  });
+  const AssetSourceAvatarVideoSchema = z.object({
+    type: z.literal("ai_avatar_video"),
+    scripts: z.array(z.string().min(1).max(500)).min(1).max(10),
+    avatar_id: z.number().int().positive(),
+    generate_backgrounds: z.boolean().optional(),
+  });
+
+  const AssetsStrategySchema = z.object({
+    image_source: z
+      .union([AssetSourceUrlSchema, AssetSourceAssetIdSchema, AssetSourceAiImageSchema])
+      .optional(),
+    carousel_sources: z
+      .array(z.union([AssetSourceUrlSchema, AssetSourceAssetIdSchema, AssetSourceAiImageSchema]))
+      .min(2)
+      .max(20)
+      .optional(),
+    video_source: z
+      .union([
+        AssetSourceUrlSchema,
+        AssetSourceAssetIdSchema,
+        AssetSourceAiVideoSchema,
+        AssetSourceAvatarLipsyncSchema,
+        AssetSourceAvatarVideoSchema,
+      ])
+      .optional(),
+  });
+
+  const SubPostSchema = z.object({
+    social_network: SocialNetworkEnum,
+    product_type: ProductTypeEnum,
+    asset_layout: AssetLayoutEnum,
+    assets_strategy: AssetsStrategySchema,
+    caption_concept: z.string().min(1).max(2000),
+    tags: z.array(z.string()).optional(),
+  });
+
+  const PlanItemSchema = z.object({
+    slug: z
+      .string()
+      .min(1)
+      .max(80)
+      .regex(/^[a-z0-9\-_]+$/i, "slug must be alphanumeric with - or _"),
+    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "expected YYYY-MM-DD"),
+    publish_at_time_local: z
+      .string()
+      .regex(/^\d{2}:\d{2}$/, "expected HH:mm (24h)"),
+    timezone: z.string().min(1).max(60),
+    concept_shared: z.string().min(1).max(500),
+    rationale: z.string().min(1).max(1000),
+    paired_with: z.array(z.string().min(1).max(80)).optional(),
+    sub_posts: z.array(SubPostSchema).min(1).max(10),
+  });
+
+  server.registerTool(
+    "draft_content_plan",
+    {
+      annotations: MUTATION_IDEMPOTENT,
+      title: "Validate a structured content plan and persist it for review before execution",
+      description: `Take a fully-structured plan_items array (each plan_item = one PostGroup with one or more per-network sub_posts) and validate it against the connected networks, per-network specs, asset layout compatibility, carousel limits and the user's current AI budget. On success, persists the plan in session memory with a plan_id that the user can later approve via execute_content_plan.
+
+PRECONDITION: must have called prepare_content_plan_context first and pass its context_id here. The context anchors the company, the networks connected and the budget snapshot. If the context_id expired (2h TTL), re-call prepare_content_plan_context.
+
+WHAT GETS VALIDATED:
+- Each sub_post: social_network + product_type + asset_layout is a legal combination per the compatibility matrix. TikTok feed image is rejected. Instagram Reel carousel is rejected. Twitter carousel of 5 is rejected (max 4). Etc.
+- Each sub_post: asset_layout matches the assets_strategy shape. single_image requires image_source; carousel_images requires carousel_sources (2 to N per network); single_video requires video_source. Mismatches block.
+- Cross-items: within the same (date, publish_at_time_local) slot, the union of social_network values must be unique. Posting to Instagram twice at the same time triggers a blocker with resolution_options (consolidate, drop, different_time).
+- Budget: estimated total cost of all AI generations (video clips + AI images) must fit ai_image_and_video_budget.remaining. Otherwise blocker with breakdown.
+- Soft warnings (NON-blocking): rationale that suggests multiple items (carousel, comparativa, N looks, comparativa) but asset_layout is single_image. Brand voice missing. Network not connected on the company.
+
+OUTPUT: plan_id (session-only, lost on server restart), a summary table for the user (display_name format), totals (counts + estimated cost + budget after), warnings (NON-blocking, for the user to read), blockers (BLOCKING, must be resolved before this plan can execute) with concrete resolution_options. If blockers are present, the plan is still persisted as draft so update_content_plan can fix individual fields without re-sending the whole structure.
+
+THIS TOOL DOES NOT GENERATE OR UPLOAD ANYTHING. It is pure validation + persistence. Costs nothing.
+
+MUTATION but IDEMPOTENT for the same input: re-calling with the same context_id and the same plan_items array returns a new plan_id pointing to the same content. No external side effects in Followr.
+
+AFTER THIS RETURNS: show the summary table to the user verbatim, list any warnings, and ask for explicit approval. ONLY THEN call execute_content_plan(plan_id, confirm: true). If the user wants changes, call update_content_plan(plan_id, changes) instead.`,
+      inputSchema: {
+        context_id: z.string().min(1),
+        time_window: z.object({
+          start: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+          end: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        }),
+        user_answers: z
+          .object({
+            posts_per_day: z.number().int().positive().max(20).optional(),
+            networks_intent: z.array(SocialNetworkEnum).optional(),
+            theme: z.string().max(500).optional(),
+            promo_context: z.string().max(500).optional(),
+          })
+          .optional(),
+        plan_items: z.array(PlanItemSchema).min(1).max(60),
+        use_brand_voice: z.boolean().optional().default(true),
+        auto_publish_schedule: z
+          .object({
+            timezone: z.string().min(1),
+            time_per_day: z.string().regex(/^\d{2}:\d{2}$/),
+          })
+          .optional(),
+      },
+    },
+    async (input) => {
+      // 1. Validate context.
+      const ctx = getContext(input.context_id);
+      if (!ctx) {
+        return toolError({
+          reason: "context_id_invalid_or_expired",
+          user_message:
+            "El context de planning expiró o no es válido. Llamá a prepare_content_plan_context de nuevo para refrescar el contexto y reintentá.",
+          suggested_actions: [
+            {
+              tool: "prepare_content_plan_context",
+              rationale: "Re-load context with current budget and network state.",
+            },
+          ],
+          blocking: true,
+        });
+      }
+
+      // 2. Per-item validation (intra) + collect cross-data.
+      const blockers: Array<Record<string, unknown>> = [];
+      const warnings: Array<Record<string, unknown>> = [];
+      const slugSeen = new Set<string>();
+      const slotMap = new Map<string, Array<{ slug: string; network: SocialNetwork }>>();
+
+      let totalImagesAiCost = 0;
+      let totalImagesAiCount = 0;
+      let totalVideosAiCost = 0;
+      let totalVideosAiCount = 0;
+      let totalUploadsCount = 0;
+      let totalExistingAssetReuse = 0;
+
+      for (const item of input.plan_items) {
+        // Unique slug across items.
+        if (slugSeen.has(item.slug)) {
+          blockers.push({
+            issue: "duplicate_slug",
+            slug: item.slug,
+            detail: `Slug "${item.slug}" appears more than once. Each plan_item needs a unique slug.`,
+          });
+        }
+        slugSeen.add(item.slug);
+
+        // Date in window.
+        if (item.date < input.time_window.start || item.date > input.time_window.end) {
+          warnings.push({
+            issue: "date_out_of_window",
+            item: item.slug,
+            detail: `Item date ${item.date} is outside the requested window ${input.time_window.start}..${input.time_window.end}.`,
+          });
+        }
+
+        // Per-sub-post validation.
+        for (let i = 0; i < item.sub_posts.length; i++) {
+          const sp = item.sub_posts[i] as SubPost;
+          const slotKey = `${item.date}T${item.publish_at_time_local}`;
+          (slotMap.get(slotKey) ?? slotMap.set(slotKey, []).get(slotKey))!.push({
+            slug: item.slug,
+            network: sp.social_network,
+          });
+
+          // Network connected on this company?
+          if (!ctx.networks_connected.includes(sp.social_network)) {
+            warnings.push({
+              issue: "network_not_connected",
+              item: item.slug,
+              sub_post_index: i,
+              network: sp.social_network,
+              detail: `${sp.social_network} is not connected to this company. Ask the user to connect it in Followr settings or remove it from the plan.`,
+            });
+          }
+
+          // social_network + product_type + asset_layout compatibility.
+          const slotSpec = NETWORK_FORMAT_COMPATIBILITY[`${sp.social_network}:${sp.product_type}`];
+          if (!slotSpec) {
+            blockers.push({
+              issue: "incompatible_product_type_for_network",
+              item: item.slug,
+              sub_post_index: i,
+              network: sp.social_network,
+              product_type: sp.product_type,
+              detail: `${sp.social_network} does not accept product_type ${sp.product_type}. See network_format_compatibility_matrix from prepare_content_plan_context.`,
+              resolution_options: networkResolutionOptions(sp.social_network, sp.product_type),
+            });
+            continue;
+          }
+          const slotAcceptsLayout = slotSpec.accepts.some(
+            (a) => a.product_type === sp.product_type && a.asset_layouts.includes(sp.asset_layout),
+          );
+          if (!slotAcceptsLayout) {
+            blockers.push({
+              issue: "incompatible_asset_layout_for_network",
+              item: item.slug,
+              sub_post_index: i,
+              network: sp.social_network,
+              product_type: sp.product_type,
+              asset_layout: sp.asset_layout,
+              detail: `${slotSpec.display_name} (${sp.product_type}) does not accept asset_layout=${sp.asset_layout}. Allowed: ${slotSpec.accepts
+                .filter((a) => a.product_type === sp.product_type)
+                .flatMap((a) => a.asset_layouts)
+                .join(", ")}.`,
+              resolution_options: layoutResolutionOptions(sp.social_network, sp.product_type, sp.asset_layout),
+            });
+            continue;
+          }
+
+          // asset_layout vs assets_strategy shape.
+          const shapeBlocker = validateLayoutShape(sp.asset_layout, sp.assets_strategy, slotSpec.max_images_in_carousel);
+          if (shapeBlocker) {
+            blockers.push({
+              issue: "asset_strategy_mismatch_for_layout",
+              item: item.slug,
+              sub_post_index: i,
+              network: sp.social_network,
+              asset_layout: sp.asset_layout,
+              detail: shapeBlocker,
+            });
+            continue;
+          }
+
+          // Cost estimation per sub_post.
+          const cost = estimateSubPostCost(sp);
+          totalImagesAiCost += cost.image_ai_cost;
+          totalImagesAiCount += cost.image_ai_count;
+          totalVideosAiCost += cost.video_ai_cost;
+          totalVideosAiCount += cost.video_ai_count;
+          totalUploadsCount += cost.upload_count;
+          totalExistingAssetReuse += cost.reuse_count;
+
+          // Rationale ↔ layout coherence soft warning.
+          if (
+            sp.asset_layout === "single_image" &&
+            /(carrusel|carousel|comparativa|comparison|múltiples?|multiples?|step.?by.?step|antes\s*\/\s*despu[eé]s|before\s*\/\s*after|\b\d+\s+looks?\b|\b\d+\s+formas?\b|\b\d+\s+tips?\b)/i.test(item.rationale + " " + sp.caption_concept)
+          ) {
+            warnings.push({
+              issue: "rationale_suggests_carousel_but_layout_is_single",
+              item: item.slug,
+              sub_post_index: i,
+              detail:
+                "El rationale o caption sugieren múltiples items pero el asset_layout es single_image. Considerá cambiar a carousel_images.",
+            });
+          }
+        }
+      }
+
+      // 3. Cross-items: duplicate network per slot.
+      for (const [slotKey, entries] of slotMap) {
+        const counts = new Map<SocialNetwork, string[]>();
+        for (const e of entries) {
+          (counts.get(e.network) ?? counts.set(e.network, []).get(e.network))!.push(e.slug);
+        }
+        for (const [network, slugs] of counts) {
+          if (slugs.length > 1) {
+            blockers.push({
+              issue: "duplicate_network_same_slot",
+              slot: slotKey,
+              network,
+              involved_items: slugs,
+              detail: `Slot ${slotKey} has ${slugs.length} sub_posts targeting ${network}. Posting twice to the same network at the same time is invalid.`,
+              resolution_options: [
+                {
+                  id: "consolidate",
+                  description:
+                    "Merge the duplicate sub_posts into ONE plan_item with heterogeneous sub_posts (a single PostGroup with multiple per-network children).",
+                },
+                {
+                  id: "drop_duplicate",
+                  description: `Remove ${network} from one of the duplicate items, leaving only the remaining sub_posts in that item.`,
+                },
+                {
+                  id: "different_time",
+                  description:
+                    "Change the publish_at_time_local of one of the duplicate items so the two posts to ${network} land at different moments.",
+                },
+              ],
+            });
+          }
+        }
+      }
+
+      // 4. Budget check.
+      const totalAiCost = totalImagesAiCost + totalVideosAiCost;
+      // We can't introspect the live budget here without a fresh API call; use
+      // the snapshot pattern: re-fetch a budget summary so the agent surfaces
+      // an up-to-date number. If budget cannot be loaded, skip the hard check.
+      let budgetRemaining: number | null = null;
+      try {
+        const budget = await loadBudgets(client);
+        budgetRemaining = budget?.ai_image_and_video_budget.remaining ?? null;
+      } catch {
+        budgetRemaining = null;
+      }
+      if (budgetRemaining !== null && totalAiCost > budgetRemaining) {
+        blockers.push({
+          issue: "budget_exceeded",
+          requested: totalAiCost,
+          available: budgetRemaining,
+          shortage: totalAiCost - budgetRemaining,
+          detail: `This plan needs ${totalAiCost} credits of ai_image_and_video_budget but the company has ${budgetRemaining}. Shortage: ${totalAiCost - budgetRemaining}.`,
+          resolution_options: [
+            {
+              id: "switch_to_cheaper_models",
+              description:
+                "Switch ai_generate video models to cheaper alternatives (SeeDance 1.1 Light at 20 cr/s instead of Veo 3.1 Fast at 50, or Hailuo Standard at 20). Check available_video_models from prepare_content_plan_context for affordable: true models.",
+            },
+            {
+              id: "reduce_ai_generations",
+              description:
+                "Replace some ai_generate sub_posts with use_existing_urls or upload_from_website strategies. Photos from the company's site cost 0 credits.",
+            },
+            {
+              id: "shrink_time_window",
+              description: "Reduce the number of plan_items, the time_window or the posts_per_day.",
+            },
+          ],
+        });
+      }
+
+      // 5. Brand voice missing soft warning.
+      if (!ctx.brand_has_voice_prompt && input.use_brand_voice) {
+        warnings.push({
+          issue: "brand_voice_missing",
+          detail:
+            "use_brand_voice is true but this company has no brand voice prompt loaded. Copies will fall back to Followr default voice. Offer the user to create one with create_prompt BEFORE executing.",
+        });
+      }
+
+      // 6. Persist plan (even with blockers, so update_content_plan can fix fields).
+      const plan = createPlan({
+        context_id: input.context_id,
+        company_id: ctx.company_id,
+        time_window: input.time_window,
+        user_answers: input.user_answers ?? {},
+        plan_items: input.plan_items as PlanItem[],
+        use_brand_voice: input.use_brand_voice ?? true,
+        ...(input.auto_publish_schedule ? { auto_publish_schedule: input.auto_publish_schedule } : {}),
+      });
+
+      // 7. Build summary table for the user.
+      const summaryRows = buildSummaryTable(plan);
+
+      const response = {
+        plan_id: plan.plan_id,
+        status: blockers.length > 0 ? "needs_revision" : "ready_for_execution",
+        summary_for_user: summaryRows,
+        totals: {
+          plan_items_count: input.plan_items.length,
+          sub_posts_count: input.plan_items.reduce((a, it) => a + it.sub_posts.length, 0),
+          estimated_ai_image_generations: totalImagesAiCount,
+          estimated_ai_video_generations: totalVideosAiCount,
+          estimated_asset_uploads: totalUploadsCount,
+          estimated_existing_asset_reuse: totalExistingAssetReuse,
+          estimated_total_credits_cost: totalAiCost,
+          budget_remaining_before_execution: budgetRemaining,
+          budget_remaining_after_execution:
+            budgetRemaining !== null ? budgetRemaining - totalAiCost : null,
+        },
+        warnings,
+        blockers,
+        next_step_instructions:
+          blockers.length > 0
+            ? "There are blockers (listed above). Surface them to the user with the resolution_options for each, then call update_content_plan(plan_id, changes) with the chosen fixes. Do NOT call execute_content_plan until status is ready_for_execution."
+            : "Show summary_for_user to the user (translate display_name fields, never expose ids). List any warnings. Ask for explicit approval ('lo ejecuto?' / 'cambio algo?'). When the user confirms, call execute_content_plan(plan_id, confirm: true). If the user wants to change a specific item, call update_content_plan(plan_id, changes) instead.",
+      };
+
+      return { content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }] };
+    },
+  );
+
+  // ────────────────────────────────────────────────────────────────────────
+  // get_content_plan (read-only inspector)
+  // ────────────────────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "get_content_plan",
+    {
+      annotations: READ_ONLY,
+      title: "Read a previously drafted content plan back from session memory",
+      description: `Return a content plan currently held in MCP server memory by plan_id. Useful for re-displaying the plan after iteration, debugging, or surfacing it to the user mid-flow.
+
+OUTPUT: same shape as draft_content_plan (plan_id, status, summary_for_user, totals, plan_items, time_window, etc.). Returns 404-style error if the plan_id has expired (session-only) or never existed.`,
+      inputSchema: {
+        plan_id: z.string().min(1),
+      },
+    },
+    async ({ plan_id }) => {
+      const plan = getPlan(plan_id);
+      if (!plan) {
+        return toolError({
+          reason: "plan_id_not_found",
+          user_message:
+            "No encuentro ese plan. Puede haber expirado (los planes viven 2hs en memoria del MCP server) o nunca fue creado. Llamá draft_content_plan para crear uno nuevo.",
+          blocking: true,
+        });
+      }
+      const summary = buildSummaryTable(plan);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                plan_id: plan.plan_id,
+                status: plan.status,
+                company_id: plan.company_id,
+                time_window: plan.time_window,
+                use_brand_voice: plan.use_brand_voice,
+                auto_publish_schedule: plan.auto_publish_schedule ?? null,
+                summary_for_user: summary,
+                plan_items: plan.plan_items,
+                created_at_iso: new Date(plan.created_at_ms).toISOString(),
+                expires_at_iso: new Date(plan.expires_at_ms).toISOString(),
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    },
+  );
+}
+
+// ── Validation helpers ──────────────────────────────────────────────────────
+
+function networkResolutionOptions(network: SocialNetwork, requestedType: ProductType) {
+  // Map each network to the product_types it actually accepts.
+  const accepted = Object.entries(NETWORK_FORMAT_COMPATIBILITY)
+    .filter(([key]) => key.startsWith(`${network}:`))
+    .flatMap(([, spec]) => spec.accepts.map((a) => a.product_type));
+  return [
+    {
+      id: "change_product_type",
+      description: `Change product_type to one accepted by ${network}: ${[...new Set(accepted)].join(", ") || "(none configured)"}.`,
+    },
+    {
+      id: "change_network",
+      description: `Drop ${network} from networks of this sub_post and target only networks that accept ${requestedType}.`,
+    },
+  ];
+}
+
+function layoutResolutionOptions(network: SocialNetwork, productType: ProductType, layout: AssetLayout) {
+  const slotSpec = NETWORK_FORMAT_COMPATIBILITY[`${network}:${productType}`];
+  const allowed = slotSpec ? slotSpec.accepts.find((a) => a.product_type === productType)?.asset_layouts ?? [] : [];
+  return [
+    {
+      id: "switch_layout",
+      description: `Switch asset_layout to one accepted on ${network} ${productType}: ${allowed.join(", ") || "(none)"}.`,
+    },
+    {
+      id: "split_subpost",
+      description: `If the same concept needs ${layout} on another network, split this sub_post into two: keep ${layout} for the network that accepts it, generate a video sub_post for ${network}.`,
+    },
+  ];
+}
+
+function validateLayoutShape(
+  layout: AssetLayout,
+  strategy: AssetsStrategy,
+  maxImagesInCarousel: number,
+): string | null {
+  if (layout === "single_image") {
+    if (!strategy.image_source) return "asset_layout=single_image requires assets_strategy.image_source.";
+  } else if (layout === "carousel_images") {
+    if (!strategy.carousel_sources || strategy.carousel_sources.length < 2) {
+      return "asset_layout=carousel_images requires assets_strategy.carousel_sources with at least 2 items.";
+    }
+    if (strategy.carousel_sources.length > maxImagesInCarousel) {
+      return `asset_layout=carousel_images: this network accepts at most ${maxImagesInCarousel} images, received ${strategy.carousel_sources.length}.`;
+    }
+  } else if (layout === "single_video" || layout === "single_gif") {
+    if (!strategy.video_source) return `asset_layout=${layout} requires assets_strategy.video_source.`;
+  } else if (layout === "carousel_mixed") {
+    // Only Threads supports mixed. carousel_sources may include video/gif items;
+    // we don't enforce strict types here because the API tolerates the variation.
+    if (!strategy.carousel_sources || strategy.carousel_sources.length < 2) {
+      return "asset_layout=carousel_mixed requires assets_strategy.carousel_sources with at least 2 items.";
+    }
+  }
+  return null;
+}
+
+interface SubPostCost {
+  image_ai_cost: number;
+  image_ai_count: number;
+  video_ai_cost: number;
+  video_ai_count: number;
+  upload_count: number;
+  reuse_count: number;
+}
+
+function estimateSubPostCost(sp: SubPost): SubPostCost {
+  const out: SubPostCost = {
+    image_ai_cost: 0,
+    image_ai_count: 0,
+    video_ai_cost: 0,
+    video_ai_count: 0,
+    upload_count: 0,
+    reuse_count: 0,
+  };
+
+  const accumulateImageSource = (src: AssetsStrategy["image_source"] | NonNullable<AssetsStrategy["carousel_sources"]>[number]) => {
+    if (!src) return;
+    if (src.type === "url") out.upload_count += 1;
+    else if (src.type === "asset_id") out.reuse_count += 1;
+    else if (src.type === "ai_generate") {
+      const model = IMAGE_MODELS.find((m) => m.model_id === (src.model ?? "nano_banana_2")) ?? IMAGE_MODELS[0];
+      out.image_ai_count += 1;
+      out.image_ai_cost += model?.cost_per_image ?? 25;
+    }
+  };
+
+  if (sp.assets_strategy.image_source) accumulateImageSource(sp.assets_strategy.image_source);
+  if (sp.assets_strategy.carousel_sources) {
+    for (const s of sp.assets_strategy.carousel_sources) accumulateImageSource(s);
+  }
+  if (sp.assets_strategy.video_source) {
+    const vs = sp.assets_strategy.video_source;
+    if (vs.type === "url") out.upload_count += 1;
+    else if (vs.type === "asset_id") out.reuse_count += 1;
+    else if (vs.type === "ai_generate") {
+      const model = VIDEO_MODELS.find((m) => m.model_id === vs.model);
+      if (model) {
+        out.video_ai_count += 1;
+        const duration = vs.duration_seconds ?? model.default_duration_seconds;
+        out.video_ai_cost += model.cost_per_second * duration;
+      } else {
+        // Unknown model; charge conservative high estimate so the budget check
+        // catches it. Equivalent to Veo 3 Fast (3200 cr).
+        out.video_ai_count += 1;
+        out.video_ai_cost += 400 * 8;
+      }
+    } else if (vs.type === "ai_avatar_lipsync") {
+      // veed_fabric at ~25 cr/sec, average ~12 sec.
+      out.video_ai_count += 1;
+      out.video_ai_cost += 25 * 12;
+    } else if (vs.type === "ai_avatar_video") {
+      // Multi-scene: each scene ~10 sec at 25 cr/sec + backgrounds.
+      const sceneCount = vs.scripts.length;
+      const lipsyncCost = 25 * 10 * sceneCount;
+      const backgroundCost = vs.generate_backgrounds ? 60 * sceneCount : 0;
+      out.video_ai_count += 1;
+      out.video_ai_cost += lipsyncCost + backgroundCost;
+    }
+  }
+  return out;
+}
+
+function buildSummaryTable(plan: ContentPlan): string[] {
+  const lines: string[] = [];
+  lines.push("| Día | Hora | Concepto | Red | Formato | Asset | Costo estimado |");
+  lines.push("|-----|------|----------|-----|---------|-------|----------------|");
+  for (const item of plan.plan_items) {
+    for (let i = 0; i < item.sub_posts.length; i++) {
+      const sp = item.sub_posts[i] as SubPost;
+      const cost = estimateSubPostCost(sp);
+      const totalCost = cost.image_ai_cost + cost.video_ai_cost;
+      lines.push(
+        `| ${item.date} | ${item.publish_at_time_local} | ${i === 0 ? item.concept_shared : "↳ (mismo concepto)"} | ${displayNetworkName(sp.social_network)} | ${displayLayout(sp.asset_layout, sp.product_type)} | ${displayAssetStrategy(sp.assets_strategy, sp.asset_layout)} | ${totalCost > 0 ? `${totalCost} cr` : "0 cr"} |`,
+      );
+    }
+  }
+  return lines;
+}
+
+function displayNetworkName(network: SocialNetwork): string {
+  const map: Record<SocialNetwork, string> = {
+    instagram: "Instagram",
+    tiktok: "TikTok",
+    facebook: "Facebook",
+    linkedin: "LinkedIn",
+    x: "X / Twitter",
+    pinterest: "Pinterest",
+    threads: "Threads",
+    youtube: "YouTube",
+    bluesky: "Bluesky",
+  };
+  return map[network];
+}
+
+function displayLayout(layout: AssetLayout, product: ProductType): string {
+  if (product === "reel") return "Reel";
+  if (product === "story") return "Story";
+  if (product === "short") return "Short";
+  if (product === "long_video") return "Video largo";
+  // feed
+  if (layout === "single_image") return "Foto";
+  if (layout === "carousel_images") return "Carrusel";
+  if (layout === "single_video") return "Video";
+  if (layout === "carousel_mixed") return "Carrusel mixto";
+  if (layout === "single_gif") return "GIF";
+  return product;
+}
+
+function displayAssetStrategy(strategy: AssetsStrategy, layout: AssetLayout): string {
+  if (layout === "single_image" && strategy.image_source) {
+    if (strategy.image_source.type === "url") return "Foto del sitio";
+    if (strategy.image_source.type === "asset_id") return "Foto ya subida";
+    if (strategy.image_source.type === "ai_generate") return "Imagen AI";
+  }
+  if (layout === "carousel_images" && strategy.carousel_sources) {
+    return `${strategy.carousel_sources.length} imágenes (carrusel)`;
+  }
+  if ((layout === "single_video" || layout === "single_gif") && strategy.video_source) {
+    const vs = strategy.video_source;
+    if (vs.type === "url") return "Video ya disponible";
+    if (vs.type === "asset_id") return "Video ya subido";
+    if (vs.type === "ai_generate") {
+      const model = VIDEO_MODELS.find((m) => m.model_id === vs.model);
+      return model ? `Video AI (${model.display_name})` : "Video AI";
+    }
+    if (vs.type === "ai_avatar_lipsync") return "Avatar lipsync";
+    if (vs.type === "ai_avatar_video") return `Avatar video (${vs.scripts.length} escenas)`;
+  }
+  return "—";
 }
