@@ -1,6 +1,6 @@
 {
   "name": "@followr-mcp/mcp-core",
-  "version": "0.5.0",
+  "version": "0.4.2",
   "private": true,
   "description": "Followr MCP server core. Registers tools, resources, and prompts against the MCP SDK.",
   "type": "module",
@@ -20,7 +20,7 @@
     "clean": "rm -rf dist tsconfig.tsbuildinfo"
   },
   "dependencies": {
-    "@followr-mcp/shared": "0.5.0",
+    "@followr-mcp/shared": "0.4.2",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "zod": "^3.23.0"
   }

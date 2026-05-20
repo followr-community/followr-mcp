@@ -1,6 +1,6 @@
 {
   "name": "followr-mcp-root",
-  "version": "0.5.0",
+  "version": "0.4.2",
   "private": true,
   "description": "Followr MCP server. Connects Claude and other AI agents to Followr's social media management platform.",
   "workspaces": [
