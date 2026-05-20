@@ -3,7 +3,9 @@
 // Launched by Claude Desktop / Claude Code / Cursor as a subprocess.
 //
 // Configuration is read from env vars:
-//   FOLLOWR_API_TOKEN (required) - Generate at app.followr.ai > Company Settings > API Keys
+//   FOLLOWR_API_TOKEN (required) - Your Followr API key. Generate at app.followr.ai by clicking
+//     your profile picture (top-left) > API Keys, or visit app.followr.ai/settings/api-keys.
+//     The env var name is historical; the value is your API key.
 //   FOLLOWR_API_BASE_URL (optional, default: https://api.followr.ai) - Override for testing.
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -18,16 +20,18 @@ if (!token) {
     [
       "Error: FOLLOWR_API_TOKEN env var is not set.",
       "",
-      "Generate a token in Followr:",
+      "Generate a Followr API key:",
       "  1. Go to https://app.followr.ai",
-      "  2. Settings > Company Settings > API Keys",
-      "  3. Click 'Generate' and copy the value",
+      "  2. Click your profile picture in the top-left",
+      "  3. Select 'API Keys' from the dropdown (or open app.followr.ai/settings/api-keys)",
+      "  4. Click 'Generate' and copy the value",
       "",
-      "Then add it to your Claude Desktop config (or equivalent):",
+      "Then add it to your Claude Desktop config (or equivalent).",
+      "Note: the env var name FOLLOWR_API_TOKEN is historical; the value is your API key.",
       '  "followr": {',
       '    "command": "npx",',
       '    "args": ["-y", "@followr/mcp"],',
-      '    "env": { "FOLLOWR_API_TOKEN": "your_token_here" }',
+      '    "env": { "FOLLOWR_API_TOKEN": "your_api_key_here" }',
       "  }",
     ].join("\n"),
   );

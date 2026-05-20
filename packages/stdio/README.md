@@ -36,28 +36,33 @@ and full tool list at https://github.com/followr-community/followr-mcp.
    - Cursor: https://cursor.com (IDE with chat).
 4. **An active Followr account.**
 
-## Step 1: Generate a Followr API token
+## Step 1: Generate a Followr API key
 
 1. Sign in at https://app.followr.ai.
-2. Top bar: pick the workspace you want the AI to operate in.
-3. Click the gear icon to its right → **API Keys** in the sidebar.
+2. Click your profile picture in the top-left corner.
+3. Select **API Keys** from the dropdown menu (shortcut: https://app.followr.ai/settings/api-keys).
 4. Click **Generate**, name it something memorable (e.g. "Claude MCP").
-5. **Copy the token immediately.** Followr only shows it once.
+5. **Copy the API key immediately.** Followr only shows it once.
 
-> ⚠️ **Security:** the token is a credential. Treat it like a password.
+> ⚠️ **Plan requirement:** the Followr API is only available on plans that
+> include API access, or on plans with the API key add-on. If your plan
+> doesn't include it, the MCP installs fine but every call returns 401.
+> Verify or upgrade your plan at https://app.followr.ai first.
+
+> ⚠️ **Security:** the API key is a credential. Treat it like a password.
 > Never paste it in a chat (Claude, Slack, anywhere). Only paste it into your
 > terminal or your local config file. If it leaks, revoke it in the same UI
 > and generate a new one.
 
-> ⚠️ **Followr tokens contain a `|` (pipe) character** in the middle.
-> The pipe is a special shell character. In every command below, the token
+> ⚠️ **Followr API keys contain a `|` (pipe) character** in the middle.
+> The pipe is a special shell character. In every command below, the API key
 > goes inside **single quotes** (`'...'`) so the shell does not split it.
 > If you forget the quotes, only the part before the `|` gets stored and
 > every request returns 401.
 
 ## Step 2: Configure your AI client
 
-### Option A — Claude Desktop (recommended)
+### Option A. Claude Desktop (recommended)
 
 Open the config file (create with `{}` as content if missing):
 
@@ -76,7 +81,7 @@ Add the Followr connector inside `mcpServers`. If your file is `{}`, replace it 
       "command": "npx",
       "args": ["-y", "@followr/mcp"],
       "env": {
-        "FOLLOWR_API_TOKEN": "PASTE_YOUR_TOKEN_HERE"
+        "FOLLOWR_API_TOKEN": "PASTE_YOUR_API_KEY_HERE"
       }
     }
   }
@@ -93,23 +98,23 @@ If you already have other MCPs, keep them and add `"followr"` as a sibling:
       "command": "npx",
       "args": ["-y", "@followr/mcp"],
       "env": {
-        "FOLLOWR_API_TOKEN": "PASTE_YOUR_TOKEN_HERE"
+        "FOLLOWR_API_TOKEN": "PASTE_YOUR_API_KEY_HERE"
       }
     }
   }
 }
 ```
 
-The token goes inside the JSON string literal as-is (no shell quoting needed inside JSON).
+The API key goes inside the JSON string literal as-is (no shell quoting needed inside JSON). The env var name `FOLLOWR_API_TOKEN` is historical and unchanged for backwards compatibility; the value you paste is your Followr API key.
 
 Save the file, **fully quit Claude Desktop** (Cmd+Q on macOS, no minimizing), and reopen it. First launch with Followr added takes ~5 to 10 seconds extra to download the package; one-time and cached afterward.
 
-### Option B — Claude Code (CLI)
+### Option B. Claude Code (CLI)
 
 In your terminal, register the MCP at user scope so it is available in every project:
 
 ```bash
-claude mcp add --scope user followr --env 'FOLLOWR_API_TOKEN=PASTE_YOUR_TOKEN_HERE' -- npx -y @followr/mcp
+claude mcp add --scope user followr --env 'FOLLOWR_API_TOKEN=PASTE_YOUR_API_KEY_HERE' -- npx -y @followr/mcp
 ```
 
 > Note: the **single quotes** around `FOLLOWR_API_TOKEN=...` protect the `|` in your token from the shell. Required.
@@ -124,7 +129,7 @@ claude mcp get followr
 
 Look for `Scope: User config` and `Status: ✓ Connected`. Open a new Claude Code session (existing sessions do not reload MCP config) and try a prompt.
 
-### Option C — Cursor
+### Option C. Cursor
 
 Edit `~/.cursor/mcp.json` (or `%USERPROFILE%\.cursor\mcp.json` on Windows). Use the same JSON shape as Claude Desktop. Restart Cursor.
 
@@ -132,7 +137,7 @@ Edit `~/.cursor/mcp.json` (or `%USERPROFILE%\.cursor\mcp.json` on Windows). Use 
 
 In a new chat, send:
 
-> Use the Followr MCP to show me which user my API token belongs to.
+> Use the Followr MCP to show me which user my API key belongs to.
 
 Expected response: your name, timezone, language, current credits. If you see that, you are connected.
 
@@ -140,11 +145,11 @@ Expected response: your name, timezone, language, current credits. If you see th
 
 **"Failed to connect" right after registering.**
 
-Run `claude mcp get followr` and check the `Environment:` section. If `FOLLOWR_API_TOKEN` shows only the first part of your token (e.g. `220248` without the `|...` after it), the shell split your command. Re-add with single quotes around the env var:
+Run `claude mcp get followr` and check the `Environment:` section. If `FOLLOWR_API_TOKEN` shows only the first part of your API key (e.g. `220248` without the `|...` after it), the shell split your command. Re-add with single quotes around the env var:
 
 ```bash
 claude mcp remove followr
-claude mcp add --scope user followr --env 'FOLLOWR_API_TOKEN=YOUR_FULL_TOKEN' -- npx -y @followr/mcp
+claude mcp add --scope user followr --env 'FOLLOWR_API_TOKEN=YOUR_FULL_API_KEY' -- npx -y @followr/mcp
 ```
 
 **The MCP is registered but my AI client says it does not see it.**
@@ -159,11 +164,11 @@ Node.js is not installed or not on your PATH. Install LTS from https://nodejs.or
 
 **"401 Unauthorized" on every tool call.**
 
-The token is invalid or revoked. Generate a new one in Followr (Settings → API Keys → Generate), update the value in your config (or via `claude mcp remove followr` + re-add), and restart your client.
+The API key is invalid, revoked, or your plan does not include API access. Generate a new key in Followr (profile picture → API Keys → Generate), verify your plan at https://app.followr.ai, update the value in your config (or via `claude mcp remove followr` + re-add), and restart your client.
 
 **"This user does not belong to the company provided."**
 
-You asked the AI to operate on a workspace your token has no access to. Ask Claude to list your workspaces first and pick one you own or are a member of.
+You asked the AI to operate on a workspace your API key has no access to. Ask Claude to list your workspaces first and pick one you own or are a member of.
 
 **"Your current subscription does not include the necessary features to perform this action."**
 
@@ -182,11 +187,11 @@ npx -y @followr/mcp --version || true
 ## Security and privacy
 
 - The MCP runs as a local subprocess of your AI client. It is not a hosted service.
-- Your Followr token never leaves your computer except in HTTPS requests directly to `api.followr.ai`.
-- The token only unlocks the workspaces you already have access to in Followr.
+- Your Followr API key never leaves your computer except in HTTPS requests directly to `api.followr.ai`.
+- The API key only unlocks the workspaces you already have access to in Followr.
 - No telemetry. The MCP does not phone home.
 - Source code is open and auditable: https://github.com/followr-community/followr-mcp.
-- To revoke a leaked token: Followr → Settings → API Keys → delete.
+- To revoke a leaked API key: Followr → profile picture → API Keys → delete.
 
 ## What's not in v0.1
 

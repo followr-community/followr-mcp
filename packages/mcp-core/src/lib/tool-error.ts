@@ -161,7 +161,7 @@ function categorizeFollowrError(
       suggested_actions: [
         {
           rationale:
-            "Verify FOLLOWR_API_TOKEN is set correctly in the MCP client config. Generate a new token at app.followr.ai > Settings > API Keys if needed.",
+            "Verify FOLLOWR_API_TOKEN is set correctly in the MCP client config (its value should be your Followr API key). Also confirm your Followr plan includes API access. Generate a new key at app.followr.ai (profile picture > API Keys, or app.followr.ai/settings/api-keys) if needed.",
         },
       ],
     };
@@ -172,7 +172,7 @@ function categorizeFollowrError(
       suggested_actions: [
         {
           rationale:
-            "The token does not have permission for this resource. Verify the user has access to the target company.",
+            "The API key does not have permission for this resource. Verify the user has access to the target company.",
         },
       ],
     };
