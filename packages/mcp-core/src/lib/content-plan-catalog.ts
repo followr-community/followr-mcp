@@ -200,6 +200,16 @@ export interface VideoModelInfo {
   cost_for_default_duration: number;
   provider: string;
   recommended_for: string;
+  // True if this model is part of the platform-curated recommendation ladder.
+  // The agent should default to a recommended model when the company has no
+  // explicit ai_preferences.video_model. Models without `recommended: true`
+  // are still available, but only surface them when the user explicitly
+  // requests cheaper / different / experimental options.
+  recommended: boolean;
+  // Sort order within the recommendation ladder (lower = more recommended).
+  // 0 = default to use, 1 = first quality step up, etc. Undefined when
+  // recommended is false.
+  recommended_rank?: number;
 }
 
 const VIDEO_MODEL_RECOMMENDED_DURATION = 8;
@@ -212,7 +222,9 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
     default_duration_seconds: VIDEO_MODEL_RECOMMENDED_DURATION,
     cost_for_default_duration: 50 * VIDEO_MODEL_RECOMMENDED_DURATION,
     provider: "Google",
-    recommended_for: "cheapest of the Veo set, fine for tests and disposable content",
+    recommended_for: "platform default for social-media video, balanced cost and quality",
+    recommended: true,
+    recommended_rank: 0,
   },
   {
     model_id: "veo_3_fast",
@@ -221,7 +233,9 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
     default_duration_seconds: VIDEO_MODEL_RECOMMENDED_DURATION,
     cost_for_default_duration: 400 * VIDEO_MODEL_RECOMMENDED_DURATION,
     provider: "Google",
-    recommended_for: "safer default for real social-media content, good quality / cost balance",
+    recommended_for: "first step up in quality from veo_3_1_fast",
+    recommended: true,
+    recommended_rank: 1,
   },
   {
     model_id: "veo_3_1",
@@ -230,7 +244,9 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
     default_duration_seconds: VIDEO_MODEL_RECOMMENDED_DURATION,
     cost_for_default_duration: 600 * VIDEO_MODEL_RECOMMENDED_DURATION,
     provider: "Google",
-    recommended_for: "premium quality, use for hero content",
+    recommended_for: "premium quality, hero content; second quality step",
+    recommended: true,
+    recommended_rank: 2,
   },
   {
     model_id: "veo_3",
@@ -239,7 +255,9 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
     default_duration_seconds: VIDEO_MODEL_RECOMMENDED_DURATION,
     cost_for_default_duration: 1000 * VIDEO_MODEL_RECOMMENDED_DURATION,
     provider: "Google",
-    recommended_for: "top tier, never use without explicit user authorization of the cost",
+    recommended_for: "top tier, only use with explicit user authorization of the cost; third quality step",
+    recommended: true,
+    recommended_rank: 3,
   },
   {
     model_id: "wan_2",
@@ -248,7 +266,8 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
     default_duration_seconds: VIDEO_MODEL_RECOMMENDED_DURATION,
     cost_for_default_duration: 150 * VIDEO_MODEL_RECOMMENDED_DURATION,
     provider: "fal",
-    recommended_for: "decent default available on most plans including Free",
+    recommended_for: "fallback default for accounts without premium model access (followr_plus_enabled=false)",
+    recommended: false,
   },
   {
     model_id: "seedance_1_1_light",
@@ -257,7 +276,8 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
     default_duration_seconds: VIDEO_MODEL_RECOMMENDED_DURATION,
     cost_for_default_duration: 20 * VIDEO_MODEL_RECOMMENDED_DURATION,
     provider: "fal",
-    recommended_for: "ultra-cheap option for quick iteration",
+    recommended_for: "available on request when user wants cheaper than the platform default",
+    recommended: false,
   },
   {
     model_id: "seedance_1_1_pro",
@@ -266,7 +286,8 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
     default_duration_seconds: VIDEO_MODEL_RECOMMENDED_DURATION,
     cost_for_default_duration: 40 * VIDEO_MODEL_RECOMMENDED_DURATION,
     provider: "fal",
-    recommended_for: "step up from Light when quality matters",
+    recommended_for: "available on request",
+    recommended: false,
   },
   {
     model_id: "seedance_2_0_fast",
@@ -275,7 +296,8 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
     default_duration_seconds: VIDEO_MODEL_RECOMMENDED_DURATION,
     cost_for_default_duration: 100 * VIDEO_MODEL_RECOMMENDED_DURATION,
     provider: "fal",
-    recommended_for: "newer SeeDance, between cost and quality",
+    recommended_for: "available on request",
+    recommended: false,
   },
   {
     model_id: "seedance_2_0",
@@ -284,7 +306,8 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
     default_duration_seconds: VIDEO_MODEL_RECOMMENDED_DURATION,
     cost_for_default_duration: 175 * VIDEO_MODEL_RECOMMENDED_DURATION,
     provider: "fal",
-    recommended_for: "best SeeDance, alternative to Veo 3 Fast at lower cost",
+    recommended_for: "available on request",
+    recommended: false,
   },
   {
     model_id: "hailuo_0_2_standard",
@@ -293,7 +316,8 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
     default_duration_seconds: VIDEO_MODEL_RECOMMENDED_DURATION,
     cost_for_default_duration: 20 * VIDEO_MODEL_RECOMMENDED_DURATION,
     provider: "fal",
-    recommended_for: "extra-cheap alternative",
+    recommended_for: "available on request",
+    recommended: false,
   },
   {
     model_id: "hailuo_0_2_premium",
@@ -302,7 +326,8 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
     default_duration_seconds: VIDEO_MODEL_RECOMMENDED_DURATION,
     cost_for_default_duration: 30 * VIDEO_MODEL_RECOMMENDED_DURATION,
     provider: "fal",
-    recommended_for: "cheap premium tier",
+    recommended_for: "available on request",
+    recommended: false,
   },
 ];
 
@@ -315,6 +340,9 @@ export interface ImageModelInfo {
   bucket: "regular" | "premium";
   provider: string;
   recommended_for: string;
+  // See VideoModelInfo.recommended for semantics.
+  recommended: boolean;
+  recommended_rank?: number;
 }
 
 export const IMAGE_MODELS: ImageModelInfo[] = [
@@ -324,7 +352,9 @@ export const IMAGE_MODELS: ImageModelInfo[] = [
     cost_per_image: 25,
     bucket: "regular",
     provider: "fal",
-    recommended_for: "safe default, available on most plans",
+    recommended_for: "platform default for images, available on most plans",
+    recommended: true,
+    recommended_rank: 0,
   },
   {
     model_id: "nano_banana_pro",
@@ -332,7 +362,8 @@ export const IMAGE_MODELS: ImageModelInfo[] = [
     cost_per_image: 45,
     bucket: "premium",
     provider: "fal",
-    recommended_for: "higher quality nano variant; requires premium quota",
+    recommended_for: "higher quality nano variant; requires followr_plus_enabled",
+    recommended: false,
   },
   {
     model_id: "gpt_image_2",
@@ -340,7 +371,8 @@ export const IMAGE_MODELS: ImageModelInfo[] = [
     cost_per_image: 70,
     bucket: "premium",
     provider: "OpenAI",
-    recommended_for: "OpenAI flagship; requires premium quota",
+    recommended_for: "OpenAI flagship; requires followr_plus_enabled",
+    recommended: false,
   },
   {
     model_id: "imagen4_preview_fast",
@@ -348,7 +380,8 @@ export const IMAGE_MODELS: ImageModelInfo[] = [
     cost_per_image: 6,
     bucket: "regular",
     provider: "Google",
-    recommended_for: "ultra-cheap Google option",
+    recommended_for: "available on request when user wants cheaper than the platform default",
+    recommended: false,
   },
   {
     model_id: "imagen4_preview",
@@ -356,7 +389,8 @@ export const IMAGE_MODELS: ImageModelInfo[] = [
     cost_per_image: 12,
     bucket: "regular",
     provider: "Google",
-    recommended_for: "balanced Google option",
+    recommended_for: "available on request",
+    recommended: false,
   },
   {
     model_id: "ideogram_v3",
@@ -364,7 +398,8 @@ export const IMAGE_MODELS: ImageModelInfo[] = [
     cost_per_image: 18,
     bucket: "regular",
     provider: "Ideogram",
-    recommended_for: "strong text-in-image rendering",
+    recommended_for: "available on request, strong text-in-image rendering",
+    recommended: false,
   },
   {
     model_id: "flux_pro_1_1",
@@ -372,7 +407,8 @@ export const IMAGE_MODELS: ImageModelInfo[] = [
     cost_per_image: 12,
     bucket: "regular",
     provider: "fal",
-    recommended_for: "popular community choice",
+    recommended_for: "available on request",
+    recommended: false,
   },
   {
     model_id: "z_image_turbo",
@@ -380,7 +416,8 @@ export const IMAGE_MODELS: ImageModelInfo[] = [
     cost_per_image: 2,
     bucket: "regular",
     provider: "fal",
-    recommended_for: "cheapest available",
+    recommended_for: "available on request, cheapest available",
+    recommended: false,
   },
 ];
 

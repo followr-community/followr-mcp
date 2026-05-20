@@ -313,21 +313,60 @@ async function loadBudgets(client: FollowrClient): Promise<AllBudgets | null> {
   }
 }
 
-// Mark video models with affordable: true/false given current budget.
-function annotateVideoModels(imageVideoRemaining: number) {
-  return VIDEO_MODELS.map((m) => ({
-    ...m,
-    affordable_at_default_duration: m.cost_for_default_duration <= imageVideoRemaining,
-    cost_note: `${m.cost_per_second} credits per second of video (${m.default_duration_seconds}s default = ${m.cost_for_default_duration} cr total).`,
-  }));
+// Mark video models with affordable: true/false given current budget, then
+// sort by (recommended_rank ASC, cost ASC). The agent should default to
+// the first entry unless the user explicitly asks for a different one.
+// When prefs.video_model is set, that model is bumped to recommended_rank 0
+// (company preference overrides catalog default).
+function annotateVideoModels(imageVideoRemaining: number, prefs?: AiPreferences) {
+  const preferredModelId = prefs?.video_model;
+  const annotated = VIDEO_MODELS.map((m) => {
+    const isCompanyDefault = preferredModelId === m.model_id;
+    return {
+      ...m,
+      affordable_at_default_duration: m.cost_for_default_duration <= imageVideoRemaining,
+      cost_note: `${m.cost_per_second} credits per second of video (${m.default_duration_seconds}s default = ${m.cost_for_default_duration} cr total).`,
+      // Company preference wins. We override the catalog's recommended/rank
+      // for this model so the agent picks it as the default.
+      ...(isCompanyDefault
+        ? { recommended: true, recommended_rank: 0, is_company_default: true as const }
+        : {}),
+    };
+  });
+  // Sort: company default first (rank 0 via override), then platform-curated
+  // recommended ladder by recommended_rank, then non-recommended by cost.
+  return annotated.sort((a, b) => {
+    const aRank = a.recommended ? a.recommended_rank ?? 99 : 100;
+    const bRank = b.recommended ? b.recommended_rank ?? 99 : 100;
+    if (aRank !== bRank) return aRank - bRank;
+    return a.cost_per_second - b.cost_per_second;
+  });
 }
 
-function annotateImageModels(imagesRemaining: number, premiumRemaining: number) {
-  return IMAGE_MODELS.map((m) => ({
-    ...m,
-    affordable: m.bucket === "premium" ? premiumRemaining >= m.cost_per_image : imagesRemaining >= m.cost_per_image,
-    cost_note: `${m.cost_per_image} credits per image (${m.bucket} bucket).`,
-  }));
+function annotateImageModels(
+  imagesRemaining: number,
+  premiumRemaining: number,
+  prefs?: AiPreferences,
+) {
+  const preferredModelId = prefs?.image_model;
+  const annotated = IMAGE_MODELS.map((m) => {
+    const isCompanyDefault = preferredModelId === m.model_id;
+    return {
+      ...m,
+      affordable:
+        m.bucket === "premium" ? premiumRemaining >= m.cost_per_image : imagesRemaining >= m.cost_per_image,
+      cost_note: `${m.cost_per_image} credits per image (${m.bucket} bucket).`,
+      ...(isCompanyDefault
+        ? { recommended: true, recommended_rank: 0, is_company_default: true as const }
+        : {}),
+    };
+  });
+  return annotated.sort((a, b) => {
+    const aRank = a.recommended ? a.recommended_rank ?? 99 : 100;
+    const bRank = b.recommended ? b.recommended_rank ?? 99 : 100;
+    if (aRank !== bRank) return aRank - bRank;
+    return a.cost_per_image - b.cost_per_image;
+  });
 }
 
 // ── prepare_content_plan_context tool ───────────────────────────────────────
@@ -456,8 +495,11 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
 
       const imageVideoRemaining = budgets?.ai_image_and_video_budget.remaining ?? Number.POSITIVE_INFINITY;
       const premiumRemaining = budgets?.ai_premium_image_models_budget.remaining ?? Number.POSITIVE_INFINITY;
-      const videoModels = annotateVideoModels(imageVideoRemaining);
-      const imageModels = annotateImageModels(imageVideoRemaining, premiumRemaining);
+      // Read company AI preferences so we can highlight the user-configured
+      // default model in the catalog response (recommended_rank 0).
+      const companyPrefs = (companyResolved as Company & { ai_preferences?: AiPreferences }).ai_preferences;
+      const videoModels = annotateVideoModels(imageVideoRemaining, companyPrefs);
+      const imageModels = annotateImageModels(imageVideoRemaining, premiumRemaining, companyPrefs);
 
       // 6. Persist the context snapshot for later validation by
       // draft_content_plan.
@@ -568,6 +610,10 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
         _assistant_guidance: {
           ultrathink_required: PLANNING_STRATEGY.ultrathink_required,
           planning_strategy: PLANNING_STRATEGY,
+          recommended_video_model_policy:
+            "available_video_models is pre-sorted: the FIRST entry is the recommended default for this company (company ai_preferences.video_model if set, otherwise the platform default veo_3_1_fast). Use that by default. The next 3 entries (veo_3_fast, veo_3_1, veo_3) are the quality-step ladder, only use them when the user explicitly asks for higher quality and you confirm the cost. NEVER default to seedance / hailuo / wan unless the user explicitly requests a cheaper model. If followr_plus_enabled is false on the user budget, fall back to wan_2 for video.",
+          recommended_image_model_policy:
+            "available_image_models is pre-sorted: the FIRST entry is the recommended default (company ai_preferences.image_model if set, otherwise nano_banana_2). Use that by default. Other models are available on request. Premium models (nano_banana_pro, gpt_image_2) require followr_plus_enabled true; if false, default to nano_banana_2 and explain the limitation if the user asks for premium.",
           next_step: "ask_user_clarifying_question_then_draft",
           required_user_clarifications: [
             "time_window (start and end dates, default: the week starting next Monday)",
