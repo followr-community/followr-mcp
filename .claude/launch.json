@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "landing-preview",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["-y", "serve", "landing", "-l", "8765", "--no-clipboard"],
+      "port": 8765
+    },
+    {
+      "name": "fanclub-preview",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["-y", "serve", "../followr-fan-club", "-l", "8766", "--no-clipboard"],
+      "port": 8766
+    }
+  ]
+}

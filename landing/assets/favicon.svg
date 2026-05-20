@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Followr MCP">
+  <defs>
+    <linearGradient id="fav-grad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#00D18D"/>
+      <stop offset="100%" stop-color="#00C3D9"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="#0B1220"/>
+  <path d="M16 14 L48 14 Q52 14 52 18 L52 38 Q52 42 48 42 L28 42 L16 50 L22 42 L16 42 Q12 42 12 38 L12 18 Q12 14 16 14 Z" fill="url(#fav-grad)"/>
+  <path d="M32 18 L34.06 23.17 L39.61 23.53 L35.33 27.08 L36.70 32.47 L32 29.50 L27.30 32.47 L28.67 27.08 L24.39 23.53 L29.94 23.17 Z" fill="#0B1220"/>
+</svg>

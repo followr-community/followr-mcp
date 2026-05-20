@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="description" content="An MCP server that lets Claude, Cursor and any MCP client run your Followr workspace by prompt. Unofficial." />
+  <meta name="theme-color" content="#0B1220" />
+
+  <title>Followr MCP. Run Followr from your AI chat.</title>
+
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg" />
+  <link rel="apple-touch-icon" href="assets/favicon.svg" />
+
+  <meta property="og:type" content="website" />
+  <meta property="og:title" content="Followr MCP. Run Followr from your AI chat." />
+  <meta property="og:description" content="An MCP server that lets Claude, Cursor and any MCP client run your Followr workspace by prompt. Unofficial." />
+  <meta property="og:image" content="assets/og-image.svg" />
+  <meta property="og:url" content="https://followr-mcp.pages.dev" />
+
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Followr MCP. Run Followr from your AI chat." />
+  <meta name="twitter:description" content="An MCP server that lets Claude, Cursor and any MCP client run your Followr workspace by prompt. Unofficial." />
+  <meta name="twitter:image" content="assets/og-image.svg" />
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <nav class="nav">
+    <a class="nav-brand" href="/" aria-label="Followr MCP home">
+      <img src="assets/mcp-mark.svg" width="32" height="32" alt="" />
+      <span class="nav-wordmark">
+        <span class="nav-wordmark-followr">followr</span>
+        <span class="nav-wordmark-product">mcp</span>
+      </span>
+    </a>
+    <span class="sticker sticker-unofficial" data-i18n="nav.unofficial">unofficial</span>
+    <span class="nav-spacer"></span>
+    <div class="nav-right">
+      <div class="lang-selector">
+        <button class="lang-button" id="lang-button" aria-haspopup="listbox" aria-expanded="false">
+          <span id="lang-button-label">EN</span>
+          <span class="lang-button-caret" aria-hidden="true">&#9662;</span>
+        </button>
+        <ul class="lang-dropdown" id="lang-dropdown" role="listbox" aria-label="Language"></ul>
+      </div>
+      <a class="button button-outline" href="https://github.com/followr-community/followr-mcp" target="_blank" rel="noopener noreferrer">
+        <span data-i18n="nav.github">GitHub</span>
+        <span aria-hidden="true">&rarr;</span>
+      </a>
+      <a class="button" href="#install">
+        <span data-i18n="nav.install">Install</span>
+      </a>
+    </div>
+  </nav>
+
+  <main>
+
+    <!-- HERO -->
+    <section class="hero">
+      <img class="hero-mark" src="assets/claude-mark.svg" alt="" aria-hidden="true" width="100" height="100" />
+      <div class="hero-inner">
+        <span class="eyebrow" data-i18n="hero.eyebrow">MODEL CONTEXT PROTOCOL</span>
+        <h1 class="hero-title">
+          <span data-i18n="hero.titleLine1">Don&apos;t open Followr.</span>
+          <span class="hero-title-accent" data-i18n="hero.titleLine2">Just ask.</span>
+        </h1>
+        <p class="hero-subtitle" data-i18n="hero.subtitle">
+          An MCP server that lets Claude, Cursor and any MCP client run your Followr workspace by prompt. Schedule posts, generate avatar videos, triage DMs, launch full campaigns. No tab&#8209;switching.
+        </p>
+        <div class="hero-ctas">
+          <a class="button button-lg" href="#install">
+            <span data-i18n="hero.ctaInstall">Install in 1 minute</span>
+            <span aria-hidden="true">&rarr;</span>
+          </a>
+          <a class="button button-ghost button-lg" href="#demo">
+            <span aria-hidden="true">&#9655;</span>
+            <span data-i18n="hero.ctaDemo">See it in action</span>
+          </a>
+        </div>
+        <ul class="hero-stats">
+          <li><span class="stat-n">72</span><span class="stat-l" data-i18n="hero.stat1">tools</span></li>
+          <li><span class="stat-n">6</span><span class="stat-l" data-i18n="hero.stat2">resources</span></li>
+          <li><span class="stat-n">5</span><span class="stat-l" data-i18n="hero.stat3">workflows</span></li>
+          <li><span class="stat-n">1</span><span class="stat-l" data-i18n="hero.stat4">npm install</span></li>
+        </ul>
+      </div>
+    </section>
+
+    <!-- DEMO -->
+    <section id="demo" class="demo">
+      <div class="demo-inner">
+        <span class="section-eyebrow" data-i18n="demo.eyebrow">DEMO</span>
+        <h2 class="section-title" data-i18n="demo.title">It looks like this in your chat.</h2>
+        <p class="section-sub" data-i18n="demo.sub">Three real conversations. Click a tab to switch.</p>
+
+        <div class="demo-tabs" role="tablist">
+          <button class="demo-tab is-active" data-tab="0" role="tab" aria-selected="true">
+            <span class="demo-tab-num">01</span>
+            <span class="demo-tab-label" data-i18n="demo.tab1">Campaign launch</span>
+          </button>
+          <button class="demo-tab" data-tab="1" role="tab" aria-selected="false">
+            <span class="demo-tab-num">02</span>
+            <span class="demo-tab-label" data-i18n="demo.tab2">Avatar reels</span>
+          </button>
+          <button class="demo-tab" data-tab="2" role="tab" aria-selected="false">
+            <span class="demo-tab-num">03</span>
+            <span class="demo-tab-label" data-i18n="demo.tab3">DM triage</span>
+          </button>
+        </div>
+
+        <div class="chat" data-chat="0">
+          <div class="chat-bubble bubble-user">
+            <div class="bubble-label" data-i18n="demo.you">you</div>
+            <p data-i18n="demo.c0.user">Spin up a 7&#8209;day campaign for our March cardigan drop. Launch March 15 at 10 AM Buenos Aires. Instagram, X and LinkedIn.</p>
+          </div>
+          <div class="chat-bubble bubble-assistant">
+            <div class="bubble-label bubble-label-claude">
+              <img class="bubble-logo" src="assets/claude-mark.svg" alt="" width="13" height="13" />
+              claude
+            </div>
+            <p data-i18n="demo.c0.a1">Done. Queued in your Acme workspace:</p>
+            <ul class="chat-list">
+              <li data-i18n="demo.c0.l1">3 teasers between March 12 and 14</li>
+              <li data-i18n="demo.c0.l2">1 launch post March 15 at 10 AM Buenos Aires</li>
+              <li data-i18n="demo.c0.l3">3 follow&#8209;ups across March 17 to 20</li>
+              <li data-i18n="demo.c0.l4">tag &ldquo;cardigan&#8209;drop&#8209;march&rdquo; applied to all 7</li>
+            </ul>
+            <p data-i18n="demo.c0.a2">Hero image generated in your brand palette. Approve, or want to review first?</p>
+            <div class="chat-tools">
+              <span class="chat-tool-chip" data-i18n="demo.c0.chip1">read brand voice</span>
+              <span class="chat-tool-chip" data-i18n="demo.c0.chip2">generated hero</span>
+              <span class="chat-tool-chip" data-i18n="demo.c0.chip3">created 7 drafts</span>
+              <span class="chat-tool-chip" data-i18n="demo.c0.chip4">scheduled across 3 networks</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="chat" data-chat="1" hidden>
+          <div class="chat-bubble bubble-user">
+            <div class="bubble-label" data-i18n="demo.you">you</div>
+            <p data-i18n="demo.c1.user">Make 5 short avatar reels about productivity for next week. Use Sofia. Schedule one per day at 8 AM.</p>
+          </div>
+          <div class="chat-bubble bubble-assistant">
+            <div class="bubble-label bubble-label-claude">
+              <img class="bubble-logo" src="assets/claude-mark.svg" alt="" width="13" height="13" />
+              claude
+            </div>
+            <p data-i18n="demo.c1.a1">Picked Sofia from your library. Here&apos;s the slate:</p>
+            <ul class="chat-list">
+              <li data-i18n="demo.c1.l1">Mon: the two&#8209;minute rule</li>
+              <li data-i18n="demo.c1.l2">Tue: protect your first hour</li>
+              <li data-i18n="demo.c1.l3">Wed: time&#8209;blocking without guilt</li>
+              <li data-i18n="demo.c1.l4">Thu: when to say no</li>
+              <li data-i18n="demo.c1.l5">Fri: a 10&#8209;minute weekly review</li>
+            </ul>
+            <p data-i18n="demo.c1.a2">Each reel runs about 700 credits. Your balance is fine. Green&#8209;light all 5?</p>
+            <div class="chat-tools">
+              <span class="chat-tool-chip" data-i18n="demo.c1.chip1">listed avatars</span>
+              <span class="chat-tool-chip" data-i18n="demo.c1.chip2">checked credits</span>
+              <span class="chat-tool-chip" data-i18n="demo.c1.chip3">drafted 5 scripts</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="chat" data-chat="2" hidden>
+          <div class="chat-bubble bubble-user">
+            <div class="bubble-label" data-i18n="demo.you">you</div>
+            <p data-i18n="demo.c2.user">Any unread DMs? Show me everything and draft replies in my voice.</p>
+          </div>
+          <div class="chat-bubble bubble-assistant">
+            <div class="bubble-label bubble-label-claude">
+              <img class="bubble-logo" src="assets/claude-mark.svg" alt="" width="13" height="13" />
+              claude
+            </div>
+            <p data-i18n="demo.c2.a1">4 unread across networks:</p>
+            <ul class="chat-list">
+              <li data-i18n="demo.c2.l1">Instagram: 2 (stock question + collab pitch)</li>
+              <li data-i18n="demo.c2.l2">Facebook: 1 (shipping complaint, order #4421)</li>
+              <li data-i18n="demo.c2.l3">X: 1 (podcast mention)</li>
+            </ul>
+            <p data-i18n="demo.c2.a2">Drafts ready in your voice. Want me to send them, or do you want to edit first?</p>
+            <div class="chat-tools">
+              <span class="chat-tool-chip" data-i18n="demo.c2.chip1">scanned 4 inboxes</span>
+              <span class="chat-tool-chip" data-i18n="demo.c2.chip2">drafted 4 replies</span>
+            </div>
+          </div>
+        </div>
+
+        <p class="demo-disclaimer" data-i18n="demo.disclaimer">
+          Mocked for illustration. Wording and tools are real. Your AI client decides the exact phrasing.
+        </p>
+      </div>
+    </section>
+
+    <!-- WHAT YOU CAN DO -->
+    <section class="capabilities">
+      <div class="capabilities-inner">
+        <span class="section-eyebrow" data-i18n="cap.eyebrow">WHAT YOU CAN DO</span>
+        <h2 class="section-title" data-i18n="cap.title">Six surfaces. One conversation.</h2>
+
+        <div class="cap-grid">
+
+          <div class="cap-card">
+            <div class="cap-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+            </div>
+            <h3 data-i18n="cap.c1.title">Schedule</h3>
+            <p data-i18n="cap.c1.body">Post groups, drafts, multi&#8209;network schedules, calendars, time&#8209;zones honored automatically.</p>
+            <code class="cap-prompt" data-i18n="cap.c1.prompt">&ldquo;Schedule this carousel for Tuesday at 9 AM in IG and FB.&rdquo;</code>
+          </div>
+
+          <div class="cap-card">
+            <div class="cap-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15 8.5 22 9.3 17 14 18.5 21 12 17.5 5.5 21 7 14 2 9.3 9 8.5 12 2"/></svg>
+            </div>
+            <h3 data-i18n="cap.c2.title">Generate</h3>
+            <p data-i18n="cap.c2.body">Text, images, audio, lipsync clips, multi&#8209;scene avatar reels with subtitles. All from natural prompts.</p>
+            <code class="cap-prompt" data-i18n="cap.c2.prompt">&ldquo;Generate 3 image variants in our brand palette.&rdquo;</code>
+          </div>
+
+          <div class="cap-card">
+            <div class="cap-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4.4 3.6-8 8-8s8 3.6 8 8"/></svg>
+            </div>
+            <h3 data-i18n="cap.c3.title">Avatars &amp; voices</h3>
+            <p data-i18n="cap.c3.body">Pick or create avatars, pull ElevenLabs voices, render reels with burned&#8209;in subtitles and outfit consistency.</p>
+            <code class="cap-prompt" data-i18n="cap.c3.prompt">&ldquo;Create an avatar from this photo. Warm Argentine voice.&rdquo;</code>
+          </div>
+
+          <div class="cap-card">
+            <div class="cap-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.4 8.4 0 0 1-3.8-.9L3 21l1.9-5.7a8.4 8.4 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.4 8.4 0 0 1 3.8-.9h.5a8.5 8.5 0 0 1 8 8v.5z"/></svg>
+            </div>
+            <h3 data-i18n="cap.c4.title">Social inbox</h3>
+            <p data-i18n="cap.c4.body">DMs, comments, contacts, conversations across every connected network. Triage and draft replies in one pass.</p>
+            <code class="cap-prompt" data-i18n="cap.c4.prompt">&ldquo;Reply to every unread DM. Soft tone, no emoji.&rdquo;</code>
+          </div>
+
+          <div class="cap-card">
+            <div class="cap-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 12l2 2 4-4"/><path d="M21 12c0 5-3.5 9-9 9s-9-4-9-9 3.5-9 9-9c2.6 0 4.9 1 6.6 2.7"/></svg>
+            </div>
+            <h3 data-i18n="cap.c5.title">Validate</h3>
+            <p data-i18n="cap.c5.body">Per&#8209;network spec checks before you publish: caption length, asset count, video duration, aspect ratio, account tier.</p>
+            <code class="cap-prompt" data-i18n="cap.c5.prompt">&ldquo;Will this run on Twitter Basic? Validate first.&rdquo;</code>
+          </div>
+
+          <div class="cap-card">
+            <div class="cap-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></svg>
+            </div>
+            <h3 data-i18n="cap.c6.title">Workspaces</h3>
+            <p data-i18n="cap.c6.body">Multi&#8209;company brand voice, tags, folders, Autopilot rules, Canva imports, analytics. One API key, every workspace.</p>
+            <code class="cap-prompt" data-i18n="cap.c6.prompt">&ldquo;In Acme: what posts ran best last month?&rdquo;</code>
+          </div>
+
+        </div>
+      </div>
+    </section>
+
+    <!-- WORKFLOWS -->
+    <section class="workflows">
+      <div class="workflows-inner">
+        <span class="section-eyebrow" data-i18n="wf.eyebrow">PRESETS</span>
+        <h2 class="section-title" data-i18n="wf.title">Five workflows that ship in the box.</h2>
+        <p class="section-sub" data-i18n="wf.sub">Multi&#8209;step orchestrations exposed as MCP prompts. Pick one and your AI runs the whole sequence.</p>
+
+        <div class="wf-grid">
+
+          <div class="wf-card">
+            <div class="wf-num">01</div>
+            <h3 data-i18n="wf.w1.title">Weekly Brief</h3>
+            <p data-i18n="wf.w1.body">Hand it a brief. Get a full week of posts drafted in brand voice, balanced across networks, scheduled day by day.</p>
+            <code class="wf-prompt">/followr.weekly&#8209;brief</code>
+          </div>
+
+          <div class="wf-card">
+            <div class="wf-num">02</div>
+            <h3 data-i18n="wf.w2.title">Campaign Launch</h3>
+            <p data-i18n="wf.w2.body">Tag taxonomy, hero asset, teasers, launch post, follow&#8209;ups. All scheduled, all tagged, all in one prompt.</p>
+            <code class="wf-prompt">/followr.campaign&#8209;launch</code>
+          </div>
+
+          <div class="wf-card">
+            <div class="wf-num">03</div>
+            <h3 data-i18n="wf.w3.title">Video Series</h3>
+            <p data-i18n="wf.w3.body">N avatar reels on one topic. Distinct angles, lipsync renders, scheduled at your chosen cadence.</p>
+            <code class="wf-prompt">/followr.video&#8209;series</code>
+          </div>
+
+          <div class="wf-card">
+            <div class="wf-num">04</div>
+            <h3 data-i18n="wf.w4.title">Crisis Response</h3>
+            <p data-i18n="wf.w4.body">Three response variants (apology / clarification / deflection) staged as drafts. A human picks one and publishes.</p>
+            <code class="wf-prompt">/followr.crisis&#8209;response</code>
+          </div>
+
+          <div class="wf-card">
+            <div class="wf-num">05</div>
+            <h3 data-i18n="wf.w5.title">URL Repurpose</h3>
+            <p data-i18n="wf.w5.body">Drop a blog or article URL. Get a thread, a carousel, a LinkedIn post and a video script. Tailored per network.</p>
+            <code class="wf-prompt">/followr.repurpose&#8209;from&#8209;url</code>
+          </div>
+
+          <div class="wf-card wf-card-empty">
+            <div class="wf-num">06</div>
+            <h3 data-i18n="wf.w6.title">Your own.</h3>
+            <p data-i18n="wf.w6.body">Compose any of the 72 tools into a custom workflow. Or fork the repo and add a preset.</p>
+            <a href="https://github.com/followr-community/followr-mcp" target="_blank" rel="noopener noreferrer" class="wf-link" data-i18n="wf.w6.link">Open the repo &rarr;</a>
+          </div>
+
+        </div>
+      </div>
+    </section>
+
+    <!-- PERSONAS -->
+    <section class="personas">
+      <div class="personas-inner">
+        <span class="section-eyebrow" data-i18n="per.eyebrow">USE CASES</span>
+        <h2 class="section-title" data-i18n="per.title">For everyone who lives in a chat window.</h2>
+
+        <div class="per-grid">
+
+          <div class="per-card">
+            <div class="per-tag" data-i18n="per.p1.tag">AGENCY</div>
+            <h3 data-i18n="per.p1.title">Twelve clients. One prompt.</h3>
+            <p data-i18n="per.p1.body">Switch workspaces with a sentence. Compare calendars. Push the same campaign across all of them.</p>
+            <code class="per-quote" data-i18n="per.p1.quote">&ldquo;In every workspace: list posts scheduled for next week.&rdquo;</code>
+          </div>
+
+          <div class="per-card">
+            <div class="per-tag" data-i18n="per.p2.tag">SOLO CREATOR</div>
+            <h3 data-i18n="per.p2.title">Stop tab&#8209;hopping. Ship.</h3>
+            <p data-i18n="per.p2.body">Write the post, generate the visual, schedule it, walk away. The dashboard is a chat.</p>
+            <code class="per-quote" data-i18n="per.p2.quote">&ldquo;Turn this newsletter into a carousel and a Reel.&rdquo;</code>
+          </div>
+
+          <div class="per-card">
+            <div class="per-tag" data-i18n="per.p3.tag">CAMPAIGN PLANNER</div>
+            <h3 data-i18n="per.p3.title">Three days of prep. One paragraph.</h3>
+            <p data-i18n="per.p3.body">Brief the AI like you&apos;d brief a junior planner. Get a full campaign back, tagged and scheduled.</p>
+            <code class="per-quote" data-i18n="per.p3.quote">&ldquo;Build the March 15 launch. Teasers, launch, follow&#8209;ups.&rdquo;</code>
+          </div>
+
+          <div class="per-card">
+            <div class="per-tag" data-i18n="per.p4.tag">COMMUNITY MANAGER</div>
+            <h3 data-i18n="per.p4.title">Every inbox. One window.</h3>
+            <p data-i18n="per.p4.body">Triage DMs and comments across every network. Draft replies in brand voice. Approve, edit, send.</p>
+            <code class="per-quote" data-i18n="per.p4.quote">&ldquo;Show me everything unread. Draft replies.&rdquo;</code>
+          </div>
+
+        </div>
+      </div>
+    </section>
+
+    <!-- COMPATIBLE -->
+    <section class="clients">
+      <div class="clients-inner">
+        <span class="section-eyebrow" data-i18n="cli.eyebrow">COMPATIBLE WITH</span>
+        <h2 class="section-title" data-i18n="cli.title">Bring your own AI.</h2>
+        <p class="section-sub" data-i18n="cli.sub">MCP is an open protocol. If your client speaks it, Followr fits.</p>
+
+        <div class="clients-grid">
+          <div class="client-badge client-badge-claude">
+            <img class="client-claude-logo" src="assets/claude-mark.svg" alt="" width="16" height="16" />
+            Claude Desktop
+          </div>
+          <div class="client-badge client-badge-claude">
+            <img class="client-claude-logo" src="assets/claude-mark.svg" alt="" width="16" height="16" />
+            Claude Code
+          </div>
+          <div class="client-badge client-badge-claude">
+            <img class="client-claude-logo" src="assets/claude-mark.svg" alt="" width="16" height="16" />
+            Claude.ai (Connectors)
+          </div>
+          <div class="client-badge"><span class="client-dot"></span>Cursor</div>
+          <div class="client-badge"><span class="client-dot"></span>Cline</div>
+          <div class="client-badge"><span class="client-dot"></span>Windsurf</div>
+          <div class="client-badge"><span class="client-dot"></span>Zed</div>
+          <div class="client-badge client-badge-faded" data-i18n="cli.other">+ any MCP client</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- INSTALL -->
+    <section id="install" class="install">
+      <div class="install-inner">
+        <span class="section-eyebrow" data-i18n="ins.eyebrow">INSTALL</span>
+        <h2 class="section-title" data-i18n="ins.title">One npm command. One API key. Done.</h2>
+        <p class="section-sub" data-i18n="ins.sub">No build step. No service to host. The MCP runs as a subprocess of your AI client.</p>
+
+        <a class="install-guide-link" href="install.html">
+          <span data-i18n="ins.guideLink"><strong>New to MCPs?</strong> Read the full step-by-step install guide.</span>
+          <span class="install-guide-link-arrow" data-i18n="ins.guideLinkArrow">Open guide &rarr;</span>
+        </a>
+
+        <p class="install-plan-note" data-i18n="ins.planNote">
+          <strong>Heads up:</strong> the Followr API is available on plans that include API access, or on plans with the API key add-on. If your plan does not include it, the MCP will install but every call will return 401. Check this inside <a href="https://app.followr.ai" target="_blank" rel="noopener noreferrer">your Followr account</a> first.
+        </p>
+
+        <div class="install-tabs" role="tablist">
+          <button class="install-tab is-active" data-install="0" role="tab" aria-selected="true">Claude Desktop</button>
+          <button class="install-tab" data-install="1" role="tab" aria-selected="false">Claude Code</button>
+          <button class="install-tab" data-install="2" role="tab" aria-selected="false">Cursor</button>
+        </div>
+
+        <div class="install-pane" data-install-pane="0">
+          <p class="install-step" data-i18n="ins.t0.step">From inside Claude Desktop: profile picture (bottom-left) &rarr; <strong>Settings</strong> &rarr; <strong>Developer</strong> &rarr; <strong>Edit Config</strong>. Paste this into <code>claude_desktop_config.json</code>:</p>
+          <div class="code-block">
+            <button class="code-copy" type="button" data-copy>
+              <svg class="code-copy-icon" viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="9" height="9" rx="1.5"/><path d="M7 4V2.5a1.5 1.5 0 0 1 1.5-1.5h4A1.5 1.5 0 0 1 14 2.5v6A1.5 1.5 0 0 1 12.5 10H11"/></svg>
+              <span class="code-copy-label" data-i18n="code.copy">Copy</span>
+            </button>
+            <pre class="code"><code>{
+  "mcpServers": {
+    "followr": {
+      "command": "npx",
+      "args": ["-y", "@followr/mcp"],
+      "env": {
+        "FOLLOWR_API_TOKEN": "PASTE_YOUR_API_KEY_HERE"
+      }
+    }
+  }
+}</code></pre>
+          </div>
+          <p class="install-note" data-i18n="ins.t0.note">Fully close Claude Desktop (Cmd+Q on macOS, system tray &rarr; Quit on Windows) and open it again from scratch. Closing the window is not enough. The first <code>npx</code> download takes 5 to 10 seconds; cached after.</p>
+        </div>
+
+        <div class="install-pane" data-install-pane="1" hidden>
+          <p class="install-step" data-i18n="ins.t1.step">Run this once. <code>--scope user</code> makes the MCP available in every project.</p>
+          <div class="code-block">
+            <button class="code-copy" type="button" data-copy>
+              <svg class="code-copy-icon" viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="9" height="9" rx="1.5"/><path d="M7 4V2.5a1.5 1.5 0 0 1 1.5-1.5h4A1.5 1.5 0 0 1 14 2.5v6A1.5 1.5 0 0 1 12.5 10H11"/></svg>
+              <span class="code-copy-label" data-i18n="code.copy">Copy</span>
+            </button>
+            <pre class="code"><code>claude mcp add --scope user followr --env 'FOLLOWR_API_TOKEN=PASTE_YOUR_API_KEY_HERE' -- npx -y @followr/mcp</code></pre>
+          </div>
+          <p class="install-note" data-i18n="ins.t1.note">Single quotes around the env var are mandatory. Followr API keys contain a pipe (<code>|</code>) which the shell would otherwise truncate.</p>
+        </div>
+
+        <div class="install-pane" data-install-pane="2" hidden>
+          <p class="install-step" data-i18n="ins.t2.step">Edit <code>~/.cursor/mcp.json</code> (or use <em>Cursor Settings &rarr; MCP</em>):</p>
+          <div class="code-block">
+            <button class="code-copy" type="button" data-copy>
+              <svg class="code-copy-icon" viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="9" height="9" rx="1.5"/><path d="M7 4V2.5a1.5 1.5 0 0 1 1.5-1.5h4A1.5 1.5 0 0 1 14 2.5v6A1.5 1.5 0 0 1 12.5 10H11"/></svg>
+              <span class="code-copy-label" data-i18n="code.copy">Copy</span>
+            </button>
+            <pre class="code"><code>{
+  "mcpServers": {
+    "followr": {
+      "command": "npx",
+      "args": ["-y", "@followr/mcp"],
+      "env": {
+        "FOLLOWR_API_TOKEN": "PASTE_YOUR_API_KEY_HERE"
+      }
+    }
+  }
+}</code></pre>
+          </div>
+          <p class="install-note" data-i18n="ins.t2.note">Same JSON shape as Claude Desktop. Reload Cursor and the connector appears.</p>
+        </div>
+
+        <div class="install-token">
+          <h3 data-i18n="ins.token.title">Need a Followr API key?</h3>
+          <ol>
+            <li data-i18n="ins.token.s1">Sign in to <a href="https://app.followr.ai" target="_blank" rel="noopener noreferrer">Followr</a>.</li>
+            <li data-i18n="ins.token.s2">Click your profile picture in the top-left &rarr; select <strong>API Keys</strong> from the dropdown (or open the <a href="https://app.followr.ai/settings/api-keys" target="_blank" rel="noopener noreferrer">API Keys settings</a> directly).</li>
+            <li data-i18n="ins.token.s3"><strong>Generate</strong>, name it (e.g. &ldquo;Claude MCP&rdquo;), copy the API key. Followr only shows it once.</li>
+          </ol>
+        </div>
+      </div>
+    </section>
+
+    <!-- TRUST -->
+    <section class="trust">
+      <div class="trust-inner">
+        <span class="section-eyebrow" data-i18n="trust.eyebrow">YOUR API KEY</span>
+        <h2 class="section-title" data-i18n="trust.title">Stays where you put it.</h2>
+
+        <div class="trust-grid">
+          <div class="trust-card">
+            <div class="trust-num">01</div>
+            <h3 data-i18n="trust.t1.title">Local subprocess</h3>
+            <p data-i18n="trust.t1.body">The MCP runs on your machine. Your API key lives in your AI client&apos;s config file. The only host that ever sees it is <code>api.followr.ai</code>.</p>
+          </div>
+          <div class="trust-card">
+            <div class="trust-num">02</div>
+            <h3 data-i18n="trust.t2.title">Never logged</h3>
+            <p data-i18n="trust.t2.body">The MCP doesn&apos;t write the API key to disk, doesn&apos;t print it, doesn&apos;t send it anywhere else. Verify in the source.</p>
+          </div>
+          <div class="trust-card">
+            <div class="trust-num">03</div>
+            <h3 data-i18n="trust.t3.title">Open source. MIT.</h3>
+            <p data-i18n="trust.t3.body">Every tool, every API call, every line of code. Auditable. Forkable. PRs welcome.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- FINAL CTA -->
+    <section class="cta">
+      <div class="cta-inner">
+        <h2 class="cta-title" data-i18n="cta.title">Ready to plug Followr into your AI chat?</h2>
+        <p class="cta-sub" data-i18n="cta.sub">One npm install, one API key, zero new dashboards.</p>
+        <div class="cta-actions">
+          <a class="button button-lg" href="#install">
+            <span data-i18n="cta.install">Install in 1 minute</span>
+            <span aria-hidden="true">&rarr;</span>
+          </a>
+          <a class="button button-outline button-lg" href="https://github.com/followr-community/followr-mcp" target="_blank" rel="noopener noreferrer">
+            <span data-i18n="cta.github">Star on GitHub</span>
+            <span aria-hidden="true">&rarr;</span>
+          </a>
+        </div>
+        <p class="cta-secondary">
+          <span data-i18n="cta.secondary">Want to read the API behind it?</span>
+          <a href="https://followrapi-docs.pages.dev" target="_blank" rel="noopener noreferrer" data-i18n="cta.docs">Community docs &rarr;</a>
+        </p>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="footer">
+    <p data-i18n="footer.disclaimer">
+      Followr MCP. Maintained by Followr Community Maintainers. Not endorsed by, affiliated with, or supported by Followr Inc. For official support, contact support@followr.ai.
+    </p>
+    <p class="footer-links">
+      <a href="https://followr.ai" target="_blank" rel="noopener noreferrer">followr.ai</a>
+      <span class="footer-dot" aria-hidden="true">&middot;</span>
+      <a href="https://github.com/followr-community/followr-mcp" target="_blank" rel="noopener noreferrer">github</a>
+      <span class="footer-dot" aria-hidden="true">&middot;</span>
+      <a href="https://followrapi-docs.pages.dev" target="_blank" rel="noopener noreferrer">api docs</a>
+      <span class="footer-dot" aria-hidden="true">&middot;</span>
+      <a href="https://followr-fan-club.pages.dev" target="_blank" rel="noopener noreferrer">fan club</a>
+    </p>
+    <span class="sticker sticker-made-with-care" data-i18n="footer.madeWith">made with care &middot; 2026</span>
+  </footer>
+
+  <script src="app.js" defer></script>
+</body>
+</html>

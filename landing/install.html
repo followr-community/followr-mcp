@@ -1,0 +1,449 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="description" content="Step-by-step install guide for the Followr MCP. From a clean machine to a working connector in five minutes. Claude Code and Claude Desktop, both paths." />
+  <meta name="theme-color" content="#0B1220" />
+
+  <title>Install guide. Followr MCP.</title>
+
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg" />
+  <link rel="apple-touch-icon" href="assets/favicon.svg" />
+
+  <meta property="og:type" content="article" />
+  <meta property="og:title" content="Followr MCP install guide. Step by step." />
+  <meta property="og:description" content="From a clean machine to a working connector in five minutes. Claude Code and Claude Desktop." />
+  <meta property="og:image" content="assets/og-image.svg" />
+  <meta property="og:url" content="https://followr-mcp.pages.dev/install.html" />
+
+  <meta name="twitter:card" content="summary_large_image" />
+  <meta name="twitter:title" content="Followr MCP install guide. Step by step." />
+  <meta name="twitter:description" content="From a clean machine to a working connector in five minutes." />
+  <meta name="twitter:image" content="assets/og-image.svg" />
+
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <nav class="nav">
+    <a class="nav-brand" href="/" aria-label="Followr MCP home">
+      <img src="assets/mcp-mark.svg" width="32" height="32" alt="" />
+      <span class="nav-wordmark">
+        <span class="nav-wordmark-followr">followr</span>
+        <span class="nav-wordmark-product">mcp</span>
+      </span>
+    </a>
+    <span class="sticker sticker-unofficial" data-i18n="nav.unofficial">unofficial</span>
+    <span class="nav-spacer"></span>
+    <div class="nav-right">
+      <div class="lang-selector">
+        <button class="lang-button" id="lang-button" aria-haspopup="listbox" aria-expanded="false">
+          <span id="lang-button-label">EN</span>
+          <span class="lang-button-caret" aria-hidden="true">&#9662;</span>
+        </button>
+        <ul class="lang-dropdown" id="lang-dropdown" role="listbox" aria-label="Language"></ul>
+      </div>
+      <a class="button button-outline" href="https://github.com/followr-community/followr-mcp" target="_blank" rel="noopener noreferrer">
+        <span data-i18n="nav.github">GitHub</span>
+        <span aria-hidden="true">&rarr;</span>
+      </a>
+      <a class="button" href="/">
+        <span data-i18n="nav.home">Home</span>
+      </a>
+    </div>
+  </nav>
+
+  <main class="guide">
+
+    <section class="guide-hero">
+      <div class="guide-hero-inner">
+        <a class="guide-back" href="/">
+          <span aria-hidden="true">&larr;</span>
+          <span data-i18n="guide.back">Back to home</span>
+        </a>
+        <span class="eyebrow" data-i18n="guide.eyebrow">DETAILED GUIDE</span>
+        <h1 class="guide-title" data-i18n="guide.title">Install the Followr MCP, step by step.</h1>
+        <p class="guide-subtitle" data-i18n="guide.subtitle">
+          From a clean machine to a working connector in five minutes. Pick the path that matches your comfort with the terminal. The end result is the same: Claude (or any MCP client) talking to your Followr workspace.
+        </p>
+        <nav class="guide-toc" aria-label="Sections">
+          <a href="#prereq" class="guide-toc-item">
+            <span class="guide-toc-num">01</span>
+            <span data-i18n="guide.toc.prereq">Prerequisites</span>
+          </a>
+          <a href="#token" class="guide-toc-item">
+            <span class="guide-toc-num">02</span>
+            <span data-i18n="guide.toc.token">Get your API key</span>
+          </a>
+          <a href="#option-a" class="guide-toc-item">
+            <span class="guide-toc-num">03</span>
+            <span data-i18n="guide.toc.optB">Claude Code</span>
+          </a>
+          <a href="#option-b" class="guide-toc-item">
+            <span class="guide-toc-num">04</span>
+            <span data-i18n="guide.toc.optA">Claude Desktop</span>
+          </a>
+          <a href="#trouble" class="guide-toc-item">
+            <span class="guide-toc-num">05</span>
+            <span data-i18n="guide.toc.trouble">Troubleshooting</span>
+          </a>
+        </nav>
+      </div>
+    </section>
+
+    <section id="prereq" class="guide-section">
+      <div class="guide-section-inner">
+        <span class="section-eyebrow" data-i18n="guide.s1.eyebrow">01 &middot; PREREQUISITES</span>
+        <h2 class="section-title" data-i18n="guide.s1.title">Three things before you start.</h2>
+        <p class="section-sub" data-i18n="guide.s1.intro">If any of these are missing the install will fail. Check them now, save yourself five minutes of debugging later.</p>
+
+        <div class="prereq-grid">
+          <div class="prereq-card">
+            <div class="prereq-num">1</div>
+            <h3 data-i18n="guide.s1.c1.title">Node.js 20 or newer</h3>
+            <p data-i18n="guide.s1.c1.body">Open a terminal and run <code>node --version</code>. If you see <code>v20</code> or higher, you are set. If the command is missing or the version is older, install the LTS build from <a href="https://nodejs.org" target="_blank" rel="noopener noreferrer">nodejs.org</a> and restart your terminal.</p>
+          </div>
+
+          <div class="prereq-card prereq-card-warning">
+            <div class="prereq-num">2</div>
+            <h3 data-i18n="guide.s1.c2.title">A Followr plan with API access</h3>
+            <p data-i18n="guide.s1.c2.body">API keys are only available on plans that include API access, or on plans with the API key add-on enabled. If your current plan does not include it, the MCP will install fine but every call will return 401. Check or upgrade your plan in <a href="https://app.followr.ai" target="_blank" rel="noopener noreferrer">your Followr account</a> before you continue.</p>
+          </div>
+
+          <div class="prereq-card">
+            <div class="prereq-num">3</div>
+            <h3 data-i18n="guide.s1.c3.title">A Followr API key</h3>
+            <p data-i18n="guide.s1.c3.body">A long string Followr generates for you. The MCP reads it at startup and uses it to authenticate every call. We walk through generating one in the next section.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="token" class="guide-section guide-section-alt">
+      <div class="guide-section-inner">
+        <span class="section-eyebrow" data-i18n="guide.s2.eyebrow">02 &middot; API KEY</span>
+        <h2 class="section-title" data-i18n="guide.s2.title">Generate your API key.</h2>
+        <p class="section-sub" data-i18n="guide.s2.intro">One API key works for every workspace under your account. Generate it once, paste it into your AI client, forget it exists.</p>
+
+        <ol class="guide-steps">
+          <li class="guide-step">
+            <div class="guide-step-num">1</div>
+            <div class="guide-step-body">
+              <h3 data-i18n="guide.s2.st1.title">Sign in to <a href="https://app.followr.ai" target="_blank" rel="noopener noreferrer">Followr</a>.</h3>
+              <p data-i18n="guide.s2.st1.body">Use the account whose workspaces you want to expose to the AI client. The API key will inherit your permissions.</p>
+            </div>
+          </li>
+
+          <li class="guide-step">
+            <div class="guide-step-num">2</div>
+            <div class="guide-step-body">
+              <h3 data-i18n="guide.s2.st2.title">Click your profile picture in the top-left and select API Keys from the dropdown menu.</h3>
+              <p data-i18n="guide.s2.st2.body">Shortcut: open the <a href="https://app.followr.ai/settings/api-keys" target="_blank" rel="noopener noreferrer">API Keys settings</a> directly.</p>
+            </div>
+          </li>
+
+          <li class="guide-step">
+            <div class="guide-step-num">3</div>
+            <div class="guide-step-body">
+              <h3 data-i18n="guide.s2.st3.title">Click Generate, name it, copy the API key.</h3>
+              <p data-i18n="guide.s2.st3.body">Name it something you will recognize later, like "Claude MCP" or "My laptop". Copy the API key immediately. Followr shows the full string only once.</p>
+            </div>
+          </li>
+        </ol>
+
+        <div class="guide-callout guide-callout-warning">
+          <strong data-i18n="guide.s2.warn.head">Treat the API key like a password.</strong>
+          <span data-i18n="guide.s2.warn.body"> Never paste it into a chat, an issue, a screenshot, or a Slack thread. Paste it only into your local terminal or a config file on your own machine. If an API key leaks, revoke it from the same screen and generate a new one.</span>
+        </div>
+      </div>
+    </section>
+
+    <section id="pickone" class="guide-fork">
+      <div class="guide-fork-inner">
+        <span class="guide-fork-eyebrow" data-i18n="guide.fork.eyebrow">PICK ONE</span>
+        <h2 class="guide-fork-title" data-i18n="guide.fork.title">The next two sections are alternatives. You only do one.</h2>
+        <p class="guide-fork-body" data-i18n="guide.fork.body">Pick the option that matches the AI client you actually use. Section 03 (Option A) is for Claude Code (terminal). Section 04 (Option B) is for Claude Desktop (app). Doing both is not necessary and not recommended.</p>
+        <div class="guide-fork-options">
+          <a href="#option-a" class="guide-fork-option">
+            <span class="guide-fork-letter">A</span>
+            <span class="guide-fork-text">
+              <span class="guide-fork-option-title" data-i18n="guide.fork.optA.title">Claude Code (CLI)</span>
+              <span class="guide-fork-option-sub" data-i18n="guide.fork.optA.sub">One terminal command. Recommended.</span>
+            </span>
+          </a>
+          <span class="guide-fork-or" data-i18n="guide.fork.or">OR</span>
+          <a href="#option-b" class="guide-fork-option">
+            <span class="guide-fork-letter">B</span>
+            <span class="guide-fork-text">
+              <span class="guide-fork-option-title" data-i18n="guide.fork.optB.title">Claude Desktop (app)</span>
+              <span class="guide-fork-option-sub" data-i18n="guide.fork.optB.sub">Edit a JSON config file.</span>
+            </span>
+          </a>
+        </div>
+      </div>
+    </section>
+
+    <section id="option-a" class="guide-section">
+      <div class="guide-section-inner">
+        <div class="guide-section-head">
+          <span class="section-eyebrow" data-i18n="guide.s3.eyebrow">03 &middot; OPTION A</span>
+          <span class="sticker sticker-recommended" data-i18n="guide.s3.chip">recommended</span>
+        </div>
+        <h2 class="section-title" data-i18n="guide.s3.title">Claude Code (CLI).</h2>
+        <p class="section-sub" data-i18n="guide.s3.intro">If you use Claude Code, this is the option for you. One terminal command, one verification, done. Skip Option B below.</p>
+
+        <ol class="guide-steps">
+          <li class="guide-step">
+            <div class="guide-step-num">1</div>
+            <div class="guide-step-body">
+              <h3 data-i18n="guide.s3.st1.title">Open your terminal and paste this command.</h3>
+              <p data-i18n="guide.s3.st1.body">Replace <code>PASTE_YOUR_API_KEY_HERE</code> with the API key you copied. Then press Enter.</p>
+              <div class="code-block">
+                <button class="code-copy" type="button" data-copy>
+                  <svg class="code-copy-icon" viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="9" height="9" rx="1.5"/><path d="M7 4V2.5a1.5 1.5 0 0 1 1.5-1.5h4A1.5 1.5 0 0 1 14 2.5v6A1.5 1.5 0 0 1 12.5 10H11"/></svg>
+                  <span class="code-copy-label" data-i18n="code.copy">Copy</span>
+                </button>
+                <pre class="code"><code>claude mcp add --scope user followr --env 'FOLLOWR_API_TOKEN=PASTE_YOUR_API_KEY_HERE' -- npx -y @followr/mcp</code></pre>
+              </div>
+              <div class="guide-callout">
+                <strong data-i18n="guide.s3.callout.head">The single quotes matter.</strong>
+                <span data-i18n="guide.s3.callout.body"> Followr API keys contain a pipe character (<code>|</code>). Without single quotes the shell interprets the pipe as a pipe operator, truncates the API key, and every call returns 401.</span>
+              </div>
+            </div>
+          </li>
+
+          <li class="guide-step">
+            <div class="guide-step-num">2</div>
+            <div class="guide-step-body">
+              <h3 data-i18n="guide.s3.st2.title">Verify the connection.</h3>
+              <p data-i18n="guide.s3.st2.body">Run this and confirm both lines:</p>
+              <div class="code-block">
+                <button class="code-copy" type="button" data-copy>
+                  <svg class="code-copy-icon" viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="9" height="9" rx="1.5"/><path d="M7 4V2.5a1.5 1.5 0 0 1 1.5-1.5h4A1.5 1.5 0 0 1 14 2.5v6A1.5 1.5 0 0 1 12.5 10H11"/></svg>
+                  <span class="code-copy-label" data-i18n="code.copy">Copy</span>
+                </button>
+                <pre class="code"><code>claude mcp get followr</code></pre>
+              </div>
+              <ul class="guide-check-list">
+                <li><code>Status: &#10003; Connected</code></li>
+                <li><code>Scope: User config</code></li>
+              </ul>
+              <p data-i18n="guide.s3.st2.note">If you see <code>Scope: Local config</code> instead, the MCP is only visible inside the directory where you ran the command. Remove it (<code>claude mcp remove followr</code>) and re-run the install with <code>--scope user</code>.</p>
+            </div>
+          </li>
+
+          <li class="guide-step">
+            <div class="guide-step-num">3</div>
+            <div class="guide-step-body">
+              <h3 data-i18n="guide.s3.st3.title">Try a real prompt.</h3>
+              <p data-i18n="guide.s3.st3.body">Inside Claude Code, ask "List my Followr workspaces" or "Show me the next scheduled posts". If you get real data back, you are done.</p>
+            </div>
+          </li>
+        </ol>
+      </div>
+    </section>
+
+    <section id="option-b" class="guide-section guide-section-alt">
+      <div class="guide-section-inner">
+        <div class="guide-section-head">
+          <span class="section-eyebrow" data-i18n="guide.s4.eyebrow">04 &middot; OPTION B</span>
+          <span class="sticker sticker-alternative" data-i18n="guide.s4.chip">alternative</span>
+        </div>
+        <h2 class="section-title" data-i18n="guide.s4.title">Claude Desktop.</h2>
+        <p class="section-sub" data-i18n="guide.s4.intro">Only follow this option if you did NOT already do Option A above. A JSON config file lives somewhere on your machine. We open it, paste a block, save it, and restart Claude. No terminal required if you use the in-app shortcut.</p>
+
+        <h3 class="guide-subheading" data-i18n="guide.s4.h1">Step 1. Open the config from inside the app.</h3>
+        <ol class="guide-steps">
+          <li class="guide-step">
+            <div class="guide-step-num">1</div>
+            <div class="guide-step-body">
+              <h3 data-i18n="guide.s4.h1.s1.title">Open Claude Desktop.</h3>
+              <p data-i18n="guide.s4.h1.s1.body">If you don't have it yet, download it from <a href="https://claude.ai/download" target="_blank" rel="noopener noreferrer">claude.ai/download</a> and sign in with your Anthropic account. The web app at claude.ai cannot run local MCPs, so the desktop app is required for this path.</p>
+            </div>
+          </li>
+
+          <li class="guide-step">
+            <div class="guide-step-num">2</div>
+            <div class="guide-step-body">
+              <h3 data-i18n="guide.s4.h1.s2.title">Click your profile picture in the bottom-left corner of the Claude window.</h3>
+              <p data-i18n="guide.s4.h1.s2.body">A menu opens.</p>
+            </div>
+          </li>
+
+          <li class="guide-step">
+            <div class="guide-step-num">3</div>
+            <div class="guide-step-body">
+              <h3 data-i18n="guide.s4.h1.s3.title">Go to Settings &rarr; Developer &rarr; Edit Config.</h3>
+              <p data-i18n="guide.s4.h1.s3.body">That opens the folder containing <code>claude_desktop_config.json</code>. Double-click the file to open it in your default text editor (TextEdit, Notepad, VS Code, whatever you have). If the file does not exist yet, create one inside that folder with that exact name.</p>
+            </div>
+          </li>
+        </ol>
+
+        <h3 class="guide-subheading" data-i18n="guide.s4.h2">Step 2. Paste the Followr block.</h3>
+        <p class="guide-prose" data-i18n="guide.s4.h2.intro">If the file is empty, paste exactly this:</p>
+        <div class="code-block">
+          <button class="code-copy" type="button" data-copy>
+            <svg class="code-copy-icon" viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="9" height="9" rx="1.5"/><path d="M7 4V2.5a1.5 1.5 0 0 1 1.5-1.5h4A1.5 1.5 0 0 1 14 2.5v6A1.5 1.5 0 0 1 12.5 10H11"/></svg>
+            <span class="code-copy-label" data-i18n="code.copy">Copy</span>
+          </button>
+          <pre class="code"><code>{
+  "mcpServers": {
+    "followr": {
+      "command": "npx",
+      "args": ["-y", "@followr/mcp"],
+      "env": {
+        "FOLLOWR_API_TOKEN": "PASTE_YOUR_API_KEY_HERE"
+      }
+    }
+  }
+}</code></pre>
+        </div>
+        <p class="guide-prose" data-i18n="guide.s4.h2.append">If the file already has other MCPs configured, only add the <code>"followr"</code> block inside <code>"mcpServers"</code>, separated by a comma from the previous block:</p>
+        <div class="code-block">
+          <button class="code-copy" type="button" data-copy>
+            <svg class="code-copy-icon" viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="9" height="9" rx="1.5"/><path d="M7 4V2.5a1.5 1.5 0 0 1 1.5-1.5h4A1.5 1.5 0 0 1 14 2.5v6A1.5 1.5 0 0 1 12.5 10H11"/></svg>
+            <span class="code-copy-label" data-i18n="code.copy">Copy</span>
+          </button>
+          <pre class="code"><code>{
+  "mcpServers": {
+    "some-other-mcp": {
+      "command": "...",
+      "args": ["..."]
+    },
+    "followr": {
+      "command": "npx",
+      "args": ["-y", "@followr/mcp"],
+      "env": {
+        "FOLLOWR_API_TOKEN": "PASTE_YOUR_API_KEY_HERE"
+      }
+    }
+  }
+}</code></pre>
+        </div>
+        <div class="guide-callout">
+          <strong data-i18n="guide.s4.h2.callout.head">The comma is required.</strong>
+          <span data-i18n="guide.s4.h2.callout.body"> If you forget it between MCP blocks the JSON becomes invalid and Claude won't load any connector, not just Followr. When in doubt paste the whole file into <a href="https://jsonlint.com" target="_blank" rel="noopener noreferrer">jsonlint.com</a>.</span>
+        </div>
+
+        <h3 class="guide-subheading" data-i18n="guide.s4.h3">Step 3. Paste your API key and save the file.</h3>
+        <p class="guide-prose" data-i18n="guide.s4.h3.body">Replace <code>PASTE_YOUR_API_KEY_HERE</code> with the API key you copied from Followr. Keep the double quotes around it. The result looks like:</p>
+        <div class="code-block">
+          <button class="code-copy" type="button" data-copy>
+            <svg class="code-copy-icon" viewBox="0 0 16 16" width="13" height="13" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="9" height="9" rx="1.5"/><path d="M7 4V2.5a1.5 1.5 0 0 1 1.5-1.5h4A1.5 1.5 0 0 1 14 2.5v6A1.5 1.5 0 0 1 12.5 10H11"/></svg>
+            <span class="code-copy-label" data-i18n="code.copy">Copy</span>
+          </button>
+          <pre class="code"><code>"FOLLOWR_API_TOKEN": "1234|abcdEFGHijklMNOP..."</code></pre>
+        </div>
+        <p class="guide-prose" data-i18n="guide.s4.h3.save">Save the file with Cmd+S (macOS) or Ctrl+S (Windows).</p>
+
+        <h3 class="guide-subheading" data-i18n="guide.s4.h4">Step 4. Fully close Claude Desktop. Then open it again.</h3>
+        <div class="guide-restart-callout">
+          <strong data-i18n="guide.s4.h4.callout.head">Closing only the window is NOT enough.</strong>
+          <span data-i18n="guide.s4.h4.callout.body"> Claude keeps running in the background and will not reload the config file until it's fully closed. After closing the window, follow the instructions for your OS below, then open the app again from scratch.</span>
+        </div>
+        <ul class="guide-os-list">
+          <li><strong data-i18n="guide.s4.h4.mac.head">macOS:</strong> <span data-i18n="guide.s4.h4.mac.body">Menu bar &rarr; Claude &rarr; Quit Claude (or press Cmd+Q). Then reopen from the Dock or Spotlight.</span></li>
+          <li><strong data-i18n="guide.s4.h4.win.head">Windows:</strong> <span data-i18n="guide.s4.h4.win.body">Right-click the Claude icon in the system tray (next to the clock) &rarr; Quit. Then open Claude again from the Start menu.</span></li>
+          <li><strong data-i18n="guide.s4.h4.lin.head">Linux:</strong> <span data-i18n="guide.s4.h4.lin.body">Close the app fully, kill any lingering process if needed, then open it again.</span></li>
+        </ul>
+
+        <h3 class="guide-subheading" data-i18n="guide.s4.h5">Step 5. Confirm the MCP is connected.</h3>
+        <p class="guide-prose" data-i18n="guide.s4.h5.body">Inside a new chat, click the tools or plug icon below the message box. You should see <code>followr</code> listed. The first time the connector loads, expect a 5 to 10 second delay while <code>npx</code> downloads <code>@followr/mcp</code>. Subsequent launches are instant.</p>
+
+        <details class="guide-details">
+          <summary data-i18n="guide.s4.alt.title">Alternative: locate the config file manually.</summary>
+          <p data-i18n="guide.s4.alt.intro">If the in-app shortcut doesn't work for any reason, the file lives at one of these paths. Open it directly with your editor.</p>
+          <ul class="guide-os-list">
+            <li><strong>macOS:</strong> <code>~/Library/Application Support/Claude/claude_desktop_config.json</code></li>
+            <li><strong>Windows:</strong> <code>%APPDATA%\Claude\claude_desktop_config.json</code></li>
+            <li><strong>Linux:</strong> <code>~/.config/Claude/claude_desktop_config.json</code></li>
+          </ul>
+          <p data-i18n="guide.s4.alt.mac">On macOS, the fastest way to reach that folder is Finder &rarr; Go &rarr; Go to Folder (Cmd+Shift+G), then paste <code>~/Library/Application Support/Claude/</code>.</p>
+        </details>
+      </div>
+    </section>
+
+    <section id="trouble" class="guide-section">
+      <div class="guide-section-inner">
+        <span class="section-eyebrow" data-i18n="guide.s5.eyebrow">05 &middot; TROUBLESHOOTING</span>
+        <h2 class="section-title" data-i18n="guide.s5.title">Common errors and fixes.</h2>
+
+        <div class="trouble-grid">
+          <div class="trouble-card">
+            <h3 data-i18n="guide.s5.e1.title">Every call returns 401 Unauthorized.</h3>
+            <p data-i18n="guide.s5.e1.body">Either the API key was truncated by the shell (missing single quotes on Claude Code), there is an extra space when you pasted it, or your plan does not include API access. Re-check the API key character by character and verify your plan inside <a href="https://app.followr.ai" target="_blank" rel="noopener noreferrer">Followr</a>.</p>
+          </div>
+
+          <div class="trouble-card">
+            <h3 data-i18n="guide.s5.e2.title">The followr connector doesn't appear in Claude Desktop.</h3>
+            <p data-i18n="guide.s5.e2.body">Almost always invalid JSON. Paste the full file into <a href="https://jsonlint.com" target="_blank" rel="noopener noreferrer">jsonlint.com</a>. The most frequent cause is a missing comma between MCP blocks. Also confirm you fully quit Claude (Cmd+Q on macOS, system tray on Windows), not just closed the window.</p>
+          </div>
+
+          <div class="trouble-card">
+            <h3 data-i18n="guide.s5.e3.title">"command not found: npx".</h3>
+            <p data-i18n="guide.s5.e3.body">Node.js is not installed or not on your PATH. Install LTS from <a href="https://nodejs.org" target="_blank" rel="noopener noreferrer">nodejs.org</a>, restart your terminal, restart your AI client, try again.</p>
+          </div>
+
+          <div class="trouble-card">
+            <h3 data-i18n="guide.s5.e4.title">First call hangs for several seconds.</h3>
+            <p data-i18n="guide.s5.e4.body">Normal on first run. <code>npx</code> is downloading the package (~25 MB cached in <code>~/.npm/_npx/</code>). Every launch after the first is instant. To pre-warm, run <code>npx -y @followr/mcp --version || true</code> in your terminal.</p>
+          </div>
+
+          <div class="trouble-card">
+            <h3 data-i18n="guide.s5.e5.title">claude.ai (web) does not list local MCPs.</h3>
+            <p data-i18n="guide.s5.e5.body">Expected. The browser version of claude.ai only supports remote HTTP connectors, not local stdio servers. For now, use Claude Desktop, Claude Code, or any other client listed on the home page.</p>
+          </div>
+
+          <div class="trouble-card">
+            <h3 data-i18n="guide.s5.e6.title">API key leaked. What now?</h3>
+            <p data-i18n="guide.s5.e6.body">Open the <a href="https://app.followr.ai/settings/api-keys" target="_blank" rel="noopener noreferrer">API Keys settings</a>, revoke the leaked API key, generate a new one, update your config file or rerun <code>claude mcp add</code>, restart your AI client.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="cta">
+      <div class="cta-inner">
+        <h2 class="cta-title" data-i18n="guide.cta.title">All set. What next?</h2>
+        <p class="cta-sub" data-i18n="guide.cta.sub">Open Claude and ask it to list your next scheduled posts. If it answers with real data, the connector is live.</p>
+        <div class="cta-actions">
+          <a class="button button-lg" href="/">
+            <span data-i18n="guide.cta.home">Back to home</span>
+            <span aria-hidden="true">&rarr;</span>
+          </a>
+          <a class="button button-outline button-lg" href="https://github.com/followr-community/followr-mcp" target="_blank" rel="noopener noreferrer">
+            <span data-i18n="guide.cta.github">Star on GitHub</span>
+            <span aria-hidden="true">&rarr;</span>
+          </a>
+        </div>
+        <p class="cta-secondary">
+          <span data-i18n="guide.cta.secondary">Want to peek at the API behind it?</span>
+          <a href="https://followrapi-docs.pages.dev" target="_blank" rel="noopener noreferrer" data-i18n="guide.cta.docs">Community docs &rarr;</a>
+        </p>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="footer">
+    <p data-i18n="footer.disclaimer">
+      Followr MCP. Maintained by Followr Community Maintainers. Not endorsed by, affiliated with, or supported by Followr Inc. For official support, contact support@followr.ai.
+    </p>
+    <p class="footer-links">
+      <a href="https://followr.ai" target="_blank" rel="noopener noreferrer">followr.ai</a>
+      <span class="footer-dot" aria-hidden="true">&middot;</span>
+      <a href="https://github.com/followr-community/followr-mcp" target="_blank" rel="noopener noreferrer">github</a>
+      <span class="footer-dot" aria-hidden="true">&middot;</span>
+      <a href="https://followrapi-docs.pages.dev" target="_blank" rel="noopener noreferrer">api docs</a>
+      <span class="footer-dot" aria-hidden="true">&middot;</span>
+      <a href="https://followr-fan-club.pages.dev" target="_blank" rel="noopener noreferrer">fan club</a>
+    </p>
+    <span class="sticker sticker-made-with-care" data-i18n="footer.madeWith">made with care &middot; 2026</span>
+  </footer>
+
+  <script src="app.js" defer></script>
+</body>
+</html>

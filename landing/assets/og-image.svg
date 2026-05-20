@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <defs>
+    <linearGradient id="og-text-grad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#00D18D"/>
+      <stop offset="100%" stop-color="#00C3D9"/>
+    </linearGradient>
+    <radialGradient id="og-bg-1" cx="0.85" cy="-0.1" r="0.7">
+      <stop offset="0%" stop-color="rgba(0, 195, 217, 0.28)"/>
+      <stop offset="100%" stop-color="rgba(0, 195, 217, 0)"/>
+    </radialGradient>
+    <radialGradient id="og-bg-2" cx="0" cy="1.1" r="0.65">
+      <stop offset="0%" stop-color="rgba(0, 209, 141, 0.22)"/>
+      <stop offset="100%" stop-color="rgba(0, 209, 141, 0)"/>
+    </radialGradient>
+    <linearGradient id="og-mark-grad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#00D18D"/>
+      <stop offset="100%" stop-color="#00C3D9"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="630" fill="#0B1220"/>
+  <rect width="1200" height="630" fill="url(#og-bg-1)"/>
+  <rect width="1200" height="630" fill="url(#og-bg-2)"/>
+
+  <g transform="translate(80, 80)">
+    <g transform="scale(1.1)">
+      <rect width="64" height="64" rx="14" fill="#0B1220" stroke="rgba(0, 195, 217, 0.4)" stroke-width="1"/>
+      <path d="M16 14 L48 14 Q52 14 52 18 L52 38 Q52 42 48 42 L28 42 L16 50 L22 42 L16 42 Q12 42 12 38 L12 18 Q12 14 16 14 Z" fill="url(#og-mark-grad)"/>
+      <path d="M32 18 L34.06 23.17 L39.61 23.53 L35.33 27.08 L36.70 32.47 L32 29.50 L27.30 32.47 L28.67 27.08 L24.39 23.53 L29.94 23.17 Z" fill="#0B1220"/>
+    </g>
+    <text x="90" y="50" font-family="Poppins, Inter, sans-serif" font-size="34" font-weight="700" fill="#F3F4F6" letter-spacing="-0.01em">followr<tspan font-weight="500" fill="#9CA3AF"> mcp</tspan></text>
+  </g>
+
+  <g transform="translate(80, 240)">
+    <text font-family="Poppins, Inter, sans-serif" font-size="92" font-weight="700" letter-spacing="-0.02em" fill="#F3F4F6">
+      <tspan x="0" y="0">Don&apos;t open Followr.</tspan>
+      <tspan x="0" y="108" fill="url(#og-text-grad)">Just ask.</tspan>
+    </text>
+  </g>
+
+  <g transform="translate(80, 500)">
+    <text font-family="Inter, sans-serif" font-size="26" font-weight="500" fill="#9CA3AF">An MCP server. 72 tools. Works in Claude, Cursor, and any MCP client.</text>
+  </g>
+
+  <g transform="translate(80, 555)">
+    <rect x="0" y="-22" width="120" height="30" rx="15" fill="rgba(245, 158, 11, 0.10)" stroke="rgba(245, 158, 11, 0.4)" stroke-width="1"/>
+    <text x="60" y="-3" font-family="Inter, sans-serif" font-size="14" font-weight="700" letter-spacing="0.12em" fill="#F59E0B" text-anchor="middle">UNOFFICIAL</text>
+  </g>
+</svg>
