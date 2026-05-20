@@ -156,16 +156,30 @@ If creative work follows (post generation, scheduling), consider calling get_com
             : singleOwned
               ? `Single company owned by the user ("${singleOwned.name}"). Safe to use its id for subsequent operations without re-asking, unless the user explicitly mentions a different company.${adminScopeNote}`
               : "";
+      // Per-modality AI budgets. Mirrors get_ai_budget output shape (the
+      // simpler 4-bucket model) so any agent that sees only get_session_context
+      // already has the correct mental model. The legacy 'credits' field from
+      // Followr's API is intentionally NOT surfaced here: it's a deprecated
+      // counter (AppSumo lifetime + topups) that previously misled agents into
+      // false "you don't have enough credits" conclusions.
       const subscription =
         balanceResult && typeof balanceResult === "object" && !("_error" in balanceResult)
           ? {
-              credits: balanceResult.credits,
-              words_allowed: balanceResult.words_allowed,
-              words_spent: balanceResult.words_spent,
-              images_allowed: balanceResult.images_allowed,
-              images_spent: balanceResult.images_spent,
+              ai_text_budget: {
+                remaining: balanceResult.words_allowed - balanceResult.words_spent,
+                used: balanceResult.words_spent,
+                total: balanceResult.words_allowed,
+              },
+              ai_image_and_video_budget: {
+                remaining: balanceResult.images_allowed - balanceResult.images_spent,
+                used: balanceResult.images_spent,
+                total: balanceResult.images_allowed,
+                note: "video and image generation share this bucket; there is no separate video quota",
+              },
               plus_chat_enabled: balanceResult.plus_chat_enabled,
               white_label_enabled: balanceResult.white_label_enabled,
+              _what_to_use_for_decisions:
+                "For any video or image generation cost decision, read ai_image_and_video_budget.remaining (not the deprecated 'credits' field that the underlying API still exposes).",
             }
           : null;
       const response: Record<string, unknown> = {
@@ -175,7 +189,6 @@ If creative work follows (post generation, scheduling), consider calling get_com
           email: me.email,
           timezone: me.timezone ?? null,
           language: me.language ?? null,
-          credits: me.credits ?? null,
         },
         companies: ownedCompanies.map((c) => ({
           id: c.id,

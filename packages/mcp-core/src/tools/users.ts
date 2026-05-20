@@ -15,11 +15,13 @@ export function registerUserTools(
     {
       annotations: READ_ONLY,
       title: "Get the user that owns the current API token",
-      description: `Return the Followr user identified by the API token in use: id, name, email, timezone, language, credit balance, password presence, created_at.
+      description: `Return the Followr user identified by the API token in use: id, name, email, timezone, language, password presence, created_at.
 
 USE AT START of a conversation to anchor "who am I" and to discover the user's timezone for scheduling decisions. The timezone returned here is the DEFAULT to assume for verbal time references ("9 AM", "tomorrow") unless the user states a different one.
 
-Combined with list_companies, this is the foundation for orienting any Followr session: who the user is, which companies they can access, and what timezone to use for time math.`,
+Combined with list_companies, this is the foundation for orienting any Followr session: who the user is, which companies they can access, and what timezone to use for time math.
+
+For AI generation budget, use get_ai_budget. This tool intentionally does NOT surface the deprecated 'credits' counter that the underlying API still exposes; that counter mixed AppSumo lifetime credits and topups and led to false negatives.`,
       inputSchema: {},
     },
     async () => {
@@ -30,7 +32,6 @@ Combined with list_companies, this is the foundation for orienting any Followr s
         email: me.email,
         timezone: me.timezone,
         language: me.language,
-        credits: me.credits,
         has_password: me.has_password,
         created_at: me.created_at,
       };

@@ -9,8 +9,8 @@
     "clean": "rm -rf dist tsconfig.tsbuildinfo"
   },
   "dependencies": {
-    "@followr-mcp/mcp-core": "0.4.0",
-    "@followr-mcp/shared": "0.4.0",
+    "@followr-mcp/mcp-core": "0.4.1",
+    "@followr-mcp/shared": "0.4.1",
     "@modelcontextprotocol/sdk": "^1.0.0"
   },
   "devDependencies": {
