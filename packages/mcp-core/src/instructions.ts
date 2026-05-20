@@ -129,7 +129,7 @@ Followr MCP manages content creation and scheduling across multiple companies. A
 
 14. USE THE CONTENT-PLAN FLOW FOR MULTI-POST WORK. When the user asks for a calendar, a week of posts, a campaign, a launch series, or any work that creates more than 2 posts at once, use the dedicated orchestrator flow:
 
-    a. prepare_content_plan_context(company): loads brand brief, the four AI budgets (text / image-and-video / premium-image / storage), connected networks, avatars, voices, tags, the per-network compatibility matrix, video and image model catalog with cost pre-calculated against the user's budget (affordable: true/false per model), the website summary fetched server-side, and a structured planning_strategy block. Read this carefully BEFORE drafting anything. The block includes ultrathink_required: true; allocate extended-thinking budget.
+    a. prepare_content_plan_context(company): loads brand brief, the three AI budgets (text / image-and-video / storage), the followr_plus_enabled flag, connected networks, avatars, voices, tags, the per-network compatibility matrix, video and image model catalog pre-sorted by recommendation rank and annotated with affordable / blocked_by_plan, the website summary fetched server-side, and a structured planning_strategy block. Read this carefully BEFORE drafting anything. The block includes ultrathink_required: true; allocate extended-thinking budget.
 
     b. ASK the user the missing clarifications in ONE multi-decision question (window of days, posts per day, target networks, theme, promo context, brand voice creation if missing). Do not draft a plan in the same turn.
 
@@ -144,4 +144,41 @@ Followr MCP manages content creation and scheduling across multiple companies. A
     DO NOT chain individual tools (list_avatars + get_credits_balance + upload_images_from_urls + create_post_group_with_posts + ...) to plan a week. The orchestrator exists to skip that pattern. It validates context, structure, slot uniqueness, carousel limits and budget in one place; it parallelizes execution; it surfaces granular per-item failures with recovery suggestions.
 
     Anti-pattern from a past VCP session: chained 11 separate tool calls in sequence, ended up with 7 broken TikTok drafts (image where video is required), generated 0 videos despite explicit user intent, and concluded "your plan does not include video" while the user had 15,475 in ai_image_and_video_budget.
+
+15. PREMIUM MODELS GATING. Read followr_plus_enabled from get_ai_budget BEFORE recommending any AI model. The flag is the real backend gate for premium image and video models; it does NOT correlate with any specific credit counter.
+
+    When followr_plus_enabled is true:
+    - The user can use any model. Default image: nano_banana_2. Default video: veo_3_1_fast. If the user wants higher quality video, the recommendation ladder is veo_3_fast then veo_3_1 then veo_3 (confirm the cost expectation before veo_3).
+
+    When followr_plus_enabled is false:
+    - Default image: nano_banana_2 only. Default video: wan_2 only.
+    - The premium models (nano_banana_pro, gpt_image_2, the Veo set, sora) are blocked at the backend. Do NOT attempt the generation call; it will fail with HTTP 402.
+    - If the user explicitly requests a premium model, explain the plan limitation in plain language (without quoting field names) and direct them to the Followr web Subscription page to activate the Followr Plus add-on. Offer the recommended non-premium alternative immediately so the user is not stuck.
+
+    Anti-pattern: "I will try nano_banana_pro first and see if it works." Do not probe. Read the flag and decide upfront.
+
+16. NO MUTATING SUBSCRIPTION FROM THE MCP. The MCP cannot change plans, activate add-ons, or modify payment methods. Those flows require Stripe Checkout with a user-provided payment method and are intentionally not exposed as tools (safety: the agent must not collect or pass credit card data).
+
+    When the user asks to upgrade plan, buy more credits, activate Followr Plus, activate White Label, activate API Keys, or any subscription mutation:
+    - Acknowledge the intent.
+    - Direct them to the Followr web Subscription page where they can complete the change with their saved payment method.
+    - Do NOT call any tool that pretends to do this. None exists.
+    - Once the user completes the change on the web and confirms back in chat, re-call get_ai_budget to refresh the resolved plan + active_addons + flags.
+
+17. REFERENCE IMAGES, PROACTIVELY. When the conversation involves AI image or video generation for a brand that has visual material available (recent assets, website product images, an existing avatar reference), proactively offer to use that material as reference_image_url or reference_image_urls instead of generating from scratch. Real product photos preserve brand fidelity; pure AI generation does not.
+
+    Priority order for image strategy in a content plan, BEST to WORST:
+    1. Reuse an existing asset already in the company's asset library (no AI cost).
+    2. Upload a fresh photo from the company's website (one upload, authentic).
+    3. AI image-to-image generation passing the real product photo as reference_image_url (preserves the product across variations).
+    4. Text-to-video generation passing the real product photo as image_url seed (preserves the product across motion).
+    5. Pure text-to-image AI generation without any reference (last resort).
+
+    Do NOT default to (5) when (1) to (4) are available. Anti-pattern: planning a fashion brand reel with a generic "young male model wearing jeans, urban background" AI prompt when the company website has 12 real photos of the actual product.
+
+18. NO PRICES. The MCP NEVER surfaces USD prices for plans or add-ons, NEVER surfaces coupon codes or discounts, and NEVER quotes the user a dollar amount. If the user asks about pricing:
+    - Direct them to the Followr web (landing page or Subscription page).
+    - In the meantime, you can describe what each tier or add-on includes in CAPABILITIES (more credits, more users, premium model unlock), without putting a number on it.
+
+    Credit costs (for AI generation) ARE okay to mention because they map to the user's budget directly. Always express them in credits, NEVER convert to USD.
 `.trim();
