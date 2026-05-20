@@ -28,7 +28,7 @@
 // This file currently implements prepare_content_plan_context. The remaining
 // three tools land in follow-up commits.
 
-import type { Company, Prompt, RuleGroup, Asset, PostGroup, Avatar, Voice, Tag, Folder } from "@followr-mcp/shared";
+import type { AiPreferences, Company, Prompt, RuleGroup, Asset, PostGroup, Avatar, Voice, Tag, Folder } from "@followr-mcp/shared";
 import { FollowrClient } from "@followr-mcp/shared";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -43,6 +43,8 @@ import {
   VIDEO_MODELS,
   compatibilityFor,
 } from "../lib/content-plan-catalog.js";
+import { resolveDriver } from "../lib/driver-resolver.js";
+import { getAiPreferences } from "../lib/preferences.js";
 import {
   type AssetLayout,
   type AssetsStrategy,
@@ -1201,6 +1203,12 @@ DO NOT CALL this without explicit user confirmation in chat. The MCP rejects cal
 
       updatePlanInState(plan_id, { status: "executing", execution_started_at_ms: Date.now() });
 
+      // Load company AI preferences ONCE for the whole execution. We propagate
+      // them down to executePlanItem and resolveSubPostAssets so each call
+      // can pick the right driver per modality without repeating the
+      // getCompany roundtrip per sub_post.
+      const prefs = await getAiPreferences(client, plan.company_id);
+
       // Compute publish_at UTC per item if auto_publish_schedule is set or
       // each item carries its own. We pass publish_at_local as YYYY-MM-DDTHH:mm
       // and let the API treat it as local in the requested timezone. Followr
@@ -1208,7 +1216,7 @@ DO NOT CALL this without explicit user confirmation in chat. The MCP rejects cal
       const itemResults: Array<Record<string, unknown>> = [];
       const executions = plan.plan_items.map(async (item) => {
         try {
-          const result = await executePlanItem(client, plan.company_id, item);
+          const result = await executePlanItem(client, plan.company_id, item, prefs);
           itemResults.push(result);
           return result;
         } catch (e) {
@@ -1306,6 +1314,7 @@ async function resolveSubPostAssets(
   client: FollowrClient,
   companyId: number,
   sp: SubPost,
+  prefs: AiPreferences,
 ): Promise<{ asset_ids: number[]; credits_consumed: number; ai_results_consumed: number[] }> {
   const credits = { value: 0 };
   const aiResults: number[] = [];
@@ -1324,10 +1333,19 @@ async function resolveSubPostAssets(
       return;
     }
     if (src.type === "ai_generate") {
+      // Resolve driver via the shared helper. Without this, the backend
+      // rejects nano_banana_2 and imagen4_* with "selected model is
+      // invalid". See packages/mcp-core/src/lib/driver-resolver.ts.
+      const aiDriver = resolveDriver({
+        prefs,
+        modality: "image",
+        model: src.model,
+      });
       const aiResult = await client.generateImage({
         q: src.prompt,
         company_id: companyId,
         ...(src.model ? { model: src.model } : {}),
+        ...(aiDriver ? { driver: aiDriver } : {}),
         ...(src.reference_image_url ? { image_url: src.reference_image_url } : {}),
       });
       const final = await client.waitForAiResult(aiResult.id, { timeoutMs: 5 * 60 * 1000 });
@@ -1367,12 +1385,21 @@ async function resolveSubPostAssets(
       collected.push(a.id);
     } else if (vs.type === "ai_generate") {
       const aspectRatio = sp.product_type === "reel" || sp.product_type === "short" ? "9:16" : "16:9";
+      // Resolve driver via the shared helper. Without this, the backend
+      // rejects veo_* / wan_* / seedance_* / hailuo_* with "selected model
+      // is invalid". See packages/mcp-core/src/lib/driver-resolver.ts.
+      const aiDriver = resolveDriver({
+        prefs,
+        modality: "video",
+        model: vs.model,
+      });
       const aiResult = await client.generateAiVideoClip({
         type: "video",
         q: vs.prompt,
         aspect_ratio: aspectRatio,
         model: vs.model,
         company_id: companyId,
+        ...(aiDriver ? { driver: aiDriver } : {}),
         ...(vs.reference_image_url ? { image_url: vs.reference_image_url } : {}),
       });
       // Video clips can take 10-15 min. Give a generous timeout.
@@ -1406,6 +1433,7 @@ async function executePlanItem(
   client: FollowrClient,
   companyId: number,
   item: PlanItem,
+  prefs: AiPreferences,
 ): Promise<Record<string, unknown>> {
   // 1. Resolve assets per sub_post IN PARALLEL.
   let assetResolutions: Array<{
@@ -1419,7 +1447,7 @@ async function executePlanItem(
     assetResolutions = await Promise.all(
       item.sub_posts.map(async (sp, idx) => {
         try {
-          const r = await resolveSubPostAssets(client, companyId, sp);
+          const r = await resolveSubPostAssets(client, companyId, sp, prefs);
           return { sub_post_index: idx, ...r };
         } catch (e) {
           return {

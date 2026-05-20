@@ -5,6 +5,7 @@ import { z } from "zod";
 
 import type { RegisterOptions } from "../index.js";
 import { MUTATION_OPEN_WORLD, READ_ONLY } from "../lib/annotations.js";
+import { resolveDriver } from "../lib/driver-resolver.js";
 import { getAiPreferences } from "../lib/preferences.js";
 import { toolError, toolErrorFromException } from "../lib/tool-error.js";
 
@@ -107,17 +108,17 @@ ASYNC: wait=true (default) blocks until completion (30-120s typical). wait=false
       try {
         const prefs = await getAiPreferences(client, company_id);
         // Resolution order: explicit tool param > company ai_preferences >
-        // hardcoded fallback. The hardcoded fallback exists because the
+        // catalog-driven inference (resolveDriver) > backend infer.
+        // The fallback model "nano_banana_2" exists because the
         // /api/aiResults/image endpoint does not apply company preferences
-        // when driver/model are omitted from the body (verified empirically).
-        //
-        // Important: Followr's ai_preferences only stores `_model` (no `_driver`),
-        // so when the company has a model configured we let the backend infer the
-        // driver instead of forcing `fal`, which would be wrong for non-fal
-        // models like imagen4_preview_fast (Google) or gpt_image_2 (OpenAI).
+        // when model is omitted from the body (verified empirically).
         const resolvedModel = model ?? prefs.image_model ?? "nano_banana_2";
-        const resolvedDriver =
-          driver ?? prefs.image_driver ?? (resolvedModel === "nano_banana_2" ? "fal" : undefined);
+        const resolvedDriver = resolveDriver({
+          explicitDriver: driver,
+          prefs,
+          modality: "image",
+          model: resolvedModel,
+        });
         const resolvedAspectRatio = aspect_ratio ?? prefs.image_aspect_ratio;
         const initial = await client.generateImage({
           q: prompt,
@@ -960,13 +961,20 @@ IMAGE-TO-VIDEO: image_url is OPTIONAL. Pass it to seed the clip with a reference
     },
     async ({ company_id, prompt, model, aspect_ratio, image_url, driver, queue, wait, timeout_seconds }) => {
       try {
+        const prefs = await getAiPreferences(client, company_id);
+        const resolvedDriver = resolveDriver({
+          explicitDriver: driver,
+          prefs,
+          modality: "video",
+          model,
+        });
         const initial = await client.generateAiVideoClip({
           type: "video",
           q: prompt,
           company_id,
           aspect_ratio: aspect_ratio ?? "9:16",
           model,
-          ...(driver ? { driver } : {}),
+          ...(resolvedDriver ? { driver: resolvedDriver } : {}),
           ...(image_url ? { image_url } : {}),
           ...(queue !== undefined ? { queue } : { queue: true }),
           chargeable: 1,
