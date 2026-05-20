@@ -1,6 +1,6 @@
 {
   "name": "@followr-mcp/mcp-core",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "description": "Followr MCP server core. Registers tools, resources, and prompts against the MCP SDK.",
   "type": "module",

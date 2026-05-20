@@ -194,12 +194,15 @@ export interface ElevenLabsVoice {
   locale?: string;
   gender?: string;
   age?: string;
+  accent?: string;
   category?: string;
   description?: string;
+  descriptive?: string;
   use_case?: string;
   preview_url?: string;
   image_url?: string;
   featured?: boolean;
+  notice_period?: number;
   [k: string]: unknown;
 }
 

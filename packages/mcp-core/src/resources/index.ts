@@ -265,7 +265,8 @@ export function registerFollowrResources(
       mimeType: "application/json",
     },
     async (uri) => {
-      const voices = await client.listElevenlabsVoices();
+      const result = await client.listElevenlabsVoices();
+      const voices = result.data ?? [];
       const slim = voices.map((v) => ({
         voice_id: v.voice_id,
         name: v.name,

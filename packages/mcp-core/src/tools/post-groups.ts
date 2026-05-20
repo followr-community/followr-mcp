@@ -451,7 +451,9 @@ USE FOR: planning a cross-network campaign ("Instagram feed + Instagram reel + T
 
 DO NOT USE: when only one network is involved (use create_post_group + create_post instead, simpler). When the posts need iterative review between creation steps. When asset uploads need to happen in between (do those first via upload_image_from_url / upload_video_from_url / upload_images_from_urls).
 
-VIDEO WORKFLOW: if any sub-post targets a reel / short, the validator requires assets[].type=video for that sub-post. Generate or upload the video FIRST (generate_avatar_video, generate_ai_video_clip, upload_video_from_url) and pass the resulting asset id in the corresponding sub-post.
+VIDEO WORKFLOW: if any sub-post targets a reel / short, the validator requires assets[].type=video for that sub-post. Generate or upload the video FIRST (generate_avatar_video, generate_avatar_lipsync_clip, generate_ai_video_clip, upload_video_from_url) and pass the resulting asset id in the corresponding sub-post.
+
+TIKTOK CONSTRAINT: tiktok_feed REQUIRES a single video asset. Single images are rejected by the spec (max_images_length=0). If the user wants to publish a still image to TikTok, the agent must first generate a video (the most complete flow is generate_avatar_video with subtitles burned in, or a lifestyle/motion clip via generate_ai_video_clip if no person speaking is needed) or upload an existing one via upload_video_from_url.
 
 SCHEDULING: pass publish_at on the PostGroup-level fields if the group should be scheduled at creation; same semantics as create_post_group (draft=true + publish_at parks the schedule).
 
@@ -534,15 +536,19 @@ RETURNS: { post_group, posts: Post[], validation: { warnings_by_post: SpecWarnin
             suggested_actions: [
               {
                 tool: "generate_avatar_video",
-                rationale: "Use this for any reel/short sub-post that is missing a video asset.",
+                rationale: "Most complete option for brand promos: multi-scene avatar reel with subtitles burned in. Default for reels, shorts, and TikTok video posts.",
+              },
+              {
+                tool: "generate_avatar_lipsync_clip",
+                rationale: "Single-scene avatar talking head, faster and cheaper than generate_avatar_video. No subtitles.",
               },
               {
                 tool: "generate_ai_video_clip",
-                rationale: "Or generate a single 8-second AI video clip for a reel/short.",
+                rationale: "8-second AI clip (Veo / Wan / SeeDance) WITHOUT a talking avatar. Best for cinematic / lifestyle / product motion shots.",
               },
               {
                 tool: "upload_video_from_url",
-                rationale: "If the user has footage, upload it first and pass the asset id.",
+                rationale: "If the user already has filmed footage, upload it first and pass the asset id.",
               },
             ],
             details: {

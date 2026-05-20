@@ -212,7 +212,7 @@ ASYNC: wait=true (default) blocks. wait=false returns pending id.`,
 
 USE THIS WHEN: the user wants a quick single-scene clip without subtitles or multi-scene concatenation. For the standard "AI Video Avatars" multi-scene flow with burned-in subtitles, use generate_avatar_video instead.
 
-CRITICAL: heavy operation. Cost is dynamic in Followr; roughly 200-500 credits per clip depending on script length and aspect ratio. Call get_credits_balance before to confirm the user has budget.
+CRITICAL: heavy operation. Cost is per SECOND of generated video (model veed_fabric_1_0 = 25 cr/seg). A typical lipsync clip is ~10-15 seconds = roughly 250-400 credits. Call get_credits_balance before to confirm the user has budget.
 
 PRECONDITION: company_id required. avatar_id required, and the avatar MUST have a voice and an image attached (list_avatars to verify, or create_avatar_full_flow if needed).
 
@@ -373,7 +373,7 @@ WHEN TO USE THE OTHER VIDEO TOOLS INSTEAD:
 
 OUTFIT PRESERVATION: when the avatar portrait shows a specific outfit that must appear in EVERY scene (fashion brand reels, product showcase with the avatar wearing the brand, lifestyle reels for a recurring look), pass outfit_description with a precise text of the clothing (e.g. "gray bomber jacket with black collar, white tee, dark jeans"). Without this, the AI may interpret clothing differently per scene based on script context (e.g. a "beach" script may put the avatar in swimwear even if the portrait shows winter wear).
 
-CRITICAL: heavy operation. Cost is dynamic in Followr (depends on script length, aspect ratio, scene count, and whether generate_backgrounds is enabled); the UI typically shows 600-1100 credits for a 3-4 scene 9:16 video at Regular speed without backgrounds, more with backgrounds enabled. Always confirm with the user before proceeding and surface get_credits_balance first.
+CRITICAL: heavy operation. Cost is per SECOND of total video duration (each lipsync scene uses veed_fabric_1_0 at 25 cr/seg; backgrounds add more). For a 3-scene 9:16 video without backgrounds at ~30s total = roughly 750 credits; with backgrounds enabled add 30-100 cr per scene. A 60s multi-scene piece can reach 2000+ cr. Always confirm with the user before proceeding and surface get_credits_balance first.
 
 PRECONDITION: company_id + avatar_id required. The avatar MUST have a voice and an image attached. Verify with get_avatar before calling.
 
@@ -925,14 +925,16 @@ WHAT THIS IS NOT:
 - NOT a talking head with lipsync. For that use generate_avatar_lipsync_clip or generate_avatar_video.
 - NOT a way to stitch multiple clips. There is no built-in concat for AI video clips today; do not promise the user a longer assembled video. If the user needs >8s, propose generate_avatar_video.
 
-RECOMMENDED MODELS (all produce ~8-second clips, the three Veo defaults for general use):
-- veo_3_1_fast (50 cr): cheapest of the recommended set. Use only for genuinely disposable content, internal tests, or quick idea checks.
-- veo_3_fast (400 cr): safer default for real social-media content. Good quality / cost balance.
-- veo_3_1 (600 cr): hero piece, launch promo, key shot. Better subject consistency and motion fidelity than veo_3_fast.
+COST MODEL (verified 2026-05-20): Followr charges PER SECOND of generated video, not per clip. Since Veo models produce ~8-second clips, multiply the per-second rate by 8 to estimate the cost per clip. Do NOT quote the per-second number to the user as if it were the total cost.
 
-ALSO AVAILABLE (the agent should NOT auto-pick these — surface them only if the user explicitly asks for a non-Veo model or a different cost point): veo_3 (1000 cr, never use without explicit user authorization), wan_2 (150), seedance_1_1_light (20), seedance_1_1_pro (40), seedance_2_0_fast (100), seedance_2_0 (175), hailuo_0_2_standard (20), hailuo_0_2_premium (30). Empirical quality / behavior of non-Veo models is not yet documented per-model.
+RECOMMENDED MODELS (all produce ~8-second clips):
+- veo_3_1_fast (50 cr/seg = ~400 cr per 8s clip): cheapest of the recommended set. Use only for genuinely disposable content, internal tests, or quick idea checks.
+- veo_3_fast (400 cr/seg = ~3200 cr per 8s clip): safer default for real social-media content. Good quality / cost balance.
+- veo_3_1 (600 cr/seg = ~4800 cr per 8s clip): hero piece, launch promo, key shot. Better subject consistency and motion fidelity than veo_3_fast.
 
-CHOOSING A MODEL: do NOT auto-pick the cheapest model to "validate" the prompt. If the result fails, you cannot tell whether the prompt or the model is at fault, and regenerating with a higher-quality model means paying twice. Instead, ASK the user about the quality bar before picking. If the user has no preference, default to veo_3_fast and surface the cost via get_credits_balance before calling. Never call veo_3 (1000 cr) without explicit user authorization of the cost.
+ALSO AVAILABLE (the agent should NOT auto-pick these — surface them only if the user explicitly asks for a non-Veo model or a different cost point): veo_3 (1000 cr/seg = ~8000 cr per 8s clip, never use without explicit user authorization), wan_2 (150 cr/seg = ~1200), seedance_1_1_light (20 cr/seg = ~160), seedance_1_1_pro (40 cr/seg = ~320), seedance_2_0_fast (100 cr/seg = ~800), seedance_2_0 (175 cr/seg = ~1400), hailuo_0_2_standard (20 cr/seg = ~160), hailuo_0_2_premium (30 cr/seg = ~240). Empirical quality / behavior of non-Veo models is not yet documented per-model.
+
+CHOOSING A MODEL: do NOT auto-pick the cheapest model to "validate" the prompt. If the result fails, you cannot tell whether the prompt or the model is at fault, and regenerating with a higher-quality model means paying twice. Instead, ASK the user about the quality bar before picking. If the user has no preference, default to veo_3_fast and surface the cost via get_credits_balance before calling. Never call veo_3 (~8000 cr per 8s clip) without explicit user authorization of the cost.
 
 PROMPT DESIGN FOR ~8 SECONDS: each recommended model produces ONE clip of roughly 8 seconds. Write the prompt as a SINGLE visual scene with one action, NOT a narrative sequence.
 - Good: "Close-up of a person typing on a laptop in a warm café, steam rising from coffee, static camera, golden-hour light, shallow depth of field, cinematic 35mm look."
@@ -947,7 +949,7 @@ IMAGE-TO-VIDEO: image_url is OPTIONAL. Pass it to seed the clip with a reference
       inputSchema: {
         company_id: z.number().int().positive(),
         prompt: z.string().min(1).describe("Visual prompt describing the single scene to generate. Keep it focused on ONE moment / action / shot — these models render ~8 seconds of video. See PROMPT DESIGN FOR ~8 SECONDS in the tool description."),
-        model: z.enum(AI_VIDEO_MODEL_ENUM).describe("AI video model. Recommended: veo_3_1_fast (50 cr), veo_3_fast (400 cr), veo_3_1 (600 cr). Confirm cost with the user before calling, especially for veo_3 (1000 cr)."),
+        model: z.enum(AI_VIDEO_MODEL_ENUM).describe("AI video model. Cost is per SECOND of video; Veo clips are ~8s. Recommended: veo_3_1_fast (~400 cr per 8s clip), veo_3_fast (~3200), veo_3_1 (~4800). Confirm cost with the user before calling, especially for veo_3 (~8000)."),
         aspect_ratio: z.enum(["9:16", "16:9"]).optional().describe("Default 9:16 (vertical, for Reels/Shorts/TikTok). Use 16:9 for landscape (LinkedIn, YouTube long-form thumbnails)."),
         image_url: z.string().url().optional().describe("Optional reference frame for image-to-video mode. Per-model support varies; the call may fail on models that do not accept it."),
         driver: z.string().optional().describe("Optional driver override. Most callers should omit; the backend resolves the driver from the model."),

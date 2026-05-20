@@ -47,7 +47,40 @@ WHEN TO WARN PROACTIVELY:
     },
     async () => {
       const balance = await client.getSubscriptionBalance();
-      return { content: [{ type: "text", text: JSON.stringify(balance, null, 2) }] };
+      const bytesSpent =
+        typeof balance.bytes_spent === "string" ? Number(balance.bytes_spent) : Number(balance.bytes_spent ?? 0);
+      const wordsRemaining = balance.words_allowed - balance.words_spent;
+      const imagesRemaining = balance.images_allowed - balance.images_spent;
+      const premiumImagesRemaining = balance.premium_images_allowed - balance.premium_images_spent;
+      const bytesRemainingGb = ((balance.bytes_allowed - bytesSpent) / 1e9).toFixed(2);
+      const bytesAllowedGb = (balance.bytes_allowed / 1e9).toFixed(2);
+      const wrapped = {
+        summary: `Text: ${balance.words_spent}/${balance.words_allowed} words. Image+Video: ${balance.images_spent}/${balance.images_allowed} (video AND image generation share this bucket). Premium images: ${balance.premium_images_spent}/${balance.premium_images_allowed}. Storage: ${(bytesSpent / 1e9).toFixed(2)}GB / ${bytesAllowedGb}GB.`,
+        for_video_or_image_generation: {
+          field: "images_allowed - images_spent",
+          remaining: imagesRemaining,
+          note: "Video and image both consume images_allowed. Do NOT use the 'credits' field for video budget decisions — that field is a generic counter, not a budget.",
+        },
+        for_text_generation: {
+          field: "words_allowed - words_spent",
+          remaining: wordsRemaining,
+        },
+        for_premium_image_models: {
+          field: "premium_images_allowed - premium_images_spent",
+          remaining: premiumImagesRemaining,
+          note:
+            premiumImagesRemaining <= 0
+              ? "premium_images_allowed is 0 or exhausted — premium image models (gpt_image_2, imagen4, etc.) will fail with HTTP 402 on this plan."
+              : null,
+        },
+        for_storage: {
+          remaining_gb: bytesRemainingGb,
+        },
+        _warning_credits_field:
+          "The 'credits' field in raw is a generic counter, NOT a per-modality budget. Use the buckets above (images_allowed for video, words_allowed for text). This is a known Followr API quirk.",
+        raw: balance,
+      };
+      return { content: [{ type: "text", text: JSON.stringify(wrapped, null, 2) }] };
     },
   );
 }

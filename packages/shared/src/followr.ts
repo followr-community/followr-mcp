@@ -404,11 +404,54 @@ export class FollowrClient {
     return result.data;
   }
 
-  async listElevenlabsVoices(options?: { page?: number }): Promise<ElevenLabsVoice[]> {
-    const result = await this.request<ApiCollection<ElevenLabsVoice>>("GET", "/api/voices/elevenlabs", {
-      query: { page: options?.page ?? 1 },
-    });
-    return result.data;
+  /**
+   * GET /api/voices/elevenlabs. Proxy to ElevenLabs shared-voices catalog.
+   *
+   * Server-side filters verified empirically 2026-05-20 (ver
+   * docs/followr-api/voices.md):
+   *   language, locale, accent (needs language ctx), gender, age, category,
+   *   sort, search, featured (use 1/0, NOT true/false; featured=true → 422),
+   *   min_notice_period_days, page (0-indexed), page_size (max 100).
+   *
+   * Server accepts but IGNORES (Followr proxy quirk):
+   *   use_case, descriptive, voice_types, featured_only.
+   *
+   * meta.total is unreliable (engañoso). Use meta.has_more to paginate.
+   */
+  async listElevenlabsVoices(options?: {
+    page?: number;
+    page_size?: number;
+    language?: string;
+    locale?: string;
+    accent?: string;
+    gender?: "male" | "female" | "non-binary";
+    age?: "young" | "middle_aged";
+    category?: "professional" | "high_quality";
+    sort?: "trending" | "latest";
+    search?: string;
+    featured?: 0 | 1;
+    min_notice_period_days?: number;
+  }): Promise<{ data: ElevenLabsVoice[]; meta?: { has_more?: boolean; total?: number; current_page?: number; per_page?: string; from?: number | null; to?: number | null } }> {
+    const query: Query = {
+      page: options?.page ?? 0,
+      page_size: options?.page_size ?? 30,
+    };
+    if (options?.language) query.language = options.language;
+    if (options?.locale) query.locale = options.locale;
+    if (options?.accent) query.accent = options.accent;
+    if (options?.gender) query.gender = options.gender;
+    if (options?.age) query.age = options.age;
+    if (options?.category) query.category = options.category;
+    if (options?.sort) query.sort = options.sort;
+    if (options?.search) query.search = options.search;
+    if (options?.featured !== undefined) query.featured = options.featured;
+    if (options?.min_notice_period_days !== undefined) query.min_notice_period_days = options.min_notice_period_days;
+    const result = await this.request<{ data: ElevenLabsVoice[]; meta?: { has_more?: boolean; total?: number; current_page?: number; per_page?: string; from?: number | null; to?: number | null } }>(
+      "GET",
+      "/api/voices/elevenlabs",
+      { query },
+    );
+    return result;
   }
 
   /**

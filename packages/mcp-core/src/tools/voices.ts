@@ -90,38 +90,110 @@ USE FOR: confirming a freshly created voice has its sample uploaded; retrieving 
     "list_elevenlabs_voices",
     {
       annotations: READ_ONLY_EXTERNAL,
-      title: "Browse the ElevenLabs voice catalog with optional filters",
-      description: `Browse the ElevenLabs voice catalog with rich metadata (language, gender, age, accent, use_case, preview_url). Supports filtering by language, gender, category, and free-text query against name and description.
+      title: "Browse the ElevenLabs voice catalog with rich filters and pagination",
+      description: `Browse the ElevenLabs shared-voices catalog (12,404 voices globally) via Followr's proxy. Rich metadata per voice (language, locale, accent, gender, age, category, descriptive, use_case, preview_url). Auto-paginates server-side and returns a curated shortlist plus the universe of filter values that appeared in the batch.
 
-NO COMPANY NEEDED: this lists voices from the upstream provider, not from a Followr company. The output is used to pick an elevenlabs_voice_id to pass into create_voice_from_elevenlabs.
+NO COMPANY NEEDED. The output is used to pick an elevenlabs_voice_id to pass into create_voice_from_elevenlabs.
 
-PAGINATION: 30 voices per page. Page through if the user wants more variety; do NOT show the user 100+ voices at once; pick a manageable sample (5-10 with preview_urls) and ask them to choose.
+REGIONAL VOICE SEARCH PATTERN:
+- For an Argentine Spanish voice: pass language='es' AND locale='es-AR' (the proxy paginates ~505 unique Argentine voices in the catalog). Some are tagged accent='argentine' (~58) and others accent='latin american' + locale='es-AR' (~447) — both are geographically Argentine.
+- For Mexican: language='es' + locale='es-MX'.
+- For British: language='en' + locale='en-GB' (or accent='british').
+- For American: language='en' + locale='en-US' (or accent='american').
 
-PRESENTING: include the preview_url when offering options so the user can actually listen.`,
+SERVER-SIDE FILTERS (forwarded by Followr proxy, verified empirically 2026-05-20):
+- language (ISO 639-1: en, es, pt, fr, it, de, ja, ko, zh, hi, ar, tr, nl, pl, ru, da)
+- locale (es-AR, es-MX, es-ES, es-CO, en-US, en-GB, en-AU, en-IN, pt-BR, pt-PT, fr-CA, fr-FR, it-IT, de-DE, ja-JP, ko-KR, tr-TR, ru-RU, pl-PL, nl-BE, ar-EG, da-DK, hi-IN, cmn-CN)
+- accent: argentine, latin american, mexican, peninsular, colombian, chilean, peruvian, venezuelan, andalusian (for es); american, british, australian, indian, scottish (for en). Best when combined with language.
+- gender (male / female / non-binary)
+- age (young / middle_aged)
+- category (professional / high_quality)
+- sort (trending / latest)
+- search (loose substring match; matches name + description + accent + locale)
+- featured_only (boolean, mapped to featured=1 server-side)
+- min_notice_period_days (filter floor on the voice's notice period)
+
+CLIENT-SIDE FILTERS (Followr proxy silently ignores these — applied locally after fetching):
+- use_case (advertisement / characters_animation / conversational / entertainment_tv / informative_educational / narrative_story / social_media)
+- descriptive (calm / confident / deep / warm / upbeat / professional / gentle / casual / mature / etc.)
+
+PAGINATION: auto-paginates server-side using has_more (the meta.total field is misleading — do NOT trust it). Default max_pages=3 fetches up to ~300 voices per call. Increase max_pages for exhaustive searches.
+
+PRESENTING TO USER: never dump 100+ voices to the user. Pick a shortlist of 5-10 best matches and include their preview_url so the user can actually listen before picking. Reference voices by NAME, never by voice_id.
+
+KNOWN QUIRK: when accent + page>0 are combined, the next page falls back to mixed accents (proxy bug). Mitigation: use page_size=100 + filter accent strictly client-side at the dedupe step.`,
       inputSchema: {
-        page: z.number().int().positive().optional().describe("API page number. 30 voices per page. Default 1."),
-        language: z.string().optional().describe("Filter by ISO 639-1 code (en, es, pt, fr, etc.)."),
-        gender: z.enum(["male", "female", "non-binary"]).optional(),
-        category: z.string().optional().describe("e.g. professional, casual."),
-        query: z.string().optional().describe("Substring match against name or description (case-insensitive)."),
-        featured_only: z.boolean().optional().describe("If true, only return voices marked featured."),
+        language: z.string().optional().describe("ISO 639-1 code. Server-side. The primary filter for narrowing by spoken language."),
+        locale: z.string().optional().describe("Locale tag like es-AR (Argentine), en-US, pt-BR. Server-side. The most reliable regional filter via Followr proxy."),
+        accent: z.string().optional().describe("Voice accent like argentine, mexican, british. Server-side; requires language context for coherent results. Many Argentine voices use accent='latin american' + locale='es-AR' — for full Argentine coverage prefer locale=es-AR over accent=argentine alone."),
+        gender: z.enum(["male", "female", "non-binary"]).optional().describe("Server-side."),
+        age: z.enum(["young", "middle_aged"]).optional().describe("Server-side."),
+        category: z.enum(["professional", "high_quality"]).optional().describe("Server-side."),
+        sort: z.enum(["trending", "latest"]).optional().describe("Server-side. Default trending."),
+        search: z.string().optional().describe("Loose substring match against name/description/accent/locale. Server-side. E.g. 'argentina', 'buenos aires', 'rioplatense'."),
+        featured_only: z.boolean().optional().describe("If true, only featured voices (mapped to featured=1 server-side). NOTE: the proxy returns 422 on featured=true; this tool sends featured=1 automatically."),
+        min_notice_period_days: z.number().int().min(0).optional().describe("Filter floor. Only voices with notice_period >= N days."),
+        use_case: z.enum(["advertisement", "characters_animation", "conversational", "entertainment_tv", "informative_educational", "narrative_story", "social_media"]).optional().describe("CLIENT-SIDE (proxy ignores). Applied locally after fetching."),
+        descriptive: z.string().optional().describe("CLIENT-SIDE (proxy ignores). Applied locally after fetching. Values like calm, warm, deep, confident, etc."),
+        page_size: z.number().int().min(1).max(100).optional().describe("Server page size, max 100. Default 100. Values >100 return 422."),
+        max_pages: z.number().int().min(1).max(10).optional().describe("How many pages to paginate (each up to page_size voices). Default 3 (~300 voices). Higher for exhaustive searches like 'all Argentine voices' (~5 pages cover 500+ es-AR voices)."),
       },
     },
-    async ({ page, language, gender, category, query, featured_only }) => {
-      const all = await client.listElevenlabsVoices({ ...(page ? { page } : {}) });
-      const q = query?.toLowerCase();
-      const filtered = all.filter((v: ElevenLabsVoice) => {
-        if (language && v.language !== language) return false;
-        if (gender && v.gender !== gender) return false;
-        if (category && v.category !== category) return false;
-        if (featured_only && !v.featured) return false;
-        if (q) {
-          const hay = `${v.name ?? ""} ${v.description ?? ""}`.toLowerCase();
-          if (!hay.includes(q)) return false;
+    async ({ language, locale, accent, gender, age, category, sort, search, featured_only, min_notice_period_days, use_case, descriptive, page_size, max_pages }) => {
+      const pageSize = page_size ?? 100;
+      const maxPages = max_pages ?? 3;
+      const seenIds = new Set<string>();
+      const allVoices: ElevenLabsVoice[] = [];
+      let pagesConsumed = 0;
+      let hadMore = false;
+      for (let page = 0; page < maxPages; page++) {
+        const result = await client.listElevenlabsVoices({
+          page,
+          page_size: pageSize,
+          ...(language ? { language } : {}),
+          ...(locale ? { locale } : {}),
+          ...(accent ? { accent } : {}),
+          ...(gender ? { gender } : {}),
+          ...(age ? { age } : {}),
+          ...(category ? { category } : {}),
+          ...(sort ? { sort } : {}),
+          ...(search ? { search } : {}),
+          ...(featured_only ? { featured: 1 as const } : {}),
+          ...(min_notice_period_days !== undefined ? { min_notice_period_days } : {}),
+        });
+        const voices = result.data ?? [];
+        if (voices.length === 0) {
+          hadMore = false;
+          break;
         }
-        return true;
-      });
-      const slim = filtered.map((v: ElevenLabsVoice) => ({
+        for (const v of voices) {
+          if (!seenIds.has(v.voice_id)) {
+            seenIds.add(v.voice_id);
+            allVoices.push(v);
+          }
+        }
+        pagesConsumed = page + 1;
+        hadMore = result.meta?.has_more === true;
+        if (!hadMore) break;
+      }
+      // Client-side filters (proxy ignores these).
+      let filtered = allVoices;
+      if (use_case) filtered = filtered.filter((v) => v.use_case === use_case);
+      if (descriptive) filtered = filtered.filter((v) => v.descriptive === descriptive);
+      // Compute the universe of filter values that appeared in the batch.
+      const uniq = (extract: (v: ElevenLabsVoice) => string | null | undefined): string[] =>
+        [...new Set(filtered.map(extract).filter((x): x is string => typeof x === "string" && x.length > 0))].sort();
+      const filterOptions = {
+        accents: uniq((v) => v.accent),
+        locales: uniq((v) => v.locale),
+        languages: uniq((v) => v.language),
+        use_cases: uniq((v) => v.use_case),
+        categories: uniq((v) => v.category),
+        descriptives: uniq((v) => v.descriptive),
+        ages: uniq((v) => v.age),
+        genders: uniq((v) => v.gender),
+      };
+      const slim = filtered.map((v) => ({
         voice_id: v.voice_id,
         name: v.name,
         language: v.language,
@@ -131,11 +203,34 @@ PRESENTING: include the preview_url when offering options so the user can actual
         accent: v.accent,
         category: v.category,
         description: v.description,
+        descriptive: v.descriptive,
         use_case: v.use_case,
         preview_url: v.preview_url,
         featured: v.featured,
       }));
-      return { content: [{ type: "text", text: JSON.stringify(slim, null, 2) }] };
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify(
+              {
+                voices: slim,
+                _filter_options_available_in_batch: filterOptions,
+                _meta: {
+                  fetched_total: allVoices.length,
+                  after_client_side_filters: filtered.length,
+                  pages_consumed: pagesConsumed,
+                  had_more_at_end: hadMore,
+                  note:
+                    "_meta.total from the upstream is unreliable; we paginate by has_more. To widen the search, increase max_pages (up to 10). To narrow, combine language + locale + accent.",
+                },
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
     },
   );
 
