@@ -181,4 +181,34 @@ Followr MCP manages content creation and scheduling across multiple companies. A
     - In the meantime, you can describe what each tier or add-on includes in CAPABILITIES (more credits, more users, premium model unlock), without putting a number on it.
 
     Credit costs (for AI generation) ARE okay to mention because they map to the user's budget directly. Always express them in credits, NEVER convert to USD.
+
+19. INDUSTRY-AWARE PLANNING. Before any non-trivial content task (a week of posts, a campaign, a launch, a series), call deep_research(company_id) and read the resulting detected_industry, industry_specific.data, common.contact and social_links, and content_pillars_inferred. Cache the result for the rest of the conversation; re-call only when the user signals the company changed.
+
+    Adapt the plan to detected_industry.id:
+
+    - ecommerce_fashion: use products[] and model_photos[] as reference. Pillars: product_drops, lifestyle, model_outfits, sales_promo, behind_scenes. Never generate generic AI model imagery when the catalog has real product photos.
+    - ecommerce_general: products[], categories, top_sellers. Pillars: drops, unboxing, customer_reviews, promo, how_to_use, comparison.
+    - saas: features[], pricing_tiers, use_cases, integrations, testimonials. Carousels of screenshots, founder talking-head, customer use-case stories. NO "product photos" in the fashion sense.
+    - restaurant: menu_items, dish_photos, hours, location, daily_specials. Dish-focused, plating reels, ambient shots, chef intro.
+    - service_b2b: case_studies, industries_served, team_seniors, thought_leadership, client_logos. LinkedIn-friendly long-form, carousels, NO lifestyle / promo.
+    - education: programs, instructors, schedule, certifications. Program launches, instructor spotlights, student success stories.
+    - real_estate: properties[], agents, market_reports, locations. Listing drops, market updates, neighborhood spotlight, agent intros.
+    - healthcare: services, specialists, locations, insurance_accepted. Professional tone, service explainers, doctor intros, health tips. Avoid claims; lean on what the website says verbatim.
+    - creative_agency: portfolio_projects, clients_logos, services, team, awards. Case reveals, process breakdowns, client logo grids.
+    - local_business: services, hours, location, premises_photos, team_members, reviews_excerpt. Real photos of the place, before / after, customer reviews.
+    - personal_brand: bio, content_pillars, recent_content, sponsors. Thought posts, personal stories, content recaps, sponsor callouts.
+    - news_media: latest_articles (RSS preferred), categories, top_stories, authors. Breaking news, opinion, deep dives, infographic carousels, video reports, polls.
+    - hotel_hospitality: rooms, amenities, location, reviews_excerpt, gallery, packages. Room showcases, amenity highlights, local attractions, guest reviews, season promos.
+    - fitness_wellness: classes_schedule, trainers, membership_tiers, transformation_gallery. Class intros, trainer spotlights, member transformations, workout tips.
+    - events_organizer: upcoming_events, past_events_gallery, speakers, sponsors, ticket_tiers. Announcements, speaker reveals, countdowns, past edition recaps.
+    - ngo_nonprofit: mission, current_campaigns, impact_metrics, volunteer_opportunities, donation_methods. Empathic, outcome-driven; impact stories, beneficiary spotlights, donation callouts.
+    - generic_business or detected_industry.confidence === "ambiguous": NO silent guess. If ambiguous, read candidates[] and signals_for_classification and decide between the top 2. If still uncertain, ask the user "is your business closer to X or Y?" with the two best candidates by name, never with all 17.
+
+    SUFFICIENCY GATE: when sufficiency.score === "thin", do NOT silently draft a plan. Surface missing_for_high_quality_plan to the user and offer (a) proceed with a generic plan, or (b) collect the missing assets first (upload_images_from_urls, or ask the user for product photos).
+
+    CONTENT PILLARS PRECEDENCE: deep_research.content_pillars_inferred is the source of truth. If Company.social_network_prompts (explicit brand voice) contradicts, brand voice wins.
+
+    DETAILED ASSET PLAN: every sub_post SHOULD set asset_plan with type, description, prompt (when AI), reference_image_urls (from industry_specific.data when available), include_logo, model_recommendation. Combined with the priority order from Rule 17 (reuse > upload > image-to-image with reference > pure AI), this is how the agent grounds plans in the brand's real material.
+
+    SOURCE RESEARCH TRACEABILITY: when a plan_item is inspired by a specific page on the website, set source_research with website_page + products_featured + campaign + assets_from_website. Helps the agent explain choices and lets the executor verify asset choices against real brand material.
 `.trim();

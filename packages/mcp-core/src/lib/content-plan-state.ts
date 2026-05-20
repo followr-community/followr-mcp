@@ -69,6 +69,48 @@ export interface AssetsStrategy {
     | AssetSourceAvatarVideo;
 }
 
+/**
+ * Detailed asset plan for a sub_post. Optional and additive over the
+ * existing assets_strategy (back-compat: plans that pre-date this field
+ * are still valid). When both are present the asset_plan is the
+ * primary source of truth and the agent / executor should reconcile.
+ *
+ * type values:
+ *   - ai_image:           pure or reference-grounded AI image
+ *   - ai_video_clip:      text-to-video clip (or image-to-video with
+ *                         reference_image_urls[0] as seed)
+ *   - avatar_video:       generated avatar reel (audio + lipsync + concat)
+ *   - reuse_asset:        existing asset from the library (reference_asset_ids)
+ *   - upload_from_website:download from source_website_product_url and upload
+ *   - composite:          multi-reference AI generation (logo + product photo
+ *                         + lifestyle pose, etc.)
+ */
+export interface AssetPlan {
+  type:
+    | "ai_image"
+    | "ai_video_clip"
+    | "avatar_video"
+    | "reuse_asset"
+    | "upload_from_website"
+    | "composite";
+  /** Visual specification of what the resulting asset should show. */
+  description: string;
+  /** AI generation prompt when applicable. */
+  prompt?: string;
+  /** Reference image URLs (from website, recent assets, or external). */
+  reference_image_urls?: string[];
+  /** When true, the brand logo should be present in the final composition. */
+  include_logo?: boolean;
+  /** Followr asset ids to reuse (for reuse_asset / composite). */
+  reference_asset_ids?: number[];
+  /** URL of the product detail page on the company website, for traceability. */
+  source_website_product_url?: string;
+  /** Recommended model id (e.g. "nano_banana_2", "veo_3_1_fast"). */
+  model_recommendation?: string;
+  /** How confident the agent is in this plan; surfaces during validation as a soft warning when low. */
+  confidence_level?: "high" | "medium" | "low";
+}
+
 export interface SubPost {
   social_network: SocialNetwork;
   product_type: ProductType;
@@ -76,6 +118,38 @@ export interface SubPost {
   assets_strategy: AssetsStrategy;
   caption_concept: string;
   tags?: string[];
+
+  /**
+   * Final publication-ready copy for this sub_post. Optional for
+   * back-compat with v0.4.2 plans; new plans SHOULD set this so the
+   * user sees the exact text that will be published, not a concept
+   * placeholder.
+   */
+  copy_draft?: string;
+
+  /**
+   * Detailed asset plan: type, description, references, logo flag,
+   * recommended model. Optional for back-compat. Adds traceability and
+   * supports the asset-strategy priority order (reuse > upload >
+   * reference-grounded AI > pure AI; see instructions Rule 17).
+   */
+  asset_plan?: AssetPlan;
+}
+
+/**
+ * Source-of-truth pointer back to the deep research that informed this
+ * plan item. Optional; populated when the plan was built on top of a
+ * deep_research call.
+ */
+export interface SourceResearch {
+  /** URL of the page on the company website that inspired this concept. */
+  website_page?: string;
+  /** Concrete product / SKU names featured by this plan item. */
+  products_featured?: string[];
+  /** Active campaign / sale / launch this item ties into. */
+  campaign?: string;
+  /** True when the assets for this item come from the company's real catalog (vs pure AI). */
+  assets_from_website: boolean;
 }
 
 export interface PlanItem {
@@ -87,6 +161,13 @@ export interface PlanItem {
   rationale: string;
   paired_with?: string[];
   sub_posts: SubPost[];
+  /**
+   * Optional reference back to the deep_research output that drove this
+   * plan item. Helps the agent explain "we chose this because the
+   * website showed X" and lets the executor trace asset choices back
+   * to real brand material.
+   */
+  source_research?: SourceResearch;
 }
 
 export interface ContentPlan {
