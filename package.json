@@ -10,7 +10,7 @@
     "packages/worker"
   ],
   "scripts": {
-    "build": "tsc --build packages/shared packages/mcp-core packages/stdio && node scripts/copy-assets.mjs",
+    "build": "tsc --build packages/shared packages/mcp-core && npm run build --workspace=@followr/mcp && node scripts/copy-assets.mjs",
     "build:worker": "cd packages/worker && npx wrangler deploy --dry-run --outdir dist",
     "typecheck": "node scripts/typecheck.mjs",
     "clean": "rm -rf packages/*/dist packages/*/tsconfig.tsbuildinfo"
