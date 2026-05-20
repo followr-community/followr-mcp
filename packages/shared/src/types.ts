@@ -362,6 +362,67 @@ export interface SubscriptionBalance {
   white_label_enabled: boolean;
 }
 
+// Subscription resource (GET /api/subscriptions, returns SINGLE subscription
+// for the active token, not a list). Wraps Stripe subscription state plus an
+// items[] array with price stripe_ids. Cross-reference items[].stripe_id
+// against Product.prices[].stripe_id (from listProducts) to identify the
+// resolved plan + active add-ons.
+export interface SubscriptionItem {
+  id: number;
+  stripe_id: string;
+  quantity: number;
+  created_at: Iso8601;
+  updated_at: Iso8601;
+}
+
+export interface Subscription {
+  id: number;
+  name: string;
+  stripe_id: string;
+  stripe_status: string;
+  trial_ends_at: Iso8601 | null;
+  ends_at: Iso8601 | null;
+  created_at: Iso8601;
+  updated_at: Iso8601;
+  items: SubscriptionItem[];
+}
+
+// Product resource (GET /api/products): catalog of plans and add-ons. Each
+// product carries its caps (users_amount, words_amount, etc.) and a feature
+// flag set, plus an array of prices (with stripe_ids that match items in
+// the active subscription).
+export interface Price {
+  id: number;
+  stripe_id: string;
+  recurring: string;
+  quantity: number;
+  created_at: Iso8601;
+  updated_at: Iso8601;
+}
+
+export interface Product {
+  id: number;
+  stripe_id: string;
+  type: string; // "plan" | "add-on" | "product"
+  name: string;
+  label: string;
+  description: string | null;
+  users_amount: number;
+  companies_amount: number;
+  words_amount: number;
+  images_amount: number;
+  premium_images_amount: number;
+  bytes_amount: number;
+  getlead_enabled: boolean;
+  white_label_enabled: boolean;
+  api_keys_enabled: boolean;
+  plus_chat_enabled: boolean;
+  created_at: Iso8601;
+  updated_at: Iso8601;
+  deleted_at: Iso8601 | null;
+  prices?: Price[];
+}
+
 export interface ApiCollection<T> {
   data: T[];
   meta?: {

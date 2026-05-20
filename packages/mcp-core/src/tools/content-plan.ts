@@ -252,8 +252,8 @@ interface AiBudget {
 interface AllBudgets {
   ai_text_budget: AiBudget;
   ai_image_and_video_budget: AiBudget;
-  ai_premium_image_models_budget: AiBudget;
   storage_budget: AiBudget & { remaining_gb: number; used_gb: number; total_gb: number };
+  followr_plus_enabled: boolean;
 }
 
 async function loadBudgets(client: FollowrClient): Promise<AllBudgets | null> {
@@ -264,7 +264,6 @@ async function loadBudgets(client: FollowrClient): Promise<AllBudgets | null> {
 
     const textRemaining = balance.words_allowed - balance.words_spent;
     const imagesRemaining = balance.images_allowed - balance.images_spent;
-    const premiumRemaining = balance.premium_images_allowed - balance.premium_images_spent;
     const bytesRemaining = balance.bytes_allowed - bytesSpent;
 
     const pct = (used: number, total: number) => (total > 0 ? Number((used / total).toFixed(3)) : 0);
@@ -287,16 +286,6 @@ async function loadBudgets(client: FollowrClient): Promise<AllBudgets | null> {
           noteHigh(pct(balance.images_spent, balance.images_allowed)) ??
           "video and image generation share this bucket; no separate video quota",
       },
-      ai_premium_image_models_budget: {
-        remaining: premiumRemaining,
-        used: balance.premium_images_spent,
-        total: balance.premium_images_allowed,
-        percent_used: pct(balance.premium_images_spent, balance.premium_images_allowed),
-        note:
-          premiumRemaining <= 0
-            ? "exhausted: premium image models (gpt_image_2, imagen4, nano_banana_pro, etc.) will fail with HTTP 402 on this plan"
-            : noteHigh(pct(balance.premium_images_spent, balance.premium_images_allowed)),
-      },
       storage_budget: {
         remaining: bytesRemaining,
         used: bytesSpent,
@@ -307,6 +296,7 @@ async function loadBudgets(client: FollowrClient): Promise<AllBudgets | null> {
         used_gb: Number((bytesSpent / 1e9).toFixed(2)),
         total_gb: Number((balance.bytes_allowed / 1e9).toFixed(2)),
       },
+      followr_plus_enabled: Boolean(balance.plus_chat_enabled),
     };
   } catch {
     return null;
@@ -345,16 +335,24 @@ function annotateVideoModels(imageVideoRemaining: number, prefs?: AiPreferences)
 
 function annotateImageModels(
   imagesRemaining: number,
-  premiumRemaining: number,
+  followrPlusEnabled: boolean,
   prefs?: AiPreferences,
 ) {
   const preferredModelId = prefs?.image_model;
   const annotated = IMAGE_MODELS.map((m) => {
     const isCompanyDefault = preferredModelId === m.model_id;
+    // Premium models require followr_plus_enabled true. Without it the
+    // backend rejects them at runtime regardless of how many credits the
+    // user has in image_and_video. Regular models only need budget.
+    const affordable =
+      m.bucket === "premium"
+        ? followrPlusEnabled && imagesRemaining >= m.cost_per_image
+        : imagesRemaining >= m.cost_per_image;
+    const blocked_by_plan = m.bucket === "premium" && !followrPlusEnabled;
     return {
       ...m,
-      affordable:
-        m.bucket === "premium" ? premiumRemaining >= m.cost_per_image : imagesRemaining >= m.cost_per_image,
+      affordable,
+      blocked_by_plan,
       cost_note: `${m.cost_per_image} credits per image (${m.bucket} bucket).`,
       ...(isCompanyDefault
         ? { recommended: true, recommended_rank: 0, is_company_default: true as const }
@@ -494,12 +492,12 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
       }
 
       const imageVideoRemaining = budgets?.ai_image_and_video_budget.remaining ?? Number.POSITIVE_INFINITY;
-      const premiumRemaining = budgets?.ai_premium_image_models_budget.remaining ?? Number.POSITIVE_INFINITY;
+      const followrPlusEnabled = budgets?.followr_plus_enabled ?? false;
       // Read company AI preferences so we can highlight the user-configured
       // default model in the catalog response (recommended_rank 0).
       const companyPrefs = (companyResolved as Company & { ai_preferences?: AiPreferences }).ai_preferences;
       const videoModels = annotateVideoModels(imageVideoRemaining, companyPrefs);
-      const imageModels = annotateImageModels(imageVideoRemaining, premiumRemaining, companyPrefs);
+      const imageModels = annotateImageModels(imageVideoRemaining, followrPlusEnabled, companyPrefs);
 
       // 6. Persist the context snapshot for later validation by
       // draft_content_plan.

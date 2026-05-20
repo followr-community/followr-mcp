@@ -27,8 +27,10 @@ import type {
   FollowrUser,
   Message,
   PostGroup,
+  Product,
   Prompt,
   RuleGroup,
+  Subscription,
   SubscriptionBalance,
   Tag,
   Voice,
@@ -766,6 +768,68 @@ export class FollowrClient {
       "/api/subscriptions/balance",
     );
     return result.data;
+  }
+
+  /**
+   * GET /api/subscriptions. Despite the plural name, this returns a SINGLE
+   * subscription (the active subscription bound to the current token), not
+   * a list. The items[] array contains the active plan + add-ons as Stripe
+   * price ids; cross-reference against listProducts to identify them.
+   *
+   * Returns null on 404 (e.g. tokens without any subscription attached).
+   */
+  async getSubscription(): Promise<Subscription | null> {
+    try {
+      const result = await this.request<ApiSingle<Subscription>>("GET", "/api/subscriptions");
+      return result.data;
+    } catch (err) {
+      if (err instanceof FollowrApiError && err.status === 404) return null;
+      throw err;
+    }
+  }
+
+  /**
+   * GET /api/products. Catalog of plans and add-ons. Pagination default is
+   * 30 items per page; pass pageSize up to 100 or paginate via page.
+   *
+   * type filter accepts "plan" | "add-on" | "product".
+   */
+  async listProducts(options?: {
+    type?: "plan" | "add-on" | "product";
+    pageSize?: number;
+    page?: number;
+    includePrices?: boolean;
+  }): Promise<Product[]> {
+    const query: Query = {
+      "page[size]": options?.pageSize ?? 30,
+    };
+    if (options?.page) query["page[number]"] = options.page;
+    if (options?.includePrices ?? true) query["include"] = "prices";
+    if (options?.type) query["filter[type]"] = options.type;
+    const result = await this.request<ApiCollection<Product>>("GET", "/api/products", { query });
+    return result.data;
+  }
+
+  /**
+   * Paginated version of listProducts that walks pages until no more results.
+   * Used internally by plan-resolver to build the full catalog map.
+   */
+  async listProductsAll(options?: {
+    type?: "plan" | "add-on" | "product";
+    includePrices?: boolean;
+  }): Promise<Product[]> {
+    const out: Product[] = [];
+    let page = 1;
+    // Hard cap to avoid runaway loops if the API misbehaves. 10 pages of 30
+    // is 300 products, more than enough headroom.
+    while (page <= 10) {
+      const batch = await this.listProducts({ ...options, pageSize: 30, page });
+      if (batch.length === 0) break;
+      out.push(...batch);
+      if (batch.length < 30) break;
+      page += 1;
+    }
+    return out;
   }
 
   // ──────────────────────────────────────────────────────────
