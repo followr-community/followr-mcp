@@ -22,6 +22,7 @@
   "dependencies": {
     "@followr-mcp/shared": "0.4.2",
     "@modelcontextprotocol/sdk": "^1.0.0",
+    "linkedom": "^0.18.0",
     "zod": "^3.23.0"
   }
 }
