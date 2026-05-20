@@ -612,6 +612,30 @@ export class FollowrClient {
     return result.data;
   }
 
+  /**
+   * Send a text reply to a Social Hub conversation. Backend proxies to Meta
+   * Graph API (Facebook + Instagram). Returns the created Message resource
+   * with `external_id` (Meta's message id) populated.
+   *
+   * Meta enforces a 24-hour messaging window: if `last_message_at` of the
+   * conversation is older than 24h, the backend returns HTTP 500
+   * `{"message": "Server Error"}` (a leak of Meta's rejection, not a
+   * legitimate 500). The MCP tool wrapper catches that and surfaces it as
+   * a structured `conversation_out_of_window` error.
+   *
+   * Text-only at the moment: any attachment-related field (`assets_ids`,
+   * `attachment_id`, `attachments[]`) is silently ignored by the backend.
+   * See Gap Z11 in /docs/followr-api/_gaps.md.
+   *
+   * Discovered and documented in social-hub.md sesión 12 (2026-05-20).
+   */
+  async sendMessage(conversationId: number, message: string): Promise<Message> {
+    const result = await this.request<ApiSingle<Message>>("POST", "/api/messages", {
+      body: { conversation_id: conversationId, message },
+    });
+    return result.data;
+  }
+
   async listExternalUsers(companyId: number, options?: { pageSize?: number; type?: string }): Promise<ExternalUser[]> {
     const query: Query = { "filter[company_id]": companyId, "page[size]": options?.pageSize ?? 30 };
     if (options?.type) query["filter[type]"] = options.type;
