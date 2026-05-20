@@ -25,6 +25,7 @@ import { registerAssetTools } from "./tools/assets.js";
 import { registerAvatarTools } from "./tools/avatars.js";
 import { registerCanvaTools } from "./tools/canva.js";
 import { registerCompanyTools } from "./tools/companies.js";
+import { registerContentPlanTools } from "./tools/content-plan.js";
 import { registerContextTools } from "./tools/context.js";
 import { registerFolderTools } from "./tools/folders.js";
 import { registerPostGroupTools } from "./tools/post-groups.js";
@@ -70,6 +71,7 @@ export function registerFollowrTools(
   registerAnalyticsTools(server, client, options);
   registerAssetTools(server, client, options);
   registerCanvaTools(server, client, options);
+  registerContentPlanTools(server, client, options);
   registerFollowrResources(server, client, options);
   registerFollowrPrompts(server, client, options);
   // v0.1 coverage complete. Future batches:
