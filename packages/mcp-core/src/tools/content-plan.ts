@@ -55,8 +55,10 @@ import {
   createPlan,
   getContext,
   getPlan,
+  updatePlan as updatePlanInState,
 } from "../lib/content-plan-state.js";
 import { toolError, toolErrorFromException } from "../lib/tool-error.js";
+import { uploadFromUrl } from "./assets.js";
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -1013,9 +1015,7 @@ AFTER THIS: same flow as draft. Show the updated table, await explicit approval,
       // Persist by mutating the entry in the state map. We can do this safely
       // because createPlan / getPlan operate on the same map and we own the
       // session lifecycle.
-      // Use the lower-level updatePlan helper.
-      const { updatePlan: persist } = await import("../lib/content-plan-state.js");
-      persist(plan_id, updatedPlan);
+      updatePlanInState(plan_id, updatedPlan);
 
       // Re-validate.
       const v = await runValidation({
@@ -1108,6 +1108,470 @@ OUTPUT: same shape as draft_content_plan (plan_id, status, summary_for_user, tot
       };
     },
   );
+
+  // ────────────────────────────────────────────────────────────────────────
+  // execute_content_plan
+  // ────────────────────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "execute_content_plan",
+    {
+      annotations: MUTATION_IDEMPOTENT,
+      title: "Execute a previously drafted content plan against Followr (uploads, AI generations, PostGroup creation, in parallel)",
+      description: `Take a draft content plan (created via draft_content_plan, optionally iterated via update_content_plan), validate that it is still consistent with current state, and execute it against Followr: upload assets from URLs, generate AI images and videos, create one PostGroup per plan_item with all its per-network sub_posts, and report granular per-item results.
+
+PRECONDITION: plan_id must exist in session memory (created by draft_content_plan, not yet executed, not expired). The agent MUST have surfaced the plan summary to the user and received EXPLICIT approval ("dale", "ejecutalo", "OK", etc) BEFORE calling this. The MCP requires confirm: true literal to proceed.
+
+NOT ATOMIC: this is on purpose. If 6 of 7 plan_items succeed and 1 fails, the 6 successful PostGroups are kept (already-consumed credits cannot be refunded). The response surfaces granular results per plan_item with the raw backend error message for each failure plus a recovery_suggestion. The agent surfaces this to the user; they can call execute_content_plan again with a fixed plan or call update_content_plan to fix the specific failing item.
+
+PARALLELISM: plan_items are executed in parallel. Inside each plan_item, sub_posts are processed in parallel (uploads + AI generations + PostGroup + Posts creation pipeline). This compresses a typical 7-day plan from N sequential round-trips into one efficient burst.
+
+ASSET STRATEGIES SUPPORTED IN v1:
+- url: download + upload to asset library (image or video).
+- asset_id: pass through.
+- ai_generate image: POST /api/aiResults/image, poll until completed, re-upload to asset library, attach asset id.
+- ai_generate video: POST /api/aiResults/video (text-to-video), poll until completed (~10-15 min for Veo), re-upload, attach.
+- ai_avatar_lipsync, ai_avatar_video: NOT supported in v1. Generate them manually with generate_avatar_lipsync_clip / generate_avatar_video first and pass asset_id back into the plan.
+
+OUTPUT: { plan_id, status (succeeded / completed_with_partial_failures / failed_all), results (per plan_item: status, post_group_id when created, asset_ids per sub_post, credits_consumed, error and recovery_suggestion when failed), totals (count succeeded / failed, total credits consumed, budget remaining after). next_actions guides what the user can do next.
+
+DO NOT CALL this without explicit user confirmation in chat. The MCP rejects calls without confirm: true.`,
+      inputSchema: {
+        plan_id: z.string().min(1),
+        confirm: z
+          .literal(true)
+          .describe(
+            "Must be the literal boolean true. Any other value or omission causes the tool to refuse. This is the chat-side confirmation gate: the agent must have asked the user out loud, received explicit approval, and only then passes confirm: true.",
+          ),
+      },
+    },
+    async ({ plan_id, confirm }) => {
+      if (confirm !== true) {
+        return toolError({
+          reason: "confirmation_required",
+          user_message:
+            "execute_content_plan requiere confirmación explícita. Llamá esta tool solo después que el usuario haya dicho explícitamente que quiere ejecutar el plan.",
+          blocking: true,
+        });
+      }
+      const plan = getPlan(plan_id);
+      if (!plan) {
+        return toolError({
+          reason: "plan_id_not_found",
+          user_message:
+            "No encuentro ese plan. Puede haber expirado (los planes viven 2hs en memoria) o nunca fue creado.",
+          blocking: true,
+        });
+      }
+      if (plan.status === "executed") {
+        return toolError({
+          reason: "plan_already_executed",
+          user_message:
+            "Este plan ya fue ejecutado. Si querés crear los mismos posts de nuevo, generá un plan nuevo con draft_content_plan.",
+          blocking: true,
+        });
+      }
+      const ctx = getContext(plan.context_id);
+      if (!ctx) {
+        return toolError({
+          reason: "context_id_invalid_or_expired",
+          user_message:
+            "El context expiró. Llamá prepare_content_plan_context y rearmá el plan antes de ejecutar.",
+          blocking: true,
+        });
+      }
+
+      // Re-validate before execute to catch any quota / state drift since draft.
+      const v = await runValidation({
+        plan_items: plan.plan_items,
+        time_window: plan.time_window,
+        ctx,
+        client,
+        use_brand_voice: plan.use_brand_voice,
+      });
+      if (v.blockers.length > 0) {
+        return toolError({
+          reason: "plan_no_longer_valid",
+          user_message:
+            "El plan dejó de ser válido entre el draft y este execute (cambió tu cuota, una red se desconectó, etc.). Llamá update_content_plan para resolver los blockers listados y reintentá.",
+          blocking: true,
+          details: { blockers: v.blockers },
+        });
+      }
+
+      updatePlanInState(plan_id, { status: "executing", execution_started_at_ms: Date.now() });
+
+      // Compute publish_at UTC per item if auto_publish_schedule is set or
+      // each item carries its own. We pass publish_at_local as YYYY-MM-DDTHH:mm
+      // and let the API treat it as local in the requested timezone. Followr
+      // stores in UTC; we send ISO with the offset computed from the IANA tz.
+      const itemResults: Array<Record<string, unknown>> = [];
+      const executions = plan.plan_items.map(async (item) => {
+        try {
+          const result = await executePlanItem(client, plan.company_id, item);
+          itemResults.push(result);
+          return result;
+        } catch (e) {
+          const result = {
+            slug: item.slug,
+            date: item.date,
+            status: "failed_unexpected" as const,
+            error_message: e instanceof Error ? e.message : String(e),
+            credits_consumed_estimate: 0,
+            recovery_suggestion:
+              "Unexpected failure outside the per-sub_post pipeline. Inspect details. If transient (network blip, 5xx), retry execute_content_plan.",
+          };
+          itemResults.push(result);
+          return result;
+        }
+      });
+      await Promise.all(executions);
+
+      // Totals.
+      const succeeded = itemResults.filter((r) => r["status"] === "created").length;
+      const failed = itemResults.length - succeeded;
+      const overallStatus =
+        succeeded === itemResults.length
+          ? "succeeded"
+          : succeeded === 0
+            ? "failed_all"
+            : "completed_with_partial_failures";
+
+      // Refresh budget for the report.
+      let budgetAfter: number | null = null;
+      try {
+        const b = await loadBudgets(client);
+        budgetAfter = b?.ai_image_and_video_budget.remaining ?? null;
+      } catch {
+        budgetAfter = null;
+      }
+
+      updatePlanInState(plan_id, {
+        status: overallStatus === "failed_all" ? "failed" : "executed",
+        execution_finished_at_ms: Date.now(),
+      });
+
+      const consumedEstimate = itemResults.reduce(
+        (a, r) => a + (typeof r["credits_consumed_estimate"] === "number" ? (r["credits_consumed_estimate"] as number) : 0),
+        0,
+      );
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                plan_id,
+                status: overallStatus,
+                results: itemResults,
+                totals: {
+                  plan_items_attempted: itemResults.length,
+                  succeeded,
+                  failed,
+                  estimated_credits_consumed: consumedEstimate,
+                  ai_image_and_video_budget_remaining: budgetAfter,
+                },
+                next_actions:
+                  overallStatus === "succeeded"
+                    ? [
+                        "Revisar los drafts en app.followr.ai (cada PostGroup creado quedó como draft).",
+                        "Programar los publish times desde la app o llamar publish_post_group_now si querés publicar uno ahora.",
+                      ]
+                    : overallStatus === "completed_with_partial_failures"
+                      ? [
+                          "Revisar los drafts que se crearon OK en app.followr.ai.",
+                          "Mirar el campo error_message de los items que fallaron para entender la causa.",
+                          "Para reintentar solo los fallidos: usar update_content_plan para ajustar ese sub_post y volver a llamar execute_content_plan (los items ya creados no se duplican porque generan nuevos PostGroups).",
+                        ]
+                      : [
+                          "Ningún item se creó. Revisar el error_message de cada fila para entender la causa raíz.",
+                          "Si fue por quota: cambiar modelos a alternativas más baratas con update_content_plan y reintentar.",
+                          "Si fue por un asset URL que ya no existe: corregir la URL con update_content_plan y reintentar.",
+                        ],
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    },
+  );
+}
+
+// ── execute helpers ─────────────────────────────────────────────────────────
+
+async function resolveSubPostAssets(
+  client: FollowrClient,
+  companyId: number,
+  sp: SubPost,
+): Promise<{ asset_ids: number[]; credits_consumed: number; ai_results_consumed: number[] }> {
+  const credits = { value: 0 };
+  const aiResults: number[] = [];
+
+  const strategy = sp.assets_strategy;
+  const collected: number[] = [];
+
+  const resolveImageSource = async (src: NonNullable<AssetsStrategy["image_source"]>) => {
+    if (src.type === "asset_id") {
+      collected.push(src.id);
+      return;
+    }
+    if (src.type === "url") {
+      const a = await uploadFromUrl(client, { companyId, url: src.url, type: "image" });
+      collected.push(a.id);
+      return;
+    }
+    if (src.type === "ai_generate") {
+      const aiResult = await client.generateImage({
+        q: src.prompt,
+        company_id: companyId,
+        ...(src.model ? { model: src.model } : {}),
+        ...(src.reference_image_url ? { image_url: src.reference_image_url } : {}),
+      });
+      const final = await client.waitForAiResult(aiResult.id, { timeoutMs: 5 * 60 * 1000 });
+      if (final.status !== "completed") {
+        throw new Error(
+          `AI image generation failed (id=${final.id}, status=${final.status}, message=${final.status_message ?? "no message"}). Backend response: ${JSON.stringify(final).slice(0, 500)}`,
+        );
+      }
+      aiResults.push(final.id);
+      const imageUrl = (final as unknown as { image_url?: string; response?: string }).image_url ?? (final as unknown as { response?: string }).response;
+      if (!imageUrl || typeof imageUrl !== "string") {
+        throw new Error(`AI image generation completed but no image URL was returned (id=${final.id}).`);
+      }
+      // The model lookup is also done in estimateSubPostCost; mirror the
+      // charge here so totals match what the user saw in the draft.
+      const m = IMAGE_MODELS.find((x) => x.model_id === (src.model ?? "nano_banana_2"));
+      credits.value += m ? m.cost_per_image : 25;
+      const a = await uploadFromUrl(client, { companyId, url: imageUrl, type: "image" });
+      collected.push(a.id);
+      return;
+    }
+  };
+
+  if (strategy.image_source) await resolveImageSource(strategy.image_source);
+
+  if (strategy.carousel_sources) {
+    // Resolve carousel in parallel.
+    await Promise.all(strategy.carousel_sources.map((src) => resolveImageSource(src)));
+  }
+
+  if (strategy.video_source) {
+    const vs = strategy.video_source;
+    if (vs.type === "asset_id") {
+      collected.push(vs.id);
+    } else if (vs.type === "url") {
+      const a = await uploadFromUrl(client, { companyId, url: vs.url, type: "video" });
+      collected.push(a.id);
+    } else if (vs.type === "ai_generate") {
+      const aspectRatio = sp.product_type === "reel" || sp.product_type === "short" ? "9:16" : "16:9";
+      const aiResult = await client.generateAiVideoClip({
+        type: "video",
+        q: vs.prompt,
+        aspect_ratio: aspectRatio,
+        model: vs.model,
+        company_id: companyId,
+        ...(vs.reference_image_url ? { image_url: vs.reference_image_url } : {}),
+      });
+      // Video clips can take 10-15 min. Give a generous timeout.
+      const final = await client.waitForAiResult(aiResult.id, { timeoutMs: 20 * 60 * 1000, intervalMs: 5000 });
+      if (final.status !== "completed") {
+        throw new Error(
+          `AI video generation failed (model=${vs.model}, id=${final.id}, status=${final.status}, message=${final.status_message ?? "no message"}). Backend response: ${JSON.stringify(final).slice(0, 500)}`,
+        );
+      }
+      aiResults.push(final.id);
+      const m = VIDEO_MODELS.find((x) => x.model_id === vs.model);
+      const duration = vs.duration_seconds ?? m?.default_duration_seconds ?? 8;
+      credits.value += (m?.cost_per_second ?? 400) * duration;
+      const videoUrl = (final as unknown as { video_url?: string; response?: string }).video_url ?? (final as unknown as { response?: string }).response;
+      if (!videoUrl || typeof videoUrl !== "string") {
+        throw new Error(`AI video generation completed but no video URL was returned (id=${final.id}).`);
+      }
+      const a = await uploadFromUrl(client, { companyId, url: videoUrl, type: "video" });
+      collected.push(a.id);
+    } else if (vs.type === "ai_avatar_lipsync" || vs.type === "ai_avatar_video") {
+      throw new Error(
+        `Asset strategy ${vs.type} is not supported by execute_content_plan in v1. Generate the avatar video first by calling generate_avatar_lipsync_clip or generate_avatar_video, then pass the resulting asset id via assets_strategy.video_source = { type: "asset_id", id: <n> }.`,
+      );
+    }
+  }
+
+  return { asset_ids: collected, credits_consumed: credits.value, ai_results_consumed: aiResults };
+}
+
+async function executePlanItem(
+  client: FollowrClient,
+  companyId: number,
+  item: PlanItem,
+): Promise<Record<string, unknown>> {
+  // 1. Resolve assets per sub_post IN PARALLEL.
+  let assetResolutions: Array<{
+    sub_post_index: number;
+    asset_ids: number[];
+    credits_consumed: number;
+    ai_results_consumed: number[];
+    error?: string;
+  }>;
+  try {
+    assetResolutions = await Promise.all(
+      item.sub_posts.map(async (sp, idx) => {
+        try {
+          const r = await resolveSubPostAssets(client, companyId, sp);
+          return { sub_post_index: idx, ...r };
+        } catch (e) {
+          return {
+            sub_post_index: idx,
+            asset_ids: [],
+            credits_consumed: 0,
+            ai_results_consumed: [],
+            error: e instanceof Error ? e.message : String(e),
+          };
+        }
+      }),
+    );
+  } catch (e) {
+    return {
+      slug: item.slug,
+      date: item.date,
+      status: "failed_resolving_assets",
+      error_message: e instanceof Error ? e.message : String(e),
+      credits_consumed_estimate: 0,
+      recovery_suggestion: "Asset resolution failed unexpectedly. Check connectivity to Followr and retry.",
+    };
+  }
+
+  const anyFail = assetResolutions.find((r) => r.error);
+  const creditsConsumed = assetResolutions.reduce((a, r) => a + r.credits_consumed, 0);
+  if (anyFail) {
+    return {
+      slug: item.slug,
+      date: item.date,
+      status: "failed_resolving_assets",
+      error_message: anyFail.error,
+      failed_sub_post_index: anyFail.sub_post_index,
+      credits_consumed_estimate: creditsConsumed,
+      recovery_suggestion:
+        "One sub_post failed to resolve its assets. The other sub_posts may have generated credits already. Fix the failing sub_post with update_content_plan and retry execute_content_plan (already-created assets in the library can be referenced via asset_id to avoid regeneration).",
+    };
+  }
+
+  // 2. Create PostGroup.
+  let group;
+  try {
+    group = await client.createPostGroup(companyId, {
+      draft: true,
+      title: item.concept_shared.slice(0, 120),
+      description: item.concept_shared,
+      topic: item.concept_shared.slice(0, 60),
+    });
+  } catch (e) {
+    return {
+      slug: item.slug,
+      date: item.date,
+      status: "failed_creating_post_group",
+      error_message: e instanceof Error ? e.message : String(e),
+      credits_consumed_estimate: creditsConsumed,
+      recovery_suggestion:
+        "Asset library uploads / AI generations succeeded but the PostGroup creation failed (likely a Followr API issue). The assets are persisted in your library; you can reuse them via asset_id by updating the plan and retrying.",
+    };
+  }
+
+  // 3. Create per-network Posts inside that PostGroup. Sequential to keep
+  // backend load reasonable; per-post the backend is fast.
+  const postResults: Array<{
+    sub_post_index: number;
+    social_network: SocialNetwork;
+    status: "created" | "failed";
+    error_message?: string;
+  }> = [];
+
+  for (let i = 0; i < item.sub_posts.length; i++) {
+    const sp = item.sub_posts[i] as SubPost;
+    const resolution = assetResolutions.find((r) => r.sub_post_index === i)!;
+    const internalNetworkId =
+      NETWORK_FORMAT_COMPATIBILITY[`${sp.social_network}:${sp.product_type}`]?.internal_id ??
+      sp.social_network;
+    try {
+      await client.createPost(group.id, {
+        social_network_type: internalNetworkId,
+        description: sp.caption_concept,
+        assets_ids: resolution.asset_ids,
+        preferences:
+          sp.product_type === "feed"
+            ? {}
+            : { media_product_type: productTypeToFollowr(sp.product_type) },
+      });
+      postResults.push({
+        sub_post_index: i,
+        social_network: sp.social_network,
+        status: "created",
+      });
+    } catch (e) {
+      postResults.push({
+        sub_post_index: i,
+        social_network: sp.social_network,
+        status: "failed",
+        error_message: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  const subPostsCreated = postResults.filter((p) => p.status === "created").length;
+  const subPostsFailed = postResults.length - subPostsCreated;
+
+  if (subPostsCreated === 0) {
+    // Roll back the empty PostGroup to avoid orphans.
+    try {
+      await client.deletePostGroup(group.id);
+    } catch {
+      // Non-fatal: surface in details.
+    }
+    return {
+      slug: item.slug,
+      date: item.date,
+      status: "failed_creating_posts",
+      error_message:
+        postResults.find((p) => p.status === "failed")?.error_message ?? "All sub_posts failed.",
+      credits_consumed_estimate: creditsConsumed,
+      sub_post_results: postResults,
+      recovery_suggestion:
+        "PostGroup was deleted to avoid leaving an orphan. The assets remain in your library. Fix the per-sub_post issues with update_content_plan and retry.",
+    };
+  }
+
+  return {
+    slug: item.slug,
+    date: item.date,
+    publish_at_time_local: item.publish_at_time_local,
+    status: subPostsFailed === 0 ? "created" : "partially_created",
+    post_group_id: group.id,
+    sub_posts_created: subPostsCreated,
+    sub_posts_failed: subPostsFailed,
+    sub_post_results: postResults,
+    credits_consumed_estimate: creditsConsumed,
+    asset_ids_per_sub_post: assetResolutions.map((r) => ({
+      sub_post_index: r.sub_post_index,
+      asset_ids: r.asset_ids,
+    })),
+  };
+}
+
+function productTypeToFollowr(pt: ProductType): string {
+  switch (pt) {
+    case "feed":
+      return "feed";
+    case "reel":
+      return "reel";
+    case "story":
+      return "story";
+    case "short":
+      return "short";
+    case "long_video":
+      return "feed";
+  }
 }
 
 // ── Validation helpers ──────────────────────────────────────────────────────

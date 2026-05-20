@@ -42,7 +42,7 @@ function filenameFromUrl(url: string, fallbackExt: string): string {
   }
 }
 
-async function uploadFromUrl(
+export async function uploadFromUrl(
   client: FollowrClient,
   args: {
     companyId: number;
