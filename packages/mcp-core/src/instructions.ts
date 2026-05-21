@@ -213,4 +213,16 @@ Followr MCP manages content creation and scheduling across multiple companies. A
     DETAILED ASSET PLAN: every sub_post SHOULD set asset_plan with type, description, prompt (when AI), reference_image_urls (from industry_specific.data when available), include_logo, model_recommendation. Combined with the priority order from Rule 17 (reuse > upload > image-to-image with reference > pure AI), this is how the agent grounds plans in the brand's real material.
 
     SOURCE RESEARCH TRACEABILITY: when a plan_item is inspired by a specific page on the website, set source_research with website_page + products_featured + campaign + assets_from_website. Helps the agent explain choices and lets the executor verify asset choices against real brand material.
+
+20. FORMAT MIX. When building a multi-post week for instagram or facebook, target the recommended mix from PLANNING_STRATEGY.format_mix_per_network: typically 1-2 reels, 1-2 carousels, 1-3 single images for a 5-7 post week. ANY IG/FB calendar of 5+ posts SHOULD include at least 1 reel.
+
+    Reels have carried organic reach on Instagram and Facebook since 2024 and remain the highest-distribution surface in 2026. A weekly calendar without reels for those networks is missing the largest available channel.
+
+    Do NOT default to "no past reels = no reel in the plan". When best_performing_posts_last_60d is empty (brand has not posted via Followr yet) or contains no reels, that is INERTIA, not preference. Pick the most movement-friendly concept of the week (try-on, transition, BTS, before/after, time-lapse, reveal, process montage) and propose it as a reel even when prior calendars were static-only. The user can always push back; the planner should not silently default to the safe choice.
+
+    When both instagram and facebook are connected, identical per-slot content is the COMMON Followr-friendly default and aligns with the cross-post workflow. Treat IG+FB as a pair: a reel slot covers both networks at once. Differentiate IG vs FB only when the brief explicitly demands it (audience age gap, network-specific promo, native FB long-caption play).
+
+    The reel argument COMPOUNDS with cross-posting: a single 9:16 vertical clip serves Instagram Reel + Facebook Reel + TikTok + YouTube Short with ZERO extra generation cost. When TikTok is in the plan (so a video is already being generated), the reel slot for IG and FB is essentially free: reuse the same asset across all four networks.
+
+    The validator surfaces a warning (no_reel_in_weekly_plan) when a 5+ post IG or FB week has zero reels, with reel_friendly_candidates from the existing plan_items. Use those to offer the user a concrete conversion before approving the plan, do not bury the warning at the end.
 `.trim();

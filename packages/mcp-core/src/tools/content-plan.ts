@@ -2524,6 +2524,68 @@ async function runValidation(args: {
     }
   }
 
+  // Cross-items: format-mix policy for instagram and facebook.
+  // A week of 5+ posts on IG or FB with zero reels misses the largest organic
+  // surface on those networks since 2024. Warning is non-blocking: the user
+  // can dismiss it, but the planner should not silently default to feed-only.
+  // See PLANNING_STRATEGY.format_mix_per_network for the underlying policy.
+  for (const network of ["instagram", "facebook"] as const) {
+    if (!ctx.networks_connected.includes(network)) continue;
+    const itemsWithNetwork: Array<{ slug: string; sub_post_index: number; product_type: ProductType }> = [];
+    for (const item of plan_items) {
+      for (let i = 0; i < item.sub_posts.length; i++) {
+        const sp = item.sub_posts[i] as SubPost;
+        if (sp.social_network === network) {
+          itemsWithNetwork.push({ slug: item.slug, sub_post_index: i, product_type: sp.product_type });
+        }
+      }
+    }
+    if (itemsWithNetwork.length >= 5) {
+      const reelCount = itemsWithNetwork.filter((e) => e.product_type === "reel").length;
+      if (reelCount === 0) {
+        // Identify reel-friendly candidates: items whose rationale or
+        // caption_concept hints at movement, transition, try-on, before/after,
+        // BTS. The agent can use these to convert one sub_post to a reel.
+        const reelKeywords =
+          /(reel|video|movimiento|movement|try[- ]?on|fit check|transición|transition|antes\s*\/\s*despu[eé]s|before\s*\/\s*after|bts|behind.?the.?scenes|tutorial|how[- ]?to|process|plating|reveal|hook|c[aá]mara r[aá]pida|time.?lapse|day in the life)/i;
+        const candidateSlugs: string[] = [];
+        for (const item of plan_items) {
+          const hasNetwork = item.sub_posts.some((sp) => sp.social_network === network);
+          if (!hasNetwork) continue;
+          if (reelKeywords.test(item.rationale + " " + item.concept_shared)) {
+            candidateSlugs.push(item.slug);
+          }
+        }
+        warnings.push({
+          issue: "no_reel_in_weekly_plan",
+          network,
+          posts_count: itemsWithNetwork.length,
+          reel_count: 0,
+          reel_friendly_candidates: candidateSlugs,
+          detail: `El plan tiene ${itemsWithNetwork.length} posts para ${network} y cero reels. Reels llevan la mayor parte del alcance orgánico en ${network} desde 2024. Un calendario balanceado típicamente incluye 1-2 reels por semana (ver format_mix_per_network).`,
+          suggestion:
+            candidateSlugs.length > 0
+              ? `Los conceptos más reel-friendly del plan son: ${candidateSlugs.join(", ")}. Sugerí al usuario convertir uno (o el que tenga más movimiento) a reel. Si TikTok ya tiene video, el mismo asset 9:16 se cross-postea como Reel sin costo extra de generación.`
+              : "Ningún concept del plan tiene keywords obvias de reel (try-on, transition, BTS, etc.). Proponé al usuario agregar UN concept reel-friendly para la semana (ver reel_concept_seeds en format_mix_per_network) o reformular uno existente con foco en movimiento.",
+          resolution_options: [
+            {
+              id: "convert_to_reel",
+              description: `Llamar update_content_plan con replace_sub_post: cambiar uno de los sub_posts ${network} a product_type='reel' + asset_layout='single_video' + assets_strategy.video_source. Si TikTok ya está en el plan_item, reusá el mismo asset (cross-post sin costo).`,
+            },
+            {
+              id: "add_new_reel_item",
+              description: "Llamar update_content_plan con add_item: agregar un nuevo plan_item con sub_post de tipo reel basado en uno de los reel_concept_seeds (try-on, transition, BTS, before/after, time-lapse).",
+            },
+            {
+              id: "keep_as_is",
+              description: "Descartar el warning si el usuario explícitamente quiere semana sólo de statics o si la marca tiene argumento (audiencia muy mayor en FB, política interna, etc.).",
+            },
+          ],
+        });
+      }
+    }
+  }
+
   // Cross-items: duplicate network per slot.
   for (const [slotKey, entries] of slotMap) {
     const counts = new Map<SocialNetwork, string[]>();

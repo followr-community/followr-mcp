@@ -535,5 +535,44 @@ export const PLANNING_STRATEGY = {
     "brand_context.website_summary is fetched server-side from the company's website (when present) and contains current product categories, audience hints, season context, active promotions. Use it to ground the plan: do NOT propose 'café en sábado de sol' if the season is winter, do not assume unisex if the brand is men-only, etc.",
 
   best_performing_posts_use:
-    "best_performing_posts_last_60d lists the top posts the company shipped in the last 60 days with engagement rate and format. Use these as inspiration for what works for THIS brand specifically: if reels dominate, plan reels; if carousels rank, plan carousels.",
+    "best_performing_posts_last_60d lists the top posts the company shipped in the last 60 days with engagement rate and format. Use these as inspiration for what works for THIS brand specifically: if reels dominate, plan reels; if carousels rank, plan carousels. CRITICAL exception: when the array is empty (brand has not posted via Followr yet), do NOT treat the absence as 'no reels needed'. Empty history is a starting point, not evidence of preference. Apply the format_mix_per_network defaults below instead.",
+
+  format_mix_per_network: {
+    rationale:
+      "Format variety within a single network drives algorithmic reach and prevents audience fatigue. A week of identical formats on the same network underperforms a balanced mix. Reels in particular have carried organic distribution on Instagram and Facebook since 2024 and remain the highest-reach surface in 2026. These targets are DEFAULTS, not hard constraints: deviate when the brief explicitly demands it (e.g. all-promo week, network-specific play) or when best_performing_posts_last_60d shows a different mix already works for THIS brand. The targets are per-network and per-week; cross-posting identical content from IG to FB is the common Followr-friendly default (see cross_post_default below).",
+    recommended_mix_per_week: {
+      instagram: {
+        target_5_to_7_posts: { reel: "1-2", carousel: "1-2", single_image: "1-3", story: "optional" },
+        minimum_floor: "At least 1 reel in any week with 5+ posts. Reels are first-class, not bonus.",
+      },
+      facebook: {
+        target_5_to_7_posts: { reel: "1-2", carousel: "1-2", single_image: "1-3" },
+        minimum_floor: "At least 1 reel in any week with 5+ posts. Same logic as instagram.",
+      },
+      tiktok: {
+        target_5_to_7_posts: { reel_video: "all (network only accepts video)" },
+        minimum_floor: "Trivially met: TikTok requires video.",
+      },
+      linkedin: {
+        target_5_to_7_posts: { single_image: "2-3", carousel: "1-2", single_video: "0-1" },
+        minimum_floor: "No video required; LinkedIn audience absorbs static carousels and long captions well.",
+      },
+      x: {
+        target_5_to_7_posts: { single_image: "3-4", carousel: "0-1", single_video: "0-1" },
+        minimum_floor: "No reel-equivalent; X is text-first with image support.",
+      },
+      youtube: {
+        target_5_to_7_posts: { short: "1-2 per week if used", long_video: "opt-in" },
+        minimum_floor: "Only plan YouTube when the brand has been asked or is video-native.",
+      },
+    },
+    cross_post_default:
+      "When both instagram and facebook are connected, identical per-slot content (same concept, same asset, same format) is the COMMON Followr-friendly default and aligns with the cross-post workflow. Differentiate IG vs FB only when the brief explicitly demands it (audience age gap, network-specific promo wording, native FB long-caption play). The mix table above applies per network; identical mix on IG and FB is expected, not lazy.",
+    reel_concept_seeds:
+      "Reel-native concepts to seed at least one reel per IG/FB week when the brand has not posted reels before: try-on / fitting moment, before/after, behind-the-scenes / packing / studio shot, transition cut (outfit change, lighting change, location change), 3-second hook + product reveal, satisfying close-up (texture, stitching, hardware, plating), POV first-person, day-in-the-life mini-vlog, customer reaction reaction-cam, time-lapse of a process. For fashion specifically: fit check, outfit transition, try-on with quick cuts. For food: plating shot, first-bite reaction, pour-and-reveal. For service businesses: process montage, day in the studio, client-result reveal.",
+    cross_post_amortization:
+      "A 9:16 vertical reel asset serves Instagram Reel + Facebook Reel + TikTok + YouTube Short with ZERO extra generation cost. When TikTok is in the plan (i.e. video already being generated), the reel slot for IG and FB is essentially free: reuse the same asset across all four networks. This compounds the case for including reels: the cost amortizes across every video-capable network the brand has connected.",
+    anti_pattern:
+      "Planning 5 IG posts for the week with 0 reels because the brand has no past reels and falling back to 'safe' feed/carousel. This is the EXACT inertia the planner should help break, not reinforce. Defaulting to feed because 'past data shows feed' (or because past data is empty) is reinforcement of status quo, not strategy. Pick the most movement-friendly concept of the week (try-on, transition, BTS, before/after) and propose it as a reel even when the brand has only posted statics before. The user can always push back; the planner should not silently default to the safe choice.",
+  },
 };
