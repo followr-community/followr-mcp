@@ -309,17 +309,41 @@ export interface RuleGroup {
   active: boolean;
   random_minutes: number;
   company_id: number;
+  posts_active_from?: Iso8601 | null;
   created_at: Iso8601;
   updated_at: Iso8601;
   rules?: Rule[];
+  tags?: Tag[];
 }
+
+/**
+ * Subset of RuleGroup fields accepted by PUT /api/ruleGroups/{id}.
+ * Includes tags_ids[] which the response model does NOT expose (the response uses `tags[]`).
+ * REPLACE semantics on tags_ids (same as PostGroup): caller must pass the FULL union.
+ */
+export interface RuleGroupPatch {
+  name?: string;
+  description?: string | null;
+  active?: boolean | 0 | 1;
+  random_minutes?: number;
+  posts_active_from?: Iso8601 | null;
+  tags_ids?: number[];
+}
+
+export type RuleFrequency = "weekly" | "daily" | "monthly" | string;
 
 export interface Rule {
   id: number;
-  tags_ids?: number[];
-  days_of_week?: string[];
-  time_slots?: string[];
-  social_network_types?: string[];
+  rule_group_id: number;
+  frequency: RuleFrequency;
+  day_of_week: number | null;
+  day_of_month: number | null;
+  week_of_month: number | null;
+  month: number | null;
+  time: string;
+  posts_active_from: Iso8601 | null;
+  created_at: Iso8601;
+  updated_at: Iso8601;
 }
 
 export interface SocialNetwork {

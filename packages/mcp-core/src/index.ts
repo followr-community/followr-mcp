@@ -32,6 +32,7 @@ import { registerPostGroupTools } from "./tools/post-groups.js";
 import { registerPostTools } from "./tools/posts.js";
 import { registerPromptTools } from "./tools/prompts.js";
 import { registerResearchTools } from "./tools/research.js";
+import { registerAutolistTools } from "./tools/autolist.js";
 import { registerRuleGroupTools } from "./tools/rule-groups.js";
 import { registerSocialHubTools } from "./tools/social-hub.js";
 import { registerSubscriptionTools } from "./tools/subscription.js";
@@ -65,6 +66,7 @@ export function registerFollowrTools(
   registerSocialHubTools(server, client, options);
   registerFolderTools(server, client, options);
   registerRuleGroupTools(server, client, options);
+  registerAutolistTools(server, client, options);
   registerSubscriptionTools(server, client, options);
   registerUserTools(server, client, options);
   registerCompanySettingsTools(server, client, options);

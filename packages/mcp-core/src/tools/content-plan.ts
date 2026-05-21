@@ -44,6 +44,7 @@ import {
   compatibilityFor,
 } from "../lib/content-plan-catalog.js";
 import { resolveDriver } from "../lib/driver-resolver.js";
+import { normalizePreferences } from "../lib/normalize-preferences.js";
 import { getAiPreferences } from "../lib/preferences.js";
 import {
   type AssetLayout,
@@ -472,7 +473,7 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
         client.listPrompts({ companyId: company_id, pageSize: 100 }),
         client.listTags(company_id, { pageSize: 100 }),
         client.listFolders(company_id, { pageSize: 100 }),
-        client.listRuleGroups(company_id),
+        client.listRuleGroups(company_id, { include: "rules,tags" }),
         client.listAvatars(company_id, { include: "image.thumbnail,voice" }),
         client.listVoices(company_id, { pageSize: 100 }),
         client.listAssets(company_id, { pageSize: 30, include: "thumbnail" }),
@@ -501,6 +502,86 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
       const tags: Tag[] = tagsR.status === "fulfilled" ? tagsR.value : [];
       const folders: Folder[] = foldersR.status === "fulfilled" ? foldersR.value : [];
       const ruleGroups: RuleGroup[] = ruleGroupsR.status === "fulfilled" ? ruleGroupsR.value : [];
+
+      // 4b. Enrich each Autopilot rule group (Autolist) with queue + history +
+      // overlap so the agent can reason about WHICH autolists are healthy /
+      // starving / zombie / out-of-season WITHOUT additional API round-trips.
+      // No LLM call here: just raw signals. The downstream LLM infers theme,
+      // temporal relevance, health status, and recommends feed / pause /
+      // create-new / merge based on these.
+      const enrichmentByRgId = new Map<
+        number,
+        { queue: PostGroup[]; history: PostGroup[] }
+      >();
+      if (ruleGroups.length > 0) {
+        const thirtyDaysAgoIso = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+        const perRgResults = await Promise.allSettled(
+          ruleGroups.map(async (rg) => {
+            const tagIds = (rg.tags ?? []).map((t) => t.id);
+            if (tagIds.length === 0) {
+              return { rgId: rg.id, queue: [] as PostGroup[], history: [] as PostGroup[] };
+            }
+            const [queueR, historyR] = await Promise.allSettled([
+              client.listCompanyPostGroups(company_id, {
+                tagIds,
+                draft: false,
+                publishAtNull: true,
+                status: "pending",
+                pageSize: 15,
+                sort: "-id",
+              }),
+              client.listCompanyPostGroups(company_id, {
+                tagIds,
+                status: "published",
+                publishAtAfter: thirtyDaysAgoIso,
+                pageSize: 30,
+                sort: "-id",
+              }),
+            ]);
+            return {
+              rgId: rg.id,
+              queue: queueR.status === "fulfilled" ? queueR.value : ([] as PostGroup[]),
+              history: historyR.status === "fulfilled" ? historyR.value : ([] as PostGroup[]),
+            };
+          }),
+        );
+        for (const r of perRgResults) {
+          if (r.status === "fulfilled") {
+            enrichmentByRgId.set(r.value.rgId, { queue: r.value.queue, history: r.value.history });
+          }
+        }
+      }
+
+      // Tag overlap between rule groups. A tag may belong to at most ONE active
+      // rule group at a time (backend constraint), so overlap among ACTIVES is
+      // surprising (and worth surfacing). Among any-state groups, overlap means
+      // a tag is shared, useful for consolidation suggestions.
+      const overlapByRgId = new Map<
+        number,
+        Array<{ rule_group_name: string; rule_group_active: boolean; overlapping_tag_names: string[] }>
+      >();
+      for (const rg of ruleGroups) {
+        const myTags = (rg.tags ?? []).map((t) => ({ id: t.id, name: t.name }));
+        if (myTags.length === 0) continue;
+        const overlaps: Array<{
+          rule_group_name: string;
+          rule_group_active: boolean;
+          overlapping_tag_names: string[];
+        }> = [];
+        for (const other of ruleGroups) {
+          if (other.id === rg.id) continue;
+          const otherTagIds = new Set((other.tags ?? []).map((t) => t.id));
+          const shared = myTags.filter((t) => otherTagIds.has(t.id));
+          if (shared.length > 0) {
+            overlaps.push({
+              rule_group_name: other.name,
+              rule_group_active: !!other.active,
+              overlapping_tag_names: shared.map((t) => t.name),
+            });
+          }
+        }
+        if (overlaps.length > 0) overlapByRgId.set(rg.id, overlaps);
+      }
       const avatars: Avatar[] = avatarsR.status === "fulfilled" ? avatarsR.value : [];
       const voices: Voice[] = voicesR.status === "fulfilled" ? voicesR.value : [];
       const assetsRecent: Asset[] = assetsRecentR.status === "fulfilled" ? assetsRecentR.value : [];
@@ -635,11 +716,69 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
           social_network_type: p.social_network_type,
           is_default_for_network: p.default,
         })),
-        publishing_rule_groups: ruleGroups.map((rg) => ({
-          id: rg.id,
-          name: (rg as RuleGroup & { name?: string }).name ?? null,
-          random_minutes: (rg as RuleGroup & { random_minutes?: number }).random_minutes ?? null,
-        })),
+        publishing_rule_groups: ruleGroups.map((rg) => {
+          const enrich = enrichmentByRgId.get(rg.id) ?? { queue: [] as PostGroup[], history: [] as PostGroup[] };
+          const slotsWeekly = (rg.rules ?? []).filter((r) => r.frequency === "weekly").length;
+          const sortedHistoryDates = enrich.history
+            .map((p) => (p as PostGroup & { publish_at?: string | null }).publish_at)
+            .filter((d): d is string => !!d)
+            .sort()
+            .reverse();
+          const lastPublishedAt = sortedHistoryDates[0] ?? null;
+          const updatedAt = (rg as RuleGroup & { updated_at?: string }).updated_at ?? null;
+          const pausedForDays = !rg.active && updatedAt
+            ? Math.floor((Date.now() - new Date(updatedAt).getTime()) / (24 * 60 * 60 * 1000))
+            : null;
+          return {
+            id: rg.id,
+            name: rg.name,
+            description: (rg as RuleGroup & { description?: string | null }).description ?? null,
+            active: rg.active,
+            random_minutes: rg.random_minutes,
+            posts_active_from:
+              (rg as RuleGroup & { posts_active_from?: string | null }).posts_active_from ?? null,
+            paused_for_days: pausedForDays,
+            tags: (rg.tags ?? []).map((t) => ({
+              id: t.id,
+              name: t.name,
+              color: (t as Tag & { color?: string | null }).color ?? null,
+            })),
+            slots: (rg.rules ?? []).map((r) => ({
+              id: r.id,
+              frequency: r.frequency,
+              day_of_week: r.day_of_week,
+              day_of_month: r.day_of_month,
+              week_of_month: r.week_of_month,
+              month: r.month,
+              time_utc: r.time,
+            })),
+            slots_per_week: slotsWeekly,
+            queue: {
+              pending_count: enrich.queue.length,
+              has_more: enrich.queue.length >= 15,
+              weeks_of_runway:
+                slotsWeekly > 0 ? Number((enrich.queue.length / slotsWeekly).toFixed(2)) : null,
+              sample: enrich.queue.slice(0, 5).map((p) => ({
+                id: p.id,
+                title: (p as PostGroup & { title?: string | null }).title ?? null,
+                topic: (p as PostGroup & { topic?: string | null }).topic ?? null,
+              })),
+            },
+            history: {
+              last_30d_published_count: enrich.history.length,
+              has_more: enrich.history.length >= 30,
+              last_published_at: lastPublishedAt,
+              recent_posts: enrich.history.slice(0, 10).map((p) => ({
+                id: p.id,
+                title: (p as PostGroup & { title?: string | null }).title ?? null,
+                topic: (p as PostGroup & { topic?: string | null }).topic ?? null,
+                publish_at:
+                  (p as PostGroup & { publish_at?: string | null }).publish_at ?? null,
+              })),
+            },
+            overlap_with_other_autolists: overlapByRgId.get(rg.id) ?? [],
+          };
+        }),
         recent_assets: assetsRecent.slice(0, 30).map((a) => ({
           id: a.id,
           type: a.type,
@@ -670,6 +809,17 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
             "Plan size playbook for confirmation flows. NEVER decide the detail level alone: always ASK the user first which view they want, presenting 2-3 options sized to the plan. Then act on the answer. Plan-size defaults to offer:\n(1) 1-3 items: surface summary_for_user, then ask 'Te muestro el detalle completo de cada uno (copy + descripción de cada imagen y video), o te alcanza con el resumen y avanzamos?'. If user picks detail, call preview_plan_item per item.\n(2) 4-7 items: surface summary_for_user, then ask 'Querés (a) ver el detalle completo de los 5, (b) que te muestre solo uno representativo y aprobás todos juntos, o (c) avanzamos con el resumen?'. Use preview_plan_item only on the chosen subset.\n(3) 8-15 items: surface summary_for_user, then ask 'Es un plan grande. Te lo (a) agrupo por día y vamos día por día, (b) te muestro 2-3 representativos (uno por concept type) y aprobás todo de una, (c) te dejo el resumen y avanzamos?'. Group by date or by concept_shared keyword.\n(4) 16+ items: surface summary_for_user, then ask 'Plan extenso. Para no abrumarte, te propongo (a) spot-check de 2-3 representativos antes de aprobar todo, (b) agrupar por semana y aprobar por semana, (c) avanzar con el resumen tal cual?'. Default recommendation: option (a) for product-heavy industries, (b) for cadence-based plans.\nNEVER dump 30 detailed previews in a row - it is unusable. NEVER pick the view yourself without asking.",
           industry_grounding_strategy:
             "Before drafting any non-trivial content plan, check brand_context.cached_industry. When null, call deep_research(company_id) to retrieve detected_industry, industry_specific.data (products, menu_items, articles, properties, etc. depending on the industry), content_pillars_inferred, and reference assets like product image URLs. Then persist the cache_suggestion suffix on Company.description via update_company so the next session reads from cache. The MCP does NOT auto-call deep_research; it is the agent's responsibility per instructions Rule 19. Skipping it means the plan grounds on shallow website metadata only and AI assets get generated without product references, producing generic visuals that do not look like the real catalog.",
+          autolist_reasoning_strategy:
+            "publishing_rule_groups contains every Autopilot autolist with rich signals. Before proposing a content plan, REASON over each autolist using these inputs (NO regex, NO keyword matching: use full LLM judgment):\n" +
+            "- tags[].name + history.recent_posts[].topic + history.recent_posts[].title → infer the theme of the autolist in 1-2 sentences. If history is empty, infer from tag names + brand voice (lower confidence).\n" +
+            "- history.recent_posts → infer tone (formal / informal / playful / etc.) and whether content is evergreen vs seasonal (Christmas, summer sale, Black Friday, back-to-school, etc.). NEVER use regex to detect seasonality; read the posts.\n" +
+            "- queue.weeks_of_runway → health: <1 week = starving (feed urgently), 1-4 = healthy, >8 = oversaturated, 0 with active=true and no recent_posts = zombie.\n" +
+            "- history.last_published_at older than 60 days while active=true → zombie autolist (was set up but unused).\n" +
+            "- overlap_with_other_autolists → if a tag is in TWO ACTIVE rule groups, that's a surprise (backend usually rejects); flag for the user.\n" +
+            "- paused_for_days → if a paused autolist has been paused for months, consider proposing delete (or leave alone if recent).\n" +
+            "Then, based on (a) the user's target period and intent and (b) each autolist's inferred theme + temporal relevance + health, recommend actions per autolist: feed / pause / activate / delete / merge / leave_alone. ALWAYS surface autolists that are out-of-season for the target period (e.g. 'Navidad' when planning June) AND skip them from the default plan, BUT mention them so the user knows you noticed. NEVER propose alimentar an autolist whose theme doesn't fit the period.\n" +
+            "Tools available for action: create_autolist (new with optional inline tag creation), update_rule_group (rename, toggle active, swap tags via REPLACE semantics on tags_ids), create_rule / delete_rule (edit slots; remember the UI deletes-and-recreates instead of PUT), delete_rule_group (destructive, cascade to rules), create_tag / find_or_create_tag / delete_tag for tag housekeeping. Backend CONSTRAINT: a tag may belong to at most ONE active rule group at a time; preflight by inspecting publishing_rule_groups overlap_with_other_autolists before activating.\n" +
+            "USER-FACING FLOW: max 1 question before proposing a concrete plan. Show the autolist status snapshot, your recommended actions, and a default proposal (e.g. 'Feed Lifestile with 12 posts over 4 weeks, pause out-of-season Navidad, leave Promo alone'). Confirm verbatim before any destructive or active-toggle action.",
           next_step: cachedIndustry
             ? "ask_user_clarifying_question_then_draft"
             : "call_deep_research_then_ask_clarifying_then_draft",
@@ -753,8 +903,12 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
   const AssetSourceAiVideoSchema = z.object({
     type: z.literal("ai_generate"),
     model: z.string().min(1),
-    prompt: z.string().min(1).max(2000),
-    reference_image_url: z.string().url().optional(),
+    prompt: z.string().min(1).max(2000).describe(
+      "Single-scene visual prompt. The model produces ONE ~8-second clip; do NOT describe sequences with multiple cuts or multiple products. If the user wants to showcase several variants in one video, use carousel_images instead or split into multi-scene generate_avatar_video. See PLANNING_STRATEGY.video_reference_constraint.",
+    ),
+    reference_image_url: z.string().url().optional().describe(
+      "Single reference frame for image-to-video. EXACTLY ONE URL. There is no multi-image composite mode: if the prompt mentions multiple distinct products or variants, the model will invent the ones not in this single reference (hallucination). Plan a carousel of images instead when multiple items must be shown faithfully.",
+    ),
     duration_seconds: z.number().positive().max(60).default(8),
   });
   const AssetSourceAvatarLipsyncSchema = z.object({
@@ -1544,123 +1698,245 @@ ITEM-BY-ITEM CONFIRMATION FLOW: when the user asks to advance one item at a time
 
 // ── execute helpers ─────────────────────────────────────────────────────────
 
-async function resolveSubPostAssets(
+type ImageSrc = NonNullable<AssetsStrategy["image_source"]>;
+type VideoSrc = NonNullable<AssetsStrategy["video_source"]>;
+
+interface ResolvedAsset {
+  asset_id: number;
+  credits_consumed: number;
+  ai_result_id: number | null;
+}
+
+interface AssetSourceRef {
+  src: ImageSrc | VideoSrc;
+  mode: "image" | "video";
+  // For video sources, the aspect ratio is derived from network/product_type.
+  // Two sub_posts requesting the same prompt at different aspect ratios are
+  // genuinely different generations, so the aspect is part of the dedupe key.
+  aspect_ratio?: "9:16" | "16:9";
+}
+
+/**
+ * Per-network video aspect-ratio priority used to maximize cross-network
+ * asset reuse within a single plan_item. The lowest numeric priority wins
+ * when multiple sub_posts in the same plan_item request AI video.
+ *
+ *   P1 (9:16 vertical, mandatory): TikTok, IG (all surfaces), FB (all
+ *       surfaces), YouTube Short. These networks privilege or require
+ *       vertical content, so when ANY of them are in the plan_item with
+ *       a video, every other ai_generate video in that plan_item is
+ *       generated at 9:16 to share the same fingerprint and avoid
+ *       duplicate billing.
+ *   P2 (16:9 horizontal): LinkedIn. If the plan_item has no P1 video,
+ *       LinkedIn dictates 16:9; if it does, LinkedIn accepts the 9:16
+ *       reel asset (LinkedIn renders it correctly on mobile).
+ *   P3 (flexible): X / Twitter, Threads, Pinterest, Bluesky. These follow
+ *       whichever priority the plan_item already settled on. When alone
+ *       they default to 9:16 because 9:16 reels render reasonably well
+ *       on every P3 platform and the asset is more reusable later.
+ *
+ * Special case: YouTube long_video is excluded from this coupling. Long
+ * form is a different production pipeline and a 9:16 long_video would
+ * look broken in the YT feed. It always uses 16:9, independent of what
+ * else is in the plan_item.
+ */
+const VIDEO_NETWORK_PRIORITY: Record<string, 1 | 2 | 3> = {
+  "tiktok:feed": 1,
+  "instagram:feed": 1,
+  "instagram:reel": 1,
+  "instagram:story": 1,
+  "facebook:feed": 1,
+  "facebook:reel": 1,
+  "facebook:story": 1,
+  "youtube:short": 1,
+  "linkedin:feed": 2,
+  "x:feed": 3,
+  "threads:feed": 3,
+  "pinterest:feed": 3,
+  "bluesky:feed": 3,
+};
+
+const PRIORITY_PREFERRED_ASPECT: Record<1 | 2 | 3, "9:16" | "16:9"> = {
+  1: "9:16",
+  2: "16:9",
+  3: "9:16",
+};
+
+function isYouTubeLongVideo(sp: SubPost): boolean {
+  return sp.social_network === "youtube" && sp.product_type === "long_video";
+}
+
+/**
+ * Resolve the plan_item's shared video aspect ratio so every AI video
+ * generation inside the item can dedupe to a single fingerprint when
+ * appropriate. YouTube long_video sub_posts opt out of this coupling and
+ * stay 16:9.
+ */
+function videoAspectRatioForPlanItem(item: PlanItem): "9:16" | "16:9" {
+  let bestPriority: number = Infinity;
+  let aspect: "9:16" | "16:9" = "9:16";
+  for (const sp of item.sub_posts) {
+    if (!sp.assets_strategy.video_source) continue;
+    if (isYouTubeLongVideo(sp)) continue;
+    const key = `${sp.social_network}:${sp.product_type}`;
+    const prio = VIDEO_NETWORK_PRIORITY[key];
+    if (prio !== undefined && prio < bestPriority) {
+      bestPriority = prio;
+      aspect = PRIORITY_PREFERRED_ASPECT[prio];
+    }
+  }
+  return aspect;
+}
+
+/**
+ * Aspect ratio the AI video generator should target for ONE sub_post.
+ * YouTube long_video opts out of the plan_item coupling and stays 16:9.
+ * Everything else inherits the plan_item's resolved aspect, which is what
+ * lets a 9:16 reel asset be shared across IG Reel + FB Reel + TikTok +
+ * LinkedIn (coupled down from 16:9) when they all appear together.
+ */
+function videoAspectRatioForSubPostInItem(sp: SubPost, item: PlanItem): "9:16" | "16:9" {
+  if (isYouTubeLongVideo(sp)) return "16:9";
+  return videoAspectRatioForPlanItem(item);
+}
+
+/**
+ * Stable fingerprint of an asset source. Sources with the same fingerprint
+ * resolve to a single backend call and their result is reused by every
+ * sub_post that requested it. This is what stops execute_content_plan
+ * from billing 3x the same Veo clip when a 9:16 video is cross-posted to
+ * IG Reel + FB Reel + TikTok.
+ *
+ * IMPORTANT: any field that genuinely changes the generator output must
+ * be part of the fingerprint. For video that means model + aspect_ratio
+ * + duration + reference_image_url + prompt.
+ */
+function fingerprintAssetSource(ref: AssetSourceRef): string {
+  const { src, mode, aspect_ratio } = ref;
+  if (src.type === "url") return `url:${src.url}`;
+  if (src.type === "asset_id") return `id:${src.id}`;
+  if (src.type === "ai_generate") {
+    if (mode === "image") {
+      const imgSrc = src as Extract<ImageSrc, { type: "ai_generate" }>;
+      const model = imgSrc.model ?? "default";
+      return `ai_image:${model}|${imgSrc.reference_image_url ?? ""}|${imgSrc.prompt}`;
+    }
+    const vidSrc = src as Extract<VideoSrc, { type: "ai_generate" }>;
+    return `ai_video:${vidSrc.model}|${aspect_ratio ?? "9:16"}|${vidSrc.duration_seconds ?? 8}|${vidSrc.reference_image_url ?? ""}|${vidSrc.prompt}`;
+  }
+  if (src.type === "ai_avatar_lipsync") return `lipsync:${src.avatar_id}|${src.script}`;
+  if (src.type === "ai_avatar_video") return `avatar:${src.avatar_id}|${src.generate_backgrounds ?? false}|${src.scripts.join("||")}`;
+  return JSON.stringify(src);
+}
+
+async function resolveAssetSourceFresh(
   client: FollowrClient,
   companyId: number,
-  sp: SubPost,
+  ref: AssetSourceRef,
   prefs: AiPreferences,
-): Promise<{ asset_ids: number[]; credits_consumed: number; ai_results_consumed: number[] }> {
-  const credits = { value: 0 };
-  const aiResults: number[] = [];
-
-  const strategy = sp.assets_strategy;
-  const collected: number[] = [];
-
-  const resolveImageSource = async (src: NonNullable<AssetsStrategy["image_source"]>) => {
-    if (src.type === "asset_id") {
-      collected.push(src.id);
-      return;
-    }
-    if (src.type === "url") {
-      const a = await uploadFromUrl(client, { companyId, url: src.url, type: "image" });
-      collected.push(a.id);
-      return;
-    }
-    if (src.type === "ai_generate") {
-      // Resolve driver via the shared helper. Without this, the backend
-      // rejects nano_banana_2 and imagen4_* with "selected model is
-      // invalid". See packages/mcp-core/src/lib/driver-resolver.ts.
-      const aiDriver = resolveDriver({
-        prefs,
-        modality: "image",
-        model: src.model,
-      });
-      const aiResult = await client.generateImage({
-        q: src.prompt,
-        company_id: companyId,
-        ...(src.model ? { model: src.model } : {}),
-        ...(aiDriver ? { driver: aiDriver } : {}),
-        ...(src.reference_image_url ? { image_url: src.reference_image_url } : {}),
-      });
-      const final = await client.waitForAiResult(aiResult.id, { timeoutMs: 5 * 60 * 1000 });
-      if (final.status !== "completed") {
-        throw new Error(
-          `AI image generation failed (id=${final.id}, status=${final.status}, message=${final.status_message ?? "no message"}). Backend response: ${JSON.stringify(final).slice(0, 500)}`,
-        );
-      }
-      aiResults.push(final.id);
-      const imageUrl = (final as unknown as { image_url?: string; response?: string }).image_url ?? (final as unknown as { response?: string }).response;
-      if (!imageUrl || typeof imageUrl !== "string") {
-        throw new Error(`AI image generation completed but no image URL was returned (id=${final.id}).`);
-      }
-      // The model lookup is also done in estimateSubPostCost; mirror the
-      // charge here so totals match what the user saw in the draft.
-      const m = IMAGE_MODELS.find((x) => x.model_id === (src.model ?? "nano_banana_2"));
-      credits.value += m ? m.cost_per_image : 25;
-      const a = await uploadFromUrl(client, { companyId, url: imageUrl, type: "image" });
-      collected.push(a.id);
-      return;
-    }
-  };
-
-  if (strategy.image_source) await resolveImageSource(strategy.image_source);
-
-  if (strategy.carousel_sources) {
-    // Resolve carousel in parallel.
-    await Promise.all(strategy.carousel_sources.map((src) => resolveImageSource(src)));
+): Promise<ResolvedAsset> {
+  const { src, mode, aspect_ratio } = ref;
+  if (src.type === "asset_id") {
+    return { asset_id: src.id, credits_consumed: 0, ai_result_id: null };
   }
-
-  if (strategy.video_source) {
-    const vs = strategy.video_source;
-    if (vs.type === "asset_id") {
-      collected.push(vs.id);
-    } else if (vs.type === "url") {
-      const a = await uploadFromUrl(client, { companyId, url: vs.url, type: "video" });
-      collected.push(a.id);
-    } else if (vs.type === "ai_generate") {
-      const aspectRatio = sp.product_type === "reel" || sp.product_type === "short" ? "9:16" : "16:9";
-      // Resolve driver via the shared helper. Without this, the backend
-      // rejects veo_* / wan_* / seedance_* / hailuo_* with "selected model
-      // is invalid". See packages/mcp-core/src/lib/driver-resolver.ts.
-      const aiDriver = resolveDriver({
-        prefs,
-        modality: "video",
-        model: vs.model,
-      });
-      const aiResult = await client.generateAiVideoClip({
-        type: "video",
-        q: vs.prompt,
-        aspect_ratio: aspectRatio,
-        model: vs.model,
-        company_id: companyId,
-        ...(aiDriver ? { driver: aiDriver } : {}),
-        ...(vs.reference_image_url ? { image_url: vs.reference_image_url } : {}),
-      });
-      // Video clips can take 10-15 min. Give a generous timeout.
-      const final = await client.waitForAiResult(aiResult.id, { timeoutMs: 20 * 60 * 1000, intervalMs: 5000 });
-      if (final.status !== "completed") {
-        throw new Error(
-          `AI video generation failed (model=${vs.model}, id=${final.id}, status=${final.status}, message=${final.status_message ?? "no message"}). Backend response: ${JSON.stringify(final).slice(0, 500)}`,
-        );
-      }
-      aiResults.push(final.id);
-      const m = VIDEO_MODELS.find((x) => x.model_id === vs.model);
-      const duration = vs.duration_seconds ?? m?.default_duration_seconds ?? 8;
-      credits.value += (m?.cost_per_second ?? 400) * duration;
-      const videoUrl = (final as unknown as { video_url?: string; response?: string }).video_url ?? (final as unknown as { response?: string }).response;
-      if (!videoUrl || typeof videoUrl !== "string") {
-        throw new Error(`AI video generation completed but no video URL was returned (id=${final.id}).`);
-      }
-      const a = await uploadFromUrl(client, { companyId, url: videoUrl, type: "video" });
-      collected.push(a.id);
-    } else if (vs.type === "ai_avatar_lipsync" || vs.type === "ai_avatar_video") {
+  if (src.type === "url") {
+    const a = await uploadFromUrl(client, {
+      companyId,
+      url: src.url,
+      type: mode === "image" ? "image" : "video",
+    });
+    return { asset_id: a.id, credits_consumed: 0, ai_result_id: null };
+  }
+  if (src.type === "ai_generate" && mode === "image") {
+    const imgSrc = src as Extract<ImageSrc, { type: "ai_generate" }>;
+    // Resolve driver via the shared helper. Without this, the backend
+    // rejects nano_banana_2 and imagen4_* with "selected model is
+    // invalid". See packages/mcp-core/src/lib/driver-resolver.ts.
+    const aiDriver = resolveDriver({ prefs, modality: "image", model: imgSrc.model });
+    const aiResult = await client.generateImage({
+      q: imgSrc.prompt,
+      company_id: companyId,
+      ...(imgSrc.model ? { model: imgSrc.model } : {}),
+      ...(aiDriver ? { driver: aiDriver } : {}),
+      ...(imgSrc.reference_image_url ? { image_url: imgSrc.reference_image_url } : {}),
+    });
+    const final = await client.waitForAiResult(aiResult.id, { timeoutMs: 5 * 60 * 1000 });
+    if (final.status !== "completed") {
       throw new Error(
-        `Asset strategy ${vs.type} is not supported by execute_content_plan in v1. Generate the avatar video first by calling generate_avatar_lipsync_clip or generate_avatar_video, then pass the resulting asset id via assets_strategy.video_source = { type: "asset_id", id: <n> }.`,
+        `AI image generation failed (id=${final.id}, status=${final.status}, message=${final.status_message ?? "no message"}). Backend response: ${JSON.stringify(final).slice(0, 500)}`,
       );
     }
+    const imageUrl =
+      (final as unknown as { image_url?: string; response?: string }).image_url ??
+      (final as unknown as { response?: string }).response;
+    if (!imageUrl || typeof imageUrl !== "string") {
+      throw new Error(`AI image generation completed but no image URL was returned (id=${final.id}).`);
+    }
+    const m = IMAGE_MODELS.find((x) => x.model_id === (imgSrc.model ?? "nano_banana_2"));
+    const credits = m ? m.cost_per_image : 25;
+    const a = await uploadFromUrl(client, { companyId, url: imageUrl, type: "image" });
+    return { asset_id: a.id, credits_consumed: credits, ai_result_id: final.id };
   }
+  if (src.type === "ai_generate" && mode === "video") {
+    const vidSrc = src as Extract<VideoSrc, { type: "ai_generate" }>;
+    const aiDriver = resolveDriver({ prefs, modality: "video", model: vidSrc.model });
+    const aiResult = await client.generateAiVideoClip({
+      type: "video",
+      q: vidSrc.prompt,
+      aspect_ratio: aspect_ratio ?? "9:16",
+      model: vidSrc.model,
+      company_id: companyId,
+      ...(aiDriver ? { driver: aiDriver } : {}),
+      ...(vidSrc.reference_image_url ? { image_url: vidSrc.reference_image_url } : {}),
+    });
+    // Video clips can take 10-15 min. Give a generous timeout.
+    const final = await client.waitForAiResult(aiResult.id, { timeoutMs: 20 * 60 * 1000, intervalMs: 5000 });
+    if (final.status !== "completed") {
+      throw new Error(
+        `AI video generation failed (model=${vidSrc.model}, id=${final.id}, status=${final.status}, message=${final.status_message ?? "no message"}). Backend response: ${JSON.stringify(final).slice(0, 500)}`,
+      );
+    }
+    const m = VIDEO_MODELS.find((x) => x.model_id === vidSrc.model);
+    const duration = vidSrc.duration_seconds ?? m?.default_duration_seconds ?? 8;
+    const credits = (m?.cost_per_second ?? 400) * duration;
+    const videoUrl =
+      (final as unknown as { video_url?: string; response?: string }).video_url ??
+      (final as unknown as { response?: string }).response;
+    if (!videoUrl || typeof videoUrl !== "string") {
+      throw new Error(`AI video generation completed but no video URL was returned (id=${final.id}).`);
+    }
+    const a = await uploadFromUrl(client, { companyId, url: videoUrl, type: "video" });
+    return { asset_id: a.id, credits_consumed: credits, ai_result_id: final.id };
+  }
+  if (src.type === "ai_avatar_lipsync" || src.type === "ai_avatar_video") {
+    throw new Error(
+      `Asset strategy ${src.type} is not supported by execute_content_plan in v1. Generate the avatar video first by calling generate_avatar_lipsync_clip or generate_avatar_video, then pass the resulting asset id via assets_strategy.video_source = { type: "asset_id", id: <n> }.`,
+    );
+  }
+  throw new Error(`Unknown asset source type: ${(src as { type?: string }).type ?? "unknown"}`);
+}
 
-  return { asset_ids: collected, credits_consumed: credits.value, ai_results_consumed: aiResults };
+interface SubPostAssetResolution {
+  sub_post_index: number;
+  asset_ids: number[];
+  error?: string;
+}
+
+function subPostAssetRefs(sp: SubPost, item: PlanItem): AssetSourceRef[] {
+  const refs: AssetSourceRef[] = [];
+  const aspect = videoAspectRatioForSubPostInItem(sp, item);
+  if (sp.assets_strategy.image_source) {
+    refs.push({ src: sp.assets_strategy.image_source, mode: "image" });
+  }
+  if (sp.assets_strategy.carousel_sources) {
+    for (const s of sp.assets_strategy.carousel_sources) {
+      refs.push({ src: s, mode: "image" });
+    }
+  }
+  if (sp.assets_strategy.video_source) {
+    refs.push({ src: sp.assets_strategy.video_source, mode: "video", aspect_ratio: aspect });
+  }
+  return refs;
 }
 
 async function executePlanItem(
@@ -1669,26 +1945,37 @@ async function executePlanItem(
   item: PlanItem,
   prefs: AiPreferences,
 ): Promise<Record<string, unknown>> {
-  // 1. Resolve assets per sub_post IN PARALLEL.
-  let assetResolutions: Array<{
-    sub_post_index: number;
-    asset_ids: number[];
-    credits_consumed: number;
-    ai_results_consumed: number[];
-    error?: string;
-  }>;
+  // 1. Build a fingerprint-keyed promise cache so any AI generation
+  // (or URL upload) requested by multiple sub_posts is performed exactly
+  // once. The cached Promise is reused across consumers, which means a
+  // 9:16 reel cross-posted to IG Reel + FB Reel + TikTok now costs ONE
+  // generation instead of three. Pre-refactor each sub_post resolved its
+  // strategy independently, billing every duplicate generation. Verified
+  // against the VCP 2026-05-21 session where the lunes reel was billed
+  // 3×400 cr instead of 1×400.
+  const resolveCache = new Map<string, Promise<ResolvedAsset>>();
+  const resolveOnce = (ref: AssetSourceRef): Promise<ResolvedAsset> => {
+    const fp = fingerprintAssetSource(ref);
+    let p = resolveCache.get(fp);
+    if (!p) {
+      p = resolveAssetSourceFresh(client, companyId, ref, prefs);
+      resolveCache.set(fp, p);
+    }
+    return p;
+  };
+
+  let assetResolutions: SubPostAssetResolution[];
   try {
     assetResolutions = await Promise.all(
-      item.sub_posts.map(async (sp, idx) => {
+      item.sub_posts.map(async (sp, idx): Promise<SubPostAssetResolution> => {
+        const refs = subPostAssetRefs(sp, item);
         try {
-          const r = await resolveSubPostAssets(client, companyId, sp, prefs);
-          return { sub_post_index: idx, ...r };
+          const resolved = await Promise.all(refs.map(resolveOnce));
+          return { sub_post_index: idx, asset_ids: resolved.map((r) => r.asset_id) };
         } catch (e) {
           return {
             sub_post_index: idx,
             asset_ids: [],
-            credits_consumed: 0,
-            ai_results_consumed: [],
             error: e instanceof Error ? e.message : String(e),
           };
         }
@@ -1705,8 +1992,16 @@ async function executePlanItem(
     };
   }
 
+  // Total credits consumed: sum each UNIQUE cache entry exactly once. The
+  // pre-refactor totals double-counted shared generations because each
+  // sub_post tracked its own consumption.
+  const settledCache = await Promise.allSettled(Array.from(resolveCache.values()));
+  const creditsConsumed = settledCache.reduce(
+    (acc, r) => acc + (r.status === "fulfilled" ? r.value.credits_consumed : 0),
+    0,
+  );
+
   const anyFail = assetResolutions.find((r) => r.error);
-  const creditsConsumed = assetResolutions.reduce((a, r) => a + r.credits_consumed, 0);
   if (anyFail) {
     // List the sub_posts that completed asset resolution successfully along
     // with the asset ids they ended up with. The agent can swap those into
@@ -1718,7 +2013,6 @@ async function executePlanItem(
       .map((r) => ({
         sub_post_index: r.sub_post_index,
         asset_ids: r.asset_ids,
-        credits_consumed: r.credits_consumed,
       }));
     const failedSubPost = item.sub_posts[anyFail.sub_post_index];
     return {
@@ -1735,6 +2029,31 @@ async function executePlanItem(
         succeededSubPostAssets.length > 0
           ? `Sub_post #${anyFail.sub_post_index} failed but ${succeededSubPostAssets.length} other sub_post(s) generated assets successfully (${creditsConsumed} cr already spent). To retry WITHOUT double-billing: (1) call update_content_plan with one replace_sub_post per entry in succeeded_sub_post_assets, swapping assets_strategy to { type: "asset_id", id: <asset_id> } for each completed asset. (2) Separately fix the failing sub_post (e.g. swap to a non-premium video model when blocked_by_plan, change prompt, point at an asset_id). (3) Call execute_content_plan(plan_id, plan_item_slugs: ["${item.slug}"], confirm: true) to retry just this item.`
           : `One sub_post failed to resolve its assets and no other sub_post had completed yet. Fix the failing sub_post with update_content_plan (e.g. change the video model when blocked_by_plan is true on the chosen model) and retry execute_content_plan with plan_item_slugs: ["${item.slug}"] to retry just this item.`,
+    };
+  }
+
+  // Defense in depth: if any sub_post resolved without an error but ended
+  // up with an empty asset_ids list, refuse to create the post. Empty
+  // strategies should be caught by validateLayoutShape upstream, but a
+  // back-compat plan (assets_strategy hand-built around asset_plan only)
+  // or a deleted referenced asset can sneak through. Creating a post
+  // without media on a network that requires media leaves a broken draft
+  // and looks exactly like the FB/IG "copy attached, image missing" bug
+  // reported on 2026-05-21.
+  const emptyAssetsFail = assetResolutions.find((r) => r.asset_ids.length === 0);
+  if (emptyAssetsFail) {
+    const sp = item.sub_posts[emptyAssetsFail.sub_post_index]!;
+    return {
+      slug: item.slug,
+      date: item.date,
+      status: "failed_resolving_assets",
+      error_message: `sub_post[${emptyAssetsFail.sub_post_index}] (${sp.social_network} ${sp.product_type} ${sp.asset_layout}) resolved to zero asset_ids. The assets_strategy is empty or every source resolved to a deleted asset. Refusing to create a post with no media.`,
+      failed_sub_post_index: emptyAssetsFail.sub_post_index,
+      failed_sub_post_network: sp.social_network,
+      failed_sub_post_strategy: sp.assets_strategy,
+      credits_consumed_estimate: creditsConsumed,
+      recovery_suggestion:
+        "Re-check the sub_post's assets_strategy with update_content_plan: confirm image_source / carousel_sources / video_source matches the asset_layout. Re-run execute_content_plan after fixing.",
     };
   }
 
@@ -1775,14 +2094,40 @@ async function executePlanItem(
       NETWORK_FORMAT_COMPATIBILITY[`${sp.social_network}:${sp.product_type}`]?.internal_id ??
       sp.social_network;
     try {
+      // Auto-inject media_product_type for the networks that require it
+      // (IG, FB, YouTube). Followr accepts UPPERCASE singular only. Same
+      // logic as posts.ts/create_post and post-groups.ts/bulk; the
+      // pre-existing branch that omitted media_product_type for
+      // product_type=feed was the root cause of the lunes VCP bug where
+      // IG/FB Reels were rejected with "media product type is invalid"
+      // (lowercase) and also the secondary FB/IG feed bug where the
+      // missing field could leave assets unattached when defaults drifted.
+      const initialPreferences: Record<string, unknown> = NETWORKS_NEEDING_MEDIA_PRODUCT_TYPE.has(
+        sp.social_network,
+      )
+        ? { media_product_type: productTypeToFollowr(sp.product_type) }
+        : {};
+      // Pass through the normalizer for defense in depth: covers the case
+      // where future code paths inject preferences with wrong case (e.g.
+      // YouTube privacy_level uppercase) and would silently 422. Map
+      // SocialNetwork "x" -> NetworkType "twitter" for the lookup.
+      const normalizerNetwork = (sp.social_network === "x" ? "twitter" : sp.social_network) as
+        | "medium"
+        | "pinterest"
+        | "twitter"
+        | "facebook"
+        | "instagram"
+        | "tiktok"
+        | "linkedin"
+        | "youtube"
+        | "threads"
+        | "bluesky";
+      const { normalized: preferences } = normalizePreferences(initialPreferences, normalizerNetwork);
       await client.createPost(group.id, {
         social_network_type: internalNetworkId,
         description: sp.caption_concept,
         assets_ids: resolution.asset_ids,
-        preferences:
-          sp.product_type === "feed"
-            ? {}
-            : { media_product_type: productTypeToFollowr(sp.product_type) },
+        preferences,
       });
       postResults.push({
         sub_post_index: i,
@@ -1822,35 +2167,87 @@ async function executePlanItem(
     };
   }
 
+  // Count unique vs requested asset references so the agent can surface
+  // the savings ("3 sub_posts cross-posted 1 video instead of 3").
+  const totalRequestedSources = item.sub_posts.reduce(
+    (acc, sp) => acc + subPostAssetRefs(sp, item).length,
+    0,
+  );
+  const uniqueAssetGenerations = resolveCache.size;
+
+  // Pre-built user-facing message in plain Spanish without IDs. The
+  // agent should reproduce/adapt this text verbatim to the user; raw IDs
+  // belong inside _internal_* fields below and must NEVER be surfaced.
+  // Discipline reminder: PLANNING_STRATEGY.never_show_internal_ids.
+  const networksCreated = postResults
+    .filter((p) => p.status === "created")
+    .map((p) => displayNetworkName(p.social_network));
+  const networksFailed = postResults
+    .filter((p) => p.status === "failed")
+    .map((p) => displayNetworkName(p.social_network));
+  const reuseLine =
+    uniqueAssetGenerations < totalRequestedSources
+      ? ` Se generaron ${uniqueAssetGenerations} asset${uniqueAssetGenerations === 1 ? "" : "s"} reutilizando entre ${totalRequestedSources - uniqueAssetGenerations} redes adicionales (ahorro de ${totalRequestedSources - uniqueAssetGenerations} generación${totalRequestedSources - uniqueAssetGenerations === 1 ? "" : "es"}).`
+      : "";
+  const userFacingSummary =
+    subPostsFailed === 0
+      ? `Posteo "${item.concept_shared}" del ${item.date} ${item.publish_at_time_local} listo como borrador en ${networksCreated.join(", ")}. Costo: ${creditsConsumed} créditos.${reuseLine}`
+      : `Posteo "${item.concept_shared}" del ${item.date} ${item.publish_at_time_local}: creado para ${networksCreated.join(", ") || "ninguna red"}, falló en ${networksFailed.join(", ")}. Costo: ${creditsConsumed} créditos.${reuseLine}`;
+
   return {
     slug: item.slug,
     date: item.date,
     publish_at_time_local: item.publish_at_time_local,
     status: subPostsFailed === 0 ? "created" : "partially_created",
-    post_group_id: group.id,
+    // Ready-to-show message. Reproduce or paraphrase this; never paste raw
+    // ids into user prose.
+    user_facing_summary: userFacingSummary,
     sub_posts_created: subPostsCreated,
     sub_posts_failed: subPostsFailed,
     sub_post_results: postResults,
     credits_consumed_estimate: creditsConsumed,
-    asset_ids_per_sub_post: assetResolutions.map((r) => ({
+    asset_reuse_summary: {
+      total_requested_sources: totalRequestedSources,
+      unique_resolutions: uniqueAssetGenerations,
+      duplicates_avoided: Math.max(0, totalRequestedSources - uniqueAssetGenerations),
+    },
+    // Internal-only fields. The agent uses these to feed follow-up tool
+    // calls (e.g. update_post_group, list_comments). NEVER mention them
+    // to the user verbatim; refer to the post by concept_shared and date.
+    _internal_post_group_id: group.id,
+    _internal_asset_ids_per_sub_post: assetResolutions.map((r) => ({
       sub_post_index: r.sub_post_index,
       asset_ids: r.asset_ids,
     })),
   };
 }
 
+// Networks where Followr's API requires preferences.media_product_type to be
+// set. Mirrors NETWORKS_NEEDING_MEDIA_PRODUCT_TYPE in posts.ts and post-groups.ts;
+// kept in this module so execute_content_plan does not depend on the standalone
+// tool internals.
+const NETWORKS_NEEDING_MEDIA_PRODUCT_TYPE: ReadonlySet<SocialNetwork> = new Set([
+  "instagram",
+  "facebook",
+  "youtube",
+]);
+
+// Followr's API accepts UPPERCASE singular: FEED | REEL | STORY | SHORT.
+// Lowercase ("reel", "feed") and plurals ("REELS", "SHORTS") return HTTP 422
+// "media product type is invalid". Verified empirically and documented in
+// docs/followr-api/posts.md.
 function productTypeToFollowr(pt: ProductType): string {
   switch (pt) {
     case "feed":
-      return "feed";
+      return "FEED";
     case "reel":
-      return "reel";
+      return "REEL";
     case "story":
-      return "story";
+      return "STORY";
     case "short":
-      return "short";
+      return "SHORT";
     case "long_video":
-      return "feed";
+      return "FEED";
   }
 }
 
@@ -1923,7 +2320,16 @@ interface SubPostCost {
   reuse_count: number;
 }
 
-function estimateSubPostCost(sp: SubPost): SubPostCost {
+/**
+ * Plan-level cost estimate that mirrors execute_content_plan's dedupe
+ * behavior: a fingerprint that appears N times across sub_posts is charged
+ * exactly once. The pre-refactor totals double-counted shared AI
+ * generations, so the user saw "1.200 cr" in the draft for a single video
+ * cross-posted to 3 networks even though execute_content_plan also billed
+ * 1.200 cr (3 separate generations); now both draft AND execute report the
+ * deduped cost ("400 cr"), which is what actually gets charged.
+ */
+function estimatePlanItemCostDeduped(item: PlanItem): SubPostCost {
   const out: SubPostCost = {
     image_ai_cost: 0,
     image_ai_count: 0,
@@ -1932,49 +2338,80 @@ function estimateSubPostCost(sp: SubPost): SubPostCost {
     upload_count: 0,
     reuse_count: 0,
   };
+  const seenFingerprints = new Set<string>();
+  for (const sp of item.sub_posts) {
+    for (const ref of subPostAssetRefs(sp, item)) {
+      const fp = fingerprintAssetSource(ref);
+      if (seenFingerprints.has(fp)) continue;
+      seenFingerprints.add(fp);
 
-  const accumulateImageSource = (src: AssetsStrategy["image_source"] | NonNullable<AssetsStrategy["carousel_sources"]>[number]) => {
-    if (!src) return;
-    if (src.type === "url") out.upload_count += 1;
-    else if (src.type === "asset_id") out.reuse_count += 1;
-    else if (src.type === "ai_generate") {
-      const model = IMAGE_MODELS.find((m) => m.model_id === (src.model ?? "nano_banana_2")) ?? IMAGE_MODELS[0];
-      out.image_ai_count += 1;
-      out.image_ai_cost += model?.cost_per_image ?? 25;
-    }
-  };
-
-  if (sp.assets_strategy.image_source) accumulateImageSource(sp.assets_strategy.image_source);
-  if (sp.assets_strategy.carousel_sources) {
-    for (const s of sp.assets_strategy.carousel_sources) accumulateImageSource(s);
-  }
-  if (sp.assets_strategy.video_source) {
-    const vs = sp.assets_strategy.video_source;
-    if (vs.type === "url") out.upload_count += 1;
-    else if (vs.type === "asset_id") out.reuse_count += 1;
-    else if (vs.type === "ai_generate") {
-      const model = VIDEO_MODELS.find((m) => m.model_id === vs.model);
-      if (model) {
+      const { src, mode } = ref;
+      if (src.type === "url") {
+        out.upload_count += 1;
+      } else if (src.type === "asset_id") {
+        out.reuse_count += 1;
+      } else if (src.type === "ai_generate" && mode === "image") {
+        const imgSrc = src as Extract<ImageSrc, { type: "ai_generate" }>;
+        const m = IMAGE_MODELS.find((x) => x.model_id === (imgSrc.model ?? "nano_banana_2")) ?? IMAGE_MODELS[0];
+        out.image_ai_count += 1;
+        out.image_ai_cost += m?.cost_per_image ?? 25;
+      } else if (src.type === "ai_generate" && mode === "video") {
+        const vidSrc = src as Extract<VideoSrc, { type: "ai_generate" }>;
+        const m = VIDEO_MODELS.find((x) => x.model_id === vidSrc.model);
+        if (m) {
+          out.video_ai_count += 1;
+          const duration = vidSrc.duration_seconds ?? m.default_duration_seconds;
+          out.video_ai_cost += m.cost_per_second * duration;
+        } else {
+          // Unknown model: charge a conservative high estimate so the budget
+          // check catches the upper bound (equivalent to Veo 3 Fast 8s).
+          out.video_ai_count += 1;
+          out.video_ai_cost += 400 * 8;
+        }
+      } else if (src.type === "ai_avatar_lipsync") {
         out.video_ai_count += 1;
-        const duration = vs.duration_seconds ?? model.default_duration_seconds;
-        out.video_ai_cost += model.cost_per_second * duration;
-      } else {
-        // Unknown model; charge conservative high estimate so the budget check
-        // catches it. Equivalent to Veo 3 Fast (3200 cr).
+        out.video_ai_cost += 25 * 12;
+      } else if (src.type === "ai_avatar_video") {
+        const sceneCount = src.scripts.length;
+        const lipsyncCost = 25 * 10 * sceneCount;
+        const backgroundCost = src.generate_backgrounds ? 60 * sceneCount : 0;
         out.video_ai_count += 1;
-        out.video_ai_cost += 400 * 8;
+        out.video_ai_cost += lipsyncCost + backgroundCost;
       }
-    } else if (vs.type === "ai_avatar_lipsync") {
-      // veed_fabric at ~25 cr/sec, average ~12 sec.
-      out.video_ai_count += 1;
-      out.video_ai_cost += 25 * 12;
-    } else if (vs.type === "ai_avatar_video") {
-      // Multi-scene: each scene ~10 sec at 25 cr/sec + backgrounds.
-      const sceneCount = vs.scripts.length;
-      const lipsyncCost = 25 * 10 * sceneCount;
-      const backgroundCost = vs.generate_backgrounds ? 60 * sceneCount : 0;
-      out.video_ai_count += 1;
-      out.video_ai_cost += lipsyncCost + backgroundCost;
+    }
+  }
+  return out;
+}
+
+/**
+ * Map every (item.slug, sub_post_index) to whether its assets are SHARED
+ * with another sub_post in the same plan_item via fingerprint dedupe.
+ * Used by the summary table and preview so the user sees "1 video x 3
+ * networks" instead of three identical rows that look like independent
+ * costs.
+ */
+function computeAssetSharing(plan: ContentPlan): Map<string, { fingerprint: string; share_group: string[] }[]> {
+  const out = new Map<string, { fingerprint: string; share_group: string[] }[]>();
+  for (const item of plan.plan_items) {
+    // Build fingerprint -> list of `{network}#{kind}` consumers within this item.
+    const fpConsumers = new Map<string, string[]>();
+    for (const sp of item.sub_posts) {
+      for (const ref of subPostAssetRefs(sp, item)) {
+        const fp = fingerprintAssetSource(ref);
+        const label = `${displayNetworkName(sp.social_network)} (${ref.mode})`;
+        const list = fpConsumers.get(fp) ?? [];
+        list.push(label);
+        fpConsumers.set(fp, list);
+      }
+    }
+    for (let i = 0; i < item.sub_posts.length; i++) {
+      const sp = item.sub_posts[i] as SubPost;
+      const perSubPost: { fingerprint: string; share_group: string[] }[] = [];
+      for (const ref of subPostAssetRefs(sp, item)) {
+        const fp = fingerprintAssetSource(ref);
+        perSubPost.push({ fingerprint: fp, share_group: fpConsumers.get(fp) ?? [] });
+      }
+      out.set(`${item.slug}#${i}`, perSubPost);
     }
   }
   return out;
@@ -1982,15 +2419,39 @@ function estimateSubPostCost(sp: SubPost): SubPostCost {
 
 function buildSummaryTable(plan: ContentPlan): string[] {
   const lines: string[] = [];
-  lines.push("| Día | Hora | Concepto | Red | Formato | Asset | Costo estimado |");
-  lines.push("|-----|------|----------|-----|---------|-------|----------------|");
+  lines.push("| Día | Hora | Concepto | Red | Formato | Asset | Compartido | Costo estimado |");
+  lines.push("|-----|------|----------|-----|---------|-------|------------|----------------|");
+  const sharing = computeAssetSharing(plan);
   for (const item of plan.plan_items) {
+    // Cost is allocated to the FIRST consumer of a fingerprint within the
+    // plan_item; subsequent consumers display 0 cr and a "↳ comparte con
+    // X" hint. Mirrors execute_content_plan's actual billing.
+    const seenInItem = new Set<string>();
     for (let i = 0; i < item.sub_posts.length; i++) {
       const sp = item.sub_posts[i] as SubPost;
-      const cost = estimateSubPostCost(sp);
-      const totalCost = cost.image_ai_cost + cost.video_ai_cost;
+      const refs = subPostAssetRefs(sp, item);
+      let rowCost = 0;
+      for (const ref of refs) {
+        const fp = fingerprintAssetSource(ref);
+        if (seenInItem.has(fp)) continue;
+        seenInItem.add(fp);
+        if (ref.src.type === "ai_generate" && ref.mode === "image") {
+          const imgSrc = ref.src as Extract<ImageSrc, { type: "ai_generate" }>;
+          const m = IMAGE_MODELS.find((x) => x.model_id === (imgSrc.model ?? "nano_banana_2")) ?? IMAGE_MODELS[0];
+          rowCost += m?.cost_per_image ?? 25;
+        } else if (ref.src.type === "ai_generate" && ref.mode === "video") {
+          const vidSrc = ref.src as Extract<VideoSrc, { type: "ai_generate" }>;
+          const m = VIDEO_MODELS.find((x) => x.model_id === vidSrc.model);
+          rowCost += m ? m.cost_per_second * (vidSrc.duration_seconds ?? m.default_duration_seconds) : 400 * 8;
+        }
+      }
+      const sharingForSubPost = sharing.get(`${item.slug}#${i}`) ?? [];
+      const sharedLabels = sharingForSubPost
+        .filter((s) => s.share_group.length > 1)
+        .map((s) => `con ${s.share_group.length - 1} más`);
+      const sharedCell = sharedLabels.length > 0 ? sharedLabels.join("; ") : "—";
       lines.push(
-        `| ${item.date} | ${item.publish_at_time_local} | ${i === 0 ? item.concept_shared : "↳ (mismo concepto)"} | ${displayNetworkName(sp.social_network)} | ${displayLayout(sp.asset_layout, sp.product_type)} | ${displayAssetStrategy(sp.assets_strategy, sp.asset_layout)} | ${totalCost > 0 ? `${totalCost} cr` : "0 cr"} |`,
+        `| ${item.date} | ${item.publish_at_time_local} | ${i === 0 ? item.concept_shared : "↳ (mismo concepto)"} | ${displayNetworkName(sp.social_network)} | ${displayLayout(sp.asset_layout, sp.product_type)} | ${displayAssetStrategy(sp.assets_strategy, sp.asset_layout)} | ${sharedCell} | ${rowCost > 0 ? `${rowCost} cr` : "0 cr"} |`,
       );
     }
   }
@@ -2043,7 +2504,26 @@ interface NetworkPreview {
   format: string;
   caption_final: string;
   assets: AssetPreview[];
+  asset_fingerprints: string[];
   flags: string[];
+}
+
+/**
+ * Unique asset for a plan_item, with the list of networks that consume it.
+ * Surfaced upfront in the preview so the user sees the asset PLAN before
+ * the per-network breakdown ("1 video 9:16 que se cross-postea a IG, FB y
+ * TikTok" instead of three identical-looking entries).
+ */
+interface SharedAssetPreview {
+  fingerprint: string;
+  preview: AssetPreview;
+  consumed_by: Array<{ network_display: string; format: string }>;
+  // Aspect ratio for videos and orientation hint for images, so the user
+  // sees "9:16 vertical" or "2:3 vertical" right next to the asset
+  // description. This is what the user asked for: explicit asset spec
+  // (kind, aspect, model, cost) in the plan and preview, not buried in
+  // per-network rows.
+  aspect_or_orientation?: string;
 }
 
 interface ItemPreview {
@@ -2056,6 +2536,7 @@ interface ItemPreview {
   rationale: string;
   paired_with: string[];
   networks: NetworkPreview[];
+  asset_plan: SharedAssetPreview[];
   totals: {
     asset_count: number;
     image_ai_count: number;
@@ -2146,11 +2627,6 @@ function buildItemPreview(
 ): ItemPreview {
   const networks: NetworkPreview[] = [];
   const flags: string[] = [];
-  let imageAiCount = 0;
-  let videoAiCount = 0;
-  let uploadCount = 0;
-  let reuseCount = 0;
-  let creditsTotal = 0;
   let maxVideoSeconds = 0;
 
   // Only flag premium-bucket models as plan-blocked when the account actually
@@ -2159,52 +2635,26 @@ function buildItemPreview(
   // status could not be determined (null), skip the flag to avoid misfiring.
   const flagBlockedByPlan = followrPlusEnabled === false;
 
+  // Pre-compute fingerprints and the unique asset plan.
+  const sharedAssetPlan: SharedAssetPreview[] = [];
+  const fpIndex = new Map<string, SharedAssetPreview>();
+
   for (const sp of item.sub_posts) {
     const assets: AssetPreview[] = [];
+    const subPostFingerprints: string[] = [];
     const networkFlags: string[] = [];
+    const refs = subPostAssetRefs(sp, item);
 
-    const checkImagePlanBlock = (a: AssetPreview) => {
-      if (!flagBlockedByPlan || a.kind !== "ai_image" || !a.model) return;
-      const im = IMAGE_MODELS.find((m) => m.model_id === a.model);
-      if (im && im.bucket === "premium") {
-        networkFlags.push(
-          `La imagen usa ${im.display_name} (premium). Esta cuenta no tiene Followr Plus activado y el backend va a rechazar el modelo con "selected model is invalid". Cambiá a nano_banana_2 o z_image_turbo con update_content_plan antes de ejecutar.`,
-        );
-      }
-    };
-
-    if (sp.assets_strategy.image_source) {
-      const a = describeAssetSource(sp.assets_strategy.image_source, "image");
-      assets.push(a);
-      if (a.kind === "ai_image") imageAiCount += 1;
-      else if (a.kind === "url_image") uploadCount += 1;
-      else if (a.kind === "library_image") reuseCount += 1;
-      creditsTotal += a.cost_credits;
-      checkImagePlanBlock(a);
-    }
-    if (sp.assets_strategy.carousel_sources) {
-      for (const s of sp.assets_strategy.carousel_sources) {
-        const a = describeAssetSource(s, "image");
-        assets.push(a);
-        if (a.kind === "ai_image") imageAiCount += 1;
-        else if (a.kind === "url_image") uploadCount += 1;
-        else if (a.kind === "library_image") reuseCount += 1;
-        creditsTotal += a.cost_credits;
-        checkImagePlanBlock(a);
-      }
-    }
-    if (sp.assets_strategy.video_source) {
-      const a = describeAssetSource(sp.assets_strategy.video_source, "video");
-      assets.push(a);
-      if (a.kind === "ai_video") videoAiCount += 1;
-      else if (a.kind === "url_video") uploadCount += 1;
-      else if (a.kind === "library_video") reuseCount += 1;
-      else if (a.kind === "avatar_lipsync" || a.kind === "avatar_video") videoAiCount += 1;
-      creditsTotal += a.cost_credits;
-      if (a.duration_seconds && a.duration_seconds > maxVideoSeconds) {
-        maxVideoSeconds = a.duration_seconds;
-      }
-      if (flagBlockedByPlan && a.model) {
+    const checkPlanBlock = (a: AssetPreview) => {
+      if (!flagBlockedByPlan) return;
+      if (a.kind === "ai_image" && a.model) {
+        const im = IMAGE_MODELS.find((m) => m.model_id === a.model);
+        if (im && im.bucket === "premium") {
+          networkFlags.push(
+            `La imagen usa ${im.display_name} (premium). Esta cuenta no tiene Followr Plus activado y el backend va a rechazar el modelo con "selected model is invalid". Cambiá a nano_banana_2 o z_image_turbo con update_content_plan antes de ejecutar.`,
+          );
+        }
+      } else if (a.kind === "ai_video" && a.model) {
         const vm = VIDEO_MODELS.find((m) => m.model_id === a.model);
         if (vm && vm.bucket === "premium") {
           networkFlags.push(
@@ -2212,19 +2662,112 @@ function buildItemPreview(
           );
         }
       }
+    };
+
+    for (const ref of refs) {
+      const a = describeAssetSource(ref.src, ref.mode);
+      assets.push(a);
+      const fp = fingerprintAssetSource(ref);
+      subPostFingerprints.push(fp);
+      checkPlanBlock(a);
+      if (a.duration_seconds && a.duration_seconds > maxVideoSeconds) {
+        maxVideoSeconds = a.duration_seconds;
+      }
+
+      const consumer = { network_display: displayNetworkName(sp.social_network), format: displayLayout(sp.asset_layout, sp.product_type) };
+      const existing = fpIndex.get(fp);
+      if (existing) {
+        existing.consumed_by.push(consumer);
+      } else {
+        // Aspect/orientation hint. For video we use the resolved aspect
+        // ratio (9:16 for reels/tiktok, 16:9 otherwise). For images we
+        // leave it undefined; the LLM passes orientation via prompt.
+        let aspect: string | undefined;
+        if (ref.mode === "video" && ref.aspect_ratio) aspect = ref.aspect_ratio;
+        const entry: SharedAssetPreview = {
+          fingerprint: fp,
+          preview: a,
+          consumed_by: [consumer],
+        };
+        if (aspect !== undefined) entry.aspect_or_orientation = aspect;
+        fpIndex.set(fp, entry);
+        sharedAssetPlan.push(entry);
+      }
     }
+
     networks.push({
       network: sp.social_network,
       network_display: displayNetworkName(sp.social_network),
       format: displayLayout(sp.asset_layout, sp.product_type),
       caption_final: sp.copy_draft && sp.copy_draft.trim().length > 0 ? sp.copy_draft : sp.caption_concept,
       assets,
+      asset_fingerprints: subPostFingerprints,
       flags: networkFlags,
     });
   }
 
+  // Totals are dedupe-aware (each unique asset counted once). Mirrors
+  // execute_content_plan billing.
+  let imageAiCount = 0;
+  let videoAiCount = 0;
+  let uploadCount = 0;
+  let reuseCount = 0;
+  let creditsTotal = 0;
+  for (const e of sharedAssetPlan) {
+    creditsTotal += e.preview.cost_credits;
+    switch (e.preview.kind) {
+      case "ai_image":
+        imageAiCount += 1;
+        break;
+      case "url_image":
+      case "url_video":
+        uploadCount += 1;
+        break;
+      case "library_image":
+      case "library_video":
+        reuseCount += 1;
+        break;
+      case "ai_video":
+      case "avatar_lipsync":
+      case "avatar_video":
+        videoAiCount += 1;
+        break;
+    }
+  }
+
   if (!plan.use_brand_voice) {
     flags.push("use_brand_voice está en false: los copys finales no van a usar el brand voice prompt aunque esté cargado.");
+  }
+
+  // Quality-upgrade heuristic. Surface a soft suggestion when the asset
+  // plan looks "hero" (rationale hints at launch/promo/key piece) but the
+  // chosen models are the cheapest in their tier. The user can ignore;
+  // not blocking. Only fires when the account has Followr Plus (premium
+  // models are usable). Helps the user discover that "you could pay more
+  // for noticeably better quality on the key piece of the week".
+  const heroKeywords = /(lanzamiento|launch|hero|pieza\s+hero|principal|cinematogr[aá]fico|cinematic|promo\s+clave|drop\s+principal|featured|flagship|destacad[ao])/i;
+  const looksHero = heroKeywords.test(item.rationale + " " + item.concept_shared);
+  if (looksHero && followrPlusEnabled === true) {
+    const lowTierVideo = sharedAssetPlan.some((e) => {
+      if (e.preview.kind !== "ai_video") return false;
+      const vm = VIDEO_MODELS.find((m) => m.model_id === e.preview.model);
+      return vm?.model_id === "veo_3.1_fast" || vm?.model_id === "wan_2.2";
+    });
+    if (lowTierVideo) {
+      flags.push(
+        'El concepto se lee como "hero" pero el video usa un modelo de entrada (veo_3.1_fast). Si querés calidad superior, podés subir a veo_3_fast (~3200 cr/8s) o veo_3.1 (~4800 cr/8s) con update_content_plan. Solo aplica si vale la pena el costo extra.',
+      );
+    }
+    const lowTierImage = sharedAssetPlan.some((e) => {
+      if (e.preview.kind !== "ai_image") return false;
+      const im = IMAGE_MODELS.find((m) => m.model_id === e.preview.model);
+      return im?.model_id === "nano_banana_2" || im?.model_id === "z_image_turbo";
+    });
+    if (lowTierImage) {
+      flags.push(
+        'El concepto se lee como "hero" pero las imágenes usan modelos de entrada. Si querés calidad superior, podés subir a nano_banana_pro (~45 cr) o flux_pro_1.1 (~12 cr) con update_content_plan.',
+      );
+    }
   }
 
   const minGen = imageAiCount > 0 ? 1 : 0;
@@ -2233,6 +2776,7 @@ function buildItemPreview(
     plan,
     item,
     networks,
+    asset_plan: sharedAssetPlan,
     totals: { imageAiCount, videoAiCount, uploadCount, reuseCount, creditsTotal },
     estimatedGenerationMinutes: { min: Math.max(1, Math.round(minGen)), max: Math.max(2, Math.round(maxGen)) },
     flags,
@@ -2248,6 +2792,7 @@ function buildItemPreview(
     rationale: item.rationale,
     paired_with: item.paired_with ?? [],
     networks,
+    asset_plan: sharedAssetPlan,
     totals: {
       asset_count: imageAiCount + videoAiCount + uploadCount + reuseCount,
       image_ai_count: imageAiCount,
@@ -2266,11 +2811,12 @@ function renderMarkdown(args: {
   plan: ContentPlan;
   item: PlanItem;
   networks: NetworkPreview[];
+  asset_plan: SharedAssetPreview[];
   totals: { imageAiCount: number; videoAiCount: number; uploadCount: number; reuseCount: number; creditsTotal: number };
   estimatedGenerationMinutes: { min: number; max: number };
   flags: string[];
 }): string {
-  const { item, networks, totals, estimatedGenerationMinutes, flags } = args;
+  const { item, networks, asset_plan, totals, estimatedGenerationMinutes, flags } = args;
   const lines: string[] = [];
   lines.push(`### ${item.date} a las ${item.publish_at_time_local} (${item.timezone})`);
   lines.push("");
@@ -2280,6 +2826,30 @@ function renderMarkdown(args: {
     lines.push(`**Por qué este post:** ${item.rationale}`);
     lines.push("");
   }
+
+  // Plan de assets: SoT of what gets generated. Listed upfront so the
+  // user sees "1 video 9:16 cross-posteado a IG/FB/TikTok" instead of
+  // three identical-looking entries one per network. This is also what
+  // tells the user "estás pagando POR asset único, no por sub_post":
+  // crucial after the 2026-05-21 incident where 3 identical videos were
+  // billed instead of 1.
+  lines.push(`**Plan de assets (${asset_plan.length} ${asset_plan.length === 1 ? "asset único" : "assets únicos"}):**`);
+  lines.push("");
+  asset_plan.forEach((e, i) => {
+    const aspect = e.aspect_or_orientation ? ` ${e.aspect_or_orientation}` : "";
+    const where = e.consumed_by.map((c) => `${c.network_display} (${c.format})`).join(", ");
+    const reuseTag = e.consumed_by.length > 1 ? ` · reusado en ${e.consumed_by.length} redes` : "";
+    lines.push(`${i + 1}. **${describeAssetKind(e.preview)}${aspect}**${reuseTag}`);
+    lines.push(`   - Va a: ${where}`);
+    if (e.preview.description) {
+      lines.push(`   - Detalle: ${e.preview.description}`);
+    }
+    if (e.preview.reference_image_url) {
+      lines.push(`   - Imagen de referencia: ${e.preview.reference_image_url}`);
+    }
+  });
+  lines.push("");
+
   for (const n of networks) {
     lines.push(`#### ${n.network_display} (${n.format})`);
     lines.push("");
@@ -2287,22 +2857,14 @@ function renderMarkdown(args: {
     lines.push("");
     lines.push(`> ${n.caption_final.replace(/\n/g, "\n> ")}`);
     lines.push("");
-    if (n.assets.length === 1) {
-      const a = n.assets[0]!;
-      lines.push(`**Asset:** ${describeAssetKind(a)}`);
-      lines.push("");
-      lines.push(`${a.description}`);
-      if (a.reference_image_url) {
-        lines.push("");
-        lines.push(`Imagen de referencia: ${a.reference_image_url}`);
-      }
-      lines.push("");
-    } else {
-      lines.push(`**Assets (${n.assets.length}):**`);
-      lines.push("");
-      n.assets.forEach((a, i) => {
-        lines.push(`${i + 1}. ${describeAssetKind(a)}. ${a.description}${a.reference_image_url ? ` (ref: ${a.reference_image_url})` : ""}`);
-      });
+    // Reference assets by their position in the plan. The per-network
+    // section no longer repeats the asset description (that lives in
+    // the Plan de assets block above), it just points to which assets
+    // this sub_post consumes.
+    if (n.asset_fingerprints.length > 0) {
+      const positions = n.asset_fingerprints.map((fp) => asset_plan.findIndex((e) => e.fingerprint === fp) + 1);
+      const positionsLabel = positions.length === 1 ? `el asset #${positions[0]}` : `los assets #${positions.join(", #")}`;
+      lines.push(`**Usa ${positionsLabel} del Plan de assets.**`);
       lines.push("");
     }
     if (n.flags.length > 0) {
@@ -2499,14 +3061,6 @@ async function runValidation(args: {
         continue;
       }
 
-      const cost = estimateSubPostCost(sp);
-      totals.image_ai_cost += cost.image_ai_cost;
-      totals.image_ai_count += cost.image_ai_count;
-      totals.video_ai_cost += cost.video_ai_cost;
-      totals.video_ai_count += cost.video_ai_count;
-      totals.upload_count += cost.upload_count;
-      totals.reuse_count += cost.reuse_count;
-
       if (
         sp.asset_layout === "single_image" &&
         /(carrusel|carousel|comparativa|comparison|múltiples?|multiples?|step.?by.?step|antes\s*\/\s*despu[eé]s|before\s*\/\s*after|\b\d+\s+looks?\b|\b\d+\s+formas?\b|\b\d+\s+tips?\b)/i.test(
@@ -2519,6 +3073,106 @@ async function runValidation(args: {
           sub_post_index: i,
           detail:
             "El rationale o caption sugieren múltiples items pero el asset_layout es single_image. Considerá cambiar a carousel_images.",
+        });
+      }
+
+      // Detect AI video sources whose prompt or sub_post concept implies
+      // multiple distinct items composed into one clip. generate_ai_video_clip
+      // takes a SINGLE reference_image_url; promising "video con los 4
+      // colores" forces the model to hallucinate the colors it cannot
+      // see. The fix is either a carousel of images or a multi-scene
+      // avatar_video. Documented in PLANNING_STRATEGY.video_reference_constraint.
+      const vs = sp.assets_strategy.video_source;
+      if (vs && vs.type === "ai_generate") {
+        const combinedText = (vs.prompt + " " + sp.caption_concept + " " + item.concept_shared + " " + item.rationale).toLowerCase();
+        const multiItemPattern =
+          /(varios?\s+(colores?|productos?|prendas?|modelos?|sabores?|variantes?|opciones?)|m[uú]ltiples?\s+(colores?|productos?|prendas?|items?)|\b[2-9]\s+(colores?|productos?|prendas?|modelos?|sabores?|variantes?)\b|los?\s+\d+\s+(colores?|productos?|prendas?)|combinando\s+(varios?|m[uú]ltiples?|diferentes?))/;
+        if (multiItemPattern.test(combinedText)) {
+          warnings.push({
+            issue: "ai_video_implies_multiple_references",
+            item: item.slug,
+            sub_post_index: i,
+            network: sp.social_network,
+            detail:
+              "El video AI promete mostrar varios productos/colores/variantes en un solo clip, pero generate_ai_video_clip acepta UNA sola reference_image_url. Si el video se ejecuta así, el modelo inventa los items que no tiene como referencia (alucinación). Reemplazá por carousel_images (una imagen por color/producto) o por avatar_video multi-escena donde cada escena lleva su referencia.",
+            resolution_options: [
+              {
+                id: "convert_to_carousel",
+                description:
+                  "Llamar update_content_plan con replace_sub_post: cambiar product_type=feed + asset_layout=carousel_images + carousel_sources con una imagen por color/variante (más fiel al catálogo y más barato). No aplica a TikTok/Reels que sólo aceptan video.",
+              },
+              {
+                id: "switch_to_avatar_video",
+                description:
+                  "Usar generate_avatar_video con una escena por variante; cada escena puede llevar su propia reference_image_url vía scene_reference_images. Mantiene formato video pero sin alucinar productos.",
+              },
+              {
+                id: "narrow_video_concept",
+                description:
+                  "Re-escribir el prompt del video para mostrar UNA sola prenda/color/producto (close-up, try-on, transición sobre la misma) con reference_image_url específica. Restringir el caption_concept para que no prometa lo que el video no muestra.",
+              },
+            ],
+          });
+        }
+      }
+    }
+  }
+
+  // Aggregate plan-level totals using dedupe-aware cost estimate. Each
+  // unique AI generation across a plan_item's sub_posts is counted once,
+  // matching execute_content_plan's actual billing.
+  for (const item of plan_items) {
+    const dedupedCost = estimatePlanItemCostDeduped(item);
+    totals.image_ai_cost += dedupedCost.image_ai_cost;
+    totals.image_ai_count += dedupedCost.image_ai_count;
+    totals.video_ai_cost += dedupedCost.video_ai_cost;
+    totals.video_ai_count += dedupedCost.video_ai_count;
+    totals.upload_count += dedupedCost.upload_count;
+    totals.reuse_count += dedupedCost.reuse_count;
+  }
+
+  // Cross-network: warn when youtube:long_video is in the plan. By policy
+  // we don't propose long_video unless the user explicitly asked or has
+  // pre-recorded video assets. If we DID end up planning long_video,
+  // surface it so the user can confirm intent. Also blocks the obvious
+  // anti-pattern of long_video with ai_generate (AI clips top out at ~8s).
+  for (const item of plan_items) {
+    for (let i = 0; i < item.sub_posts.length; i++) {
+      const sp = item.sub_posts[i] as SubPost;
+      if (sp.social_network !== "youtube" || sp.product_type !== "long_video") continue;
+      const vs = sp.assets_strategy.video_source;
+      if (vs && vs.type === "ai_generate") {
+        blockers.push({
+          issue: "youtube_long_video_with_ai_generate",
+          item: item.slug,
+          sub_post_index: i,
+          detail:
+            "YouTube long_video con assets_strategy.video_source de tipo ai_generate. Los clips AI duran ~8s; no sirven como YouTube long_video. Followr lo va a publicar pero el resultado es un long_video de 8s, no usable.",
+          resolution_options: [
+            {
+              id: "drop_youtube",
+              description:
+                "Eliminar el sub_post de youtube:long_video. No proponer long_video sin que el usuario lo pida explícitamente con video propio (assets_strategy.video_source = { type: 'asset_id' } o 'url').",
+            },
+            {
+              id: "swap_to_youtube_short",
+              description:
+                "Cambiar product_type=short para crear un YouTube Short. Shorts comparten 9:16 con Reels/TikTok y permiten dedupear el video.",
+            },
+            {
+              id: "upload_existing_video",
+              description:
+                "Si el usuario tiene un video largo propio, cargarlo primero con upload_video_from_url y pasar assets_strategy.video_source = { type: 'asset_id', id: <n> }.",
+            },
+          ],
+        });
+      } else {
+        warnings.push({
+          issue: "youtube_long_video_proposed",
+          item: item.slug,
+          sub_post_index: i,
+          detail:
+            "El plan incluye un sub_post YouTube long_video. Por política, long_video no se propone por defecto — confirmá con el usuario que pidió contenido long-form para YouTube esta semana antes de avanzar (ver PLANNING_STRATEGY.youtube_feed_policy).",
         });
       }
     }

@@ -16,9 +16,11 @@ export function registerTagTools(server: McpServer, client: FollowrClient, _opti
 
 PRECONDITION: company_id required. If multiple companies and the user hasn't named one, call list_companies first and ask by name.
 
-USE BEFORE: create_tag (to dedupe by name) and update_post_group with tags_ids (to compute the REPLACE list correctly).
+USE BEFORE: create_tag (to dedupe by name); update_post_group with tags_ids (to compute the REPLACE list correctly); create_autolist (to pick existing_tag_ids vs deciding to create new tags); analyzing autolists (a tag's name + the topics of PostGroups using it are how the agent infers what each Autopilot rule group is "about").
 
-PRESENTING: refer to tags by name, never by id.`,
+PRESENTING: refer to tags by name, never by id.
+
+PARA HISPANOHABLANTES: lista los tags de la company. Cada autolista se filtra por uno o varios tags, asi que sirve para entender de que va cada autolista mirando los nombres.`,
       inputSchema: {
         company_id: z.number().int().positive(),
       },
@@ -51,7 +53,11 @@ PRECONDITION: company_id required. If multiple companies and the user hasn't nam
 
 DEDUPE: prefer find_or_create_tag over create_tag whenever the agent doesn't know if the tag already exists. Creating duplicates clutters the company and can confuse downstream tag-based filters and rule groups.
 
-NAMING: keep tag names short and consistent (no inflections, no emojis unless the user requests). Tag names appear in the Followr UI and on PostGroups.`,
+NAMING: keep tag names short and consistent (no inflections, no emojis unless the user requests). Tag names appear in the Followr UI and on PostGroups.
+
+AUTOLISTS: if the user is creating a brand-new autolist that needs a brand-new tag, prefer create_autolist with new_tags: [{name, color}] over a separate create_tag + create_autolist. The composite tool handles rollback (deletes the tag if the autolist creation fails), whereas the manual two-step flow can leave an orphan tag behind. Use standalone create_tag for tag-only operations (one-off categorization, approval status, etc.).
+
+PARA HISPANOHABLANTES: crear un tag suelto en la company. Si vas a usarlo en una autolista nueva, mejor llamá create_autolist con new_tags inline (hace rollback si falla).`,
       inputSchema: {
         company_id: z.number().int().positive(),
         name: z.string().min(1),
@@ -104,7 +110,13 @@ ACTIVE FLAG: active=false hides the tag from default tag pickers in the Followr 
 
 CRITICAL: Confirm with the user verbatim before calling. State the tag name (not id) and the fact that this is permanent.
 
-BROKEN REFERENCES: PostGroups that referenced this tag keep their tags_ids list pointing to the now-deleted tag id. The dangling reference doesn't crash queries but creates UI inconsistencies. Consider update_tag with active=false as a safer alternative if the user just wants to hide the tag.`,
+BROKEN REFERENCES: PostGroups that referenced this tag keep their tags_ids list pointing to the now-deleted tag id. The dangling reference doesn't crash queries but creates UI inconsistencies. Consider update_tag with active=false as a safer alternative if the user just wants to hide the tag.
+
+AUTOLIST IMPACT: if the tag is currently attached to a RuleGroup (autolist), deleting it leaves the autolist with one fewer filter. The autolist itself is NOT deleted, but it will stop catching PostGroups that only had this tag. Surface this to the user if you detected the link via list_rule_groups before calling.
+
+CLEANUP CONTEXT: appropriate when the user explicitly asks to remove a tag, or when an autolist creation flow rolled back and left an orphan tag the user wants to clean up. NOT appropriate as a casual housekeeping action; always confirm first.
+
+PARA HISPANOHABLANTES: borra un tag permanentemente. Si esta vinculado a una autolista, esta sigue existiendo pero pierde ese filtro. Confirmar verbatim por nombre antes de llamar.`,
       inputSchema: {
         tag_id: z.number().int().positive(),
       },

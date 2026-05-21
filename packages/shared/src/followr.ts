@@ -25,11 +25,14 @@ import type {
   ExternalUser,
   Folder,
   FollowrUser,
+  Iso8601,
   Message,
   PostGroup,
   Product,
   Prompt,
+  Rule,
   RuleGroup,
+  RuleGroupPatch,
   Subscription,
   SubscriptionBalance,
   Tag,
@@ -180,6 +183,8 @@ export class FollowrClient {
       ignoreTags?: string;
       hasRelation?: boolean;
       postsDescription?: string;
+      tagIds?: number[];
+      status?: "pending" | "published" | string;
     },
   ): Promise<PostGroup[]> {
     const query: Query = {
@@ -198,6 +203,14 @@ export class FollowrClient {
     if (options?.ignoreTags !== undefined) query["filter[ignoreTags]"] = options.ignoreTags;
     if (options?.hasRelation !== undefined) query["filter[has_relation]"] = options.hasRelation ? 1 : 0;
     if (options?.postsDescription) query["filter[posts.description]"] = options.postsDescription;
+    if (options?.tagIds?.length) {
+      // Spatie-style multi-id filter. Verified 2026-05-21 in UI sniffing: the
+      // frontend sends `filter[tags.id]=<id>` (single) when one tag, repeated
+      // when multiple. Backend treats array as OR. Convert numbers to strings
+      // because the Query type only accepts string[] for repeated params.
+      query["filter[tags.id]"] = options.tagIds.map((id) => String(id));
+    }
+    if (options?.status) query["filter[status]"] = options.status;
     const result = await this.request<ApiCollection<PostGroup>>(
       "GET",
       `/api/companies/${companyId}/postGroups`,
@@ -361,23 +374,42 @@ export class FollowrClient {
   /**
    * POST /api/ruleGroups.
    *
-   * Body field is `active` (boolean), NOT `is_active`. Earlier versions of
-   * this client used `is_active`, which the backend silently ignored, leaving
-   * the created rule group with `active: null` regardless of caller intent.
-   * Verified empirically 2026-05-17 and fixed.
+   * Body field is `active` (boolean or 0/1; backend accepts both, UI sends 1/0),
+   * NOT `is_active`. Earlier versions of this client used `is_active`, which the
+   * backend silently ignored. Verified empirically 2026-05-17 and fixed.
+   *
+   * Includes optional `tags_ids[]` which associates Tags via many-to-many in a
+   * single call (no separate attach endpoint needed). Confirmed 2026-05-21 via
+   * UI sniffing on VCP (sesión Chrome MCP).
+   *
+   * Backend CONSTRAINT (verified empirically 2026-05-21): a tag may belong to
+   * at most ONE active RuleGroup at a time. Trying to create/activate a group
+   * with a tag already taken by another active group returns 422
+   * { "message": "the same tags applied" }. Callers should preflight by
+   * inspecting list_rule_groups to surface a clear error before the POST.
    */
   async createRuleGroup(body: {
     name: string;
     company_id: number;
-    active?: boolean;
+    active?: boolean | 0 | 1;
     description?: string;
     random_minutes?: number;
+    posts_active_from?: Iso8601 | null;
+    tags_ids?: number[];
   }): Promise<RuleGroup> {
     const result = await this.request<ApiSingle<RuleGroup>>("POST", "/api/ruleGroups", { body });
     return result.data;
   }
 
-  async updateRuleGroup(ruleGroupId: number, patch: Partial<RuleGroup>): Promise<RuleGroup> {
+  /**
+   * PUT /api/ruleGroups/{id}. Accepts partial bodies (PATCH-style semantics)
+   * even though the verb is PUT. Tested 2026-05-21 with `{active: 0}` alone (200).
+   *
+   * `tags_ids` has REPLACE semantics, same as update_post_group. To add a tag
+   * without removing existing ones, fetch current `tags`, compute the union, and
+   * pass the full list.
+   */
+  async updateRuleGroup(ruleGroupId: number, patch: RuleGroupPatch): Promise<RuleGroup> {
     const result = await this.request<ApiSingle<RuleGroup>>("PUT", `/api/ruleGroups/${ruleGroupId}`, {
       body: patch,
     });
@@ -386,6 +418,93 @@ export class FollowrClient {
 
   async deleteRuleGroup(ruleGroupId: number): Promise<void> {
     await this.request<void>("DELETE", `/api/ruleGroups/${ruleGroupId}`);
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // Rules (individual slots inside a RuleGroup)
+  // ──────────────────────────────────────────────────────────
+
+  /**
+   * POST /api/rules. Creates a single timing slot inside a RuleGroup.
+   *
+   * ASYMMETRY: the REQUEST body uses `group_id`, but the RESPONSE (and the
+   * shape returned by list_rule_groups?include=rules) uses `rule_group_id`.
+   * Verified 2026-05-21 via UI sniffing on VCP.
+   *
+   * `time` must be "HH:MM" (no seconds) in UTC. Response normalizes to "HH:MM:SS".
+   *
+   * `day_of_week` is ISO 8601 and REQUIRED: 1=Mon, 2=Tue, ..., 7=Sun.
+   *
+   * ⚠️ HARD CONSTRAINT: `frequency` is locked to the literal `"weekly"`.
+   * The backend accepts `"daily"` and `"monthly"` too, but the Followr web UI
+   * crashes with a TypeError when it tries to render any rule with
+   * `day_of_week == null` (which is what daily and monthly-with-day_of_month
+   * produce). The crash takes down the entire /autopilot/rules page (blank
+   * screen) until the offending rule is deleted via the API. Verified
+   * empirically 2026-05-21 on VCP. The MCP enforces weekly-only at multiple
+   * layers (zod schema, this type, and runtime guards in the tool handlers)
+   * because exposing the other values would silently break the user's UI.
+   * Do NOT relax this until the Followr frontend fixes the day_of_week == null
+   * render path.
+   */
+  async createRule(body: {
+    group_id: number;
+    frequency: "weekly";
+    day_of_week: number;
+    time: string;
+    posts_active_from?: Iso8601 | null;
+  }): Promise<Rule> {
+    if (body.frequency !== "weekly") {
+      throw new Error(
+        `FollowrClient.createRule: frequency must be "weekly". The Followr UI crashes on non-weekly rules; this client refuses to create them.`,
+      );
+    }
+    const result = await this.request<ApiSingle<Rule>>("POST", "/api/rules", { body });
+    return result.data;
+  }
+
+  /**
+   * PUT /api/rules/{id}. Edits a single slot in-place. Accepts partial-PATCH
+   * style body (any subset of frequency, day_of_week, day_of_month,
+   * week_of_month, month, time, posts_active_from).
+   *
+   * Verified empirically 2026-05-21 with `{time: "15:30"}` alone, returns 200
+   * with the full updated Rule. The Followr UI does NOT use this endpoint (it
+   * does delete-and-recreate) but the endpoint exists and works. The MCP
+   * prefers PUT over delete-and-recreate when only a couple of fields change:
+   * 1 round trip vs 2, and preserves the slot id (better for audit / trace).
+   */
+  async updateRule(
+    ruleId: number,
+    patch: {
+      frequency?: "weekly";
+      day_of_week?: number;
+      time?: string;
+      posts_active_from?: Iso8601 | null;
+    },
+  ): Promise<Rule> {
+    // ⚠️ HARD CONSTRAINT same as createRule: frequency may not be set to
+    // anything other than "weekly". See createRule docblock for full
+    // explanation of the Followr UI crash on day_of_week == null rules.
+    if (patch.frequency !== undefined && patch.frequency !== "weekly") {
+      throw new Error(
+        `FollowrClient.updateRule: frequency must be "weekly" (or omitted). The Followr UI crashes on non-weekly rules; this client refuses to update them to any other frequency.`,
+      );
+    }
+    const result = await this.request<ApiSingle<Rule>>("PUT", `/api/rules/${ruleId}`, {
+      body: patch,
+    });
+    return result.data;
+  }
+
+  /**
+   * DELETE /api/rules/{id}. 204 on success. Verified 2026-05-21.
+   *
+   * The UI uses delete-and-recreate for editing slots, but PUT works too (see
+   * updateRule above). Prefer updateRule when only changing a couple of fields.
+   */
+  async deleteRule(ruleId: number): Promise<void> {
+    await this.request<void>("DELETE", `/api/rules/${ruleId}`);
   }
 
   // ──────────────────────────────────────────────────────────
