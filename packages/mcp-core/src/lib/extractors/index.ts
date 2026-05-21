@@ -28,3 +28,15 @@ export type { MenuItem, ExtractMenuOptions } from "./menu.js";
 
 export { extractArticles } from "./articles.js";
 export type { ArticleEntry, ExtractArticlesOptions } from "./articles.js";
+
+export {
+  detectEcommercePlatform,
+  fetchPlatformCatalog,
+  fetchProductsViaSitemap,
+} from "./ecommerce-apis.js";
+export type {
+  EcommercePlatform,
+  FastPathOptions,
+  SitemapFallbackOptions,
+  SitemapFallbackResult,
+} from "./ecommerce-apis.js";

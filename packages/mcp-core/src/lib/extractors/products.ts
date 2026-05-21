@@ -30,7 +30,7 @@ export interface ExtractedProduct {
   /** Absolute URL to the product detail page when discoverable. */
   url: string | null;
   /** Where the entry came from. Useful for diagnostics and dedupe. */
-  source: "json_ld" | "css_selector";
+  source: "json_ld" | "css_selector" | "platform_api" | "sitemap_jsonld";
 }
 
 export interface ExtractProductsOptions {

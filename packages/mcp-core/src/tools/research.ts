@@ -34,6 +34,7 @@ import type { RegisterOptions } from "../index.js";
 import { READ_ONLY } from "../lib/annotations.js";
 import {
   bodyTextExcerpt,
+  detectEcommercePlatform,
   extractArticles,
   extractContact,
   extractImages,
@@ -41,9 +42,12 @@ import {
   extractMenu,
   extractOgMeta,
   extractProducts,
+  fetchPlatformCatalog,
+  fetchProductsViaSitemap,
   parseHtml,
   type ArticleEntry,
   type ContactInfo,
+  type EcommercePlatform,
   type ExtractedProduct,
   type MenuItem,
   type OgMetaResult,
@@ -209,6 +213,8 @@ interface FetchResult {
   status: number;
   body: string;
   truncated: boolean;
+  /** Response headers with lowercased keys. set-cookie values are joined with "; ". */
+  headers: Record<string, string>;
   error?: string;
 }
 
@@ -224,17 +230,25 @@ async function fetchWithBudget(url: string, settings: DepthSettings): Promise<Fe
         Accept: "text/html,application/xhtml+xml",
       },
     });
+    // Capture response headers (lowercased). Used downstream for platform
+    // detection (e.g. Shopify sets link: <https://cdn.shopify.com>; and
+    // _shopify_* cookies).
+    const headers: Record<string, string> = {};
+    res.headers.forEach((value, key) => {
+      const k = key.toLowerCase();
+      headers[k] = headers[k] ? `${headers[k]}; ${value}` : value;
+    });
     if (!res.ok) {
-      return { ok: false, status: res.status, body: "", truncated: false, error: `HTTP ${res.status}` };
+      return { ok: false, status: res.status, body: "", truncated: false, headers, error: `HTTP ${res.status}` };
     }
     // Read up to max_bytes. We stream when available, otherwise read text and truncate.
     const text = await res.text();
     const truncated = text.length > settings.max_bytes;
     const body = truncated ? text.slice(0, settings.max_bytes) : text;
-    return { ok: true, status: res.status, body, truncated };
+    return { ok: true, status: res.status, body, truncated, headers };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    return { ok: false, status: 0, body: "", truncated: false, error: msg };
+    return { ok: false, status: 0, body: "", truncated: false, headers: {}, error: msg };
   } finally {
     clearTimeout(timer);
   }
@@ -495,29 +509,36 @@ export function registerResearchTools(
     "deep_research",
     {
       annotations: READ_ONLY,
-      title: "Deep research on a company website with industry-aware extraction",
-      description: `Fetches the company website, classifies the industry, runs the matching IndustryProfile's extractors, and returns a normalized payload the planning agent uses to ground content plans in the brand's real assets and context.
+      title: "Deep research on a company website: detect industry, extract product images and catalog, menu items, articles or properties (Shopify, WooCommerce, VTEX, generic). Investigar empresa y extraer imágenes y catálogo de marca",
+      description: `Investigar el sitio de una empresa y extraer assets reales (imágenes de catálogo, fotos de productos, lookbook, menu items, articles, properties) para usar como referencia en planes de contenido. The tool fetches the company website, detects ecommerce platform (Shopify, WooCommerce, VTEX), uses documented JSON catalog APIs when available, falls back to sitemap parsing for unrecognized sites, runs industry-specific HTML extractors, classifies the industry from page text, and returns a normalized payload the planning agent uses to ground content plans in the brand's real material.
 
-WHEN TO CALL: at the start of any non-trivial content task (a week of posts, a campaign, a launch). One call per conversation per company is enough; cache the result.
+WHEN TO CALL: al inicio de cualquier tarea de contenido no trivial (a week of posts, a campaign, a launch, a series). Una llamada por conversación por compañía alcanza; cacheá el resultado con el cache_suggestion. Llamar SIEMPRE antes de armar un plan si la marca tiene catálogo visual (moda, comida, retail, real estate) para que los assets generados se parezcan a la marca real y no a fashion-genérico-AI.
+
+EXTRACTION STRATEGY (in priority order):
+1. Ecommerce platform fast-path. Detects Shopify (cdn.shopify.com header, _shopify_* cookie), WooCommerce (meta generator, /wp-json/wc/), VTEX (vtexassets.com, vtexcommerce.com). When matched, hits the platform's documented JSON catalog API (/products.json, /wp-json/wc/store/v1/products, /api/catalog_system/pub/products/search/) for full product data with image arrays in one request.
+2. Sitemap fallback for SPA sites or unrecognized platforms. Reads sitemap_products_*.xml or sitemap.xml, filters product-shaped URLs, fetches the first 4-8 in parallel and extracts JSON-LD Product or og:image+title from each.
+3. HTML CSS extractors per industry profile (products, menu, articles, etc). Runs on the home page and up to 2 profile-suggested sub-paths.
+4. LLM handoff. When 1-3 all fail, returns hints_for_llm_fallback with sitemap_urls_to_try, og_image and next_steps_for_agent. The agent can then WebFetch those URLs manually or ask the user for product URLs to retry with website_url override.
 
 DEPTH MODES:
 - fast: home page only, 5s timeout, 500KB cap, no sub-page crawl. Use when iterating quickly.
-- standard (default): home page + up to 2 profile-suggested sub-paths, 10s timeout, 2MB cap. Recommended.
-- thorough: + sitemap top URLs, 15s timeout, 5MB cap. Use for onboarding a new company.
+- standard (default): home page + up to 2 profile-suggested sub-paths + sitemap fallback for ecommerce when extractors return empty, 10s timeout, 2MB cap. Recommended.
+- thorough: aggressive crawl including sitemap top URLs, 15s timeout, 5MB cap. Use when onboarding a new company.
 
 CLASSIFIER: a heuristic keyword scorer matches the page text against 16 industry profiles plus a generic fallback. When confidence is "ambiguous" the tool returns the top candidates plus signals_for_classification ({title, description, body_excerpt, og_type, social_links_types}) and the LLM client decides. The MCP itself never calls an external LLM for classification.
 
 OUTPUT:
 - detected_industry: id + confidence + reasoning + (when ambiguous) candidates + signals.
 - common: company_name, title, description, language, logo_url, contact (emails, phones), social_links.
-- industry_specific: { industry, data } where data is industry-specific (products, menu_items, latest_articles, properties, etc).
+- industry_specific: { industry, data } where data is industry-specific (products with image_urls, menu_items, latest_articles, properties, etc).
 - content_pillars_inferred: suggested pillars with sample post ideas.
 - sufficiency: complete | partial | thin, with recommendations to enrich data.
-- meta: extractors_succeeded, extractors_failed, parser_used, requires_js_render, duration_ms.
+- hints_for_llm_fallback (only when sufficiency is thin and ecommerce extraction failed): platform_detected, sitemap_urls_to_try, og_image, next_steps_for_agent so the LLM can recover via WebFetch or user prompts.
+- meta: extractors_succeeded, extractors_failed, parser_used, requires_js_render, platform_detected, sitemap_diagnostics, duration_ms.
 - cache_suggestion (optional): when the agent decides to persist the detected industry across conversations, it can append the provided suffix to Company.description via update_company. The MCP does NOT mutate Company itself.
 
 LIMITATIONS:
-- SPA-only sites (Shopify Hydrogen, Next.js CSR-heavy, React without SSR) return mostly empty data in fast / standard. The tool flags requires_js_render in meta; the agent can offer to re-run thorough or ask the user for assets directly.
+- Pure custom SPAs without documented APIs and without a sitemap may still return empty. The tool surfaces hints_for_llm_fallback in that case so the LLM can try its own WebFetch on specific URLs.
 - The classifier works best in es / en. Other languages: the heuristic still runs on universal keywords (most strong keywords have es+en synonyms) but confidence may be lower; the LLM client handles the ambiguous case.`,
       inputSchema: {
         company_id: z.number().int().positive(),
@@ -561,31 +582,120 @@ LIMITATIONS:
         // 3. Fetch home page.
         const fetched = await fetchWithBudget(effectiveUrl, settings);
         if (!fetched.ok) {
-          return ok(buildFetchFailedResult(company, effectiveUrl, fetched.error ?? "unknown", depthMode, startedAt));
+          return ok(
+            buildFetchFailedResult(
+              company,
+              effectiveUrl,
+              fetched.error ?? "unknown",
+              depthMode,
+              startedAt,
+            ),
+          );
         }
 
         const parsed = parseHtml(fetched.body, effectiveUrl);
         const og = extractOgMeta(parsed);
         const spa = detectSpa(parsed);
 
-        // 4. SPA short-circuit: if requires_js_render and we are not in
-        //    thorough mode, return what little we have plus a hint.
-        if (spa.requires_js_render && depthMode !== "thorough") {
-          return ok(buildSpaShortCircuitResult(company, effectiveUrl, parsed, og, spa, depthMode, startedAt));
+        // 4. Ecommerce platform detection + fast-path catalog fetch.
+        //    Many ecommerce sites (Shopify Hydrogen, Next.js Commerce, custom
+        //    React shells) are SPAs at the HTML level but expose stable JSON
+        //    APIs for their catalog. Detecting the platform and hitting that
+        //    API is more reliable than scraping a JS-rendered home and gives
+        //    full image arrays + prices + descriptions in one request.
+        const platform = detectEcommercePlatform(fetched.headers, fetched.body);
+        let platformProducts: ExtractedProduct[] = [];
+        let platformError: string | null = null;
+        if (platform) {
+          try {
+            platformProducts = await fetchPlatformCatalog(platform, effectiveUrl, {
+              timeoutMs: settings.fetch_timeout_ms,
+              maxItems: 30,
+            });
+          } catch (err) {
+            platformError = err instanceof Error ? err.message : String(err);
+          }
         }
 
-        // 5. Classify.
+        // 5. Sitemap probe. Cheap when the site has no sitemap (one 404),
+        //    high-value when the home is SPA but product detail pages are
+        //    SSR (Shopify Hydrogen, most VTEX themes). Only run as a rescue
+        //    for SPA or thorough mode; standard mode with a non-SPA home
+        //    skips this here and runs it again later if extractors fail.
+        let sitemapResult: Awaited<ReturnType<typeof fetchProductsViaSitemap>> | null = null;
+        const sitemapAttemptedEarly =
+          platformProducts.length === 0 && (spa.requires_js_render || depthMode === "thorough");
+        if (sitemapAttemptedEarly) {
+          try {
+            sitemapResult = await fetchProductsViaSitemap(effectiveUrl, {
+              timeoutMs: settings.fetch_timeout_ms,
+              maxProductFetches: spa.requires_js_render ? 8 : 4,
+            });
+          } catch {
+            // best effort; do not surface
+          }
+        }
+
+        // 6. SPA short-circuit ONLY if neither platform nor sitemap rescued
+        //    us. With either of those, the JS-rendered home is irrelevant
+        //    because we already have product data.
+        if (
+          spa.requires_js_render &&
+          depthMode !== "thorough" &&
+          platformProducts.length === 0 &&
+          (sitemapResult?.products.length ?? 0) === 0
+        ) {
+          return ok(
+            buildSpaShortCircuitResult(company, effectiveUrl, parsed, og, spa, depthMode, startedAt, {
+              platform_detected: platform,
+              platform_fast_path_error: platformError,
+              sitemap_urls_found: sitemapResult?.sitemap_urls ?? [],
+              sitemap_diagnostics: sitemapResult?.diagnostics ?? null,
+            }),
+          );
+        }
+
+        // 7. Classify.
         const classification = classifyWithHint(parsed, og, user_industry_hint);
         const profile = getProfile(classification.best.id);
 
-        // 6. Run extractors on the home page.
+        // 8. Run extractors on the home page.
         const { data: home_data, report } = runProfileExtractors(parsed, profile);
 
-        // 7. Strategy 3 fallback: contact + images from home regardless
-        //    of profile so common shapes are always present.
+        // 8.5. Merge fast-path products (platform API + early sitemap rescue).
+        //      Platform entries go first because they have the richest data
+        //      (full image arrays, structured prices). CSS-extracted entries
+        //      are kept only when their name does not duplicate a platform
+        //      entry.
+        const recoveredProducts: ExtractedProduct[] = [
+          ...platformProducts,
+          ...(sitemapResult?.products ?? []),
+        ];
+        if (recoveredProducts.length > 0) {
+          const existing = ((home_data["products"] as unknown[]) ?? []) as ExtractedProduct[];
+          const seen = new Set(recoveredProducts.map((p) => p.name.toLowerCase()));
+          home_data["products"] = [
+            ...recoveredProducts,
+            ...existing.filter((p) => !seen.has(p.name.toLowerCase())),
+          ];
+          const recoveredImgs = recoveredProducts.flatMap((p) => p.image_urls).filter(Boolean);
+          const existingImgs = (home_data["product_images"] as string[] | undefined) ?? [];
+          home_data["product_images"] = Array.from(new Set([...recoveredImgs, ...existingImgs])).slice(0, 60);
+          if (platformProducts.length > 0 && platform) {
+            report.succeeded.push(`products:platform_api:${platform}`);
+          }
+          if ((sitemapResult?.products.length ?? 0) > 0) {
+            report.succeeded.push("products:sitemap_fallback");
+          }
+        }
+        if (platform && platformProducts.length === 0 && platformError) {
+          report.failed.push({ name: `products:platform_api:${platform}`, reason: platformError });
+        }
+
+        // 9. Contact (always; profile-agnostic).
         const contact = extractContact(parsed);
 
-        // 8. Extra page crawl in standard / thorough.
+        // 10. Extra page crawl in standard / thorough.
         const extraPages = await crawlExtraPages(profile, effectiveUrl, settings);
         for (const { parsed: extraParsed } of extraPages) {
           const { data: extraData, report: extraReport } = runProfileExtractors(extraParsed, profile);
@@ -594,7 +704,7 @@ LIMITATIONS:
           report.failed.push(...extraReport.failed);
         }
 
-        // 9. Async strategies (RSS for news_media).
+        // 11. Async strategies (RSS for news_media).
         if (profile.id === "news_media" && og.rss_url) {
           try {
             const articles = await extractArticles(parsed, {
@@ -611,7 +721,46 @@ LIMITATIONS:
           }
         }
 
-        // 10. Build response.
+        // 12. Late sitemap fallback for ecommerce industries when nothing
+        //     else has produced products (and we did not run sitemap earlier
+        //     under the SPA-rescue path).
+        const isEcommerceProfile =
+          profile.id === "ecommerce_fashion" || profile.id === "ecommerce_general";
+        const productsAfterExtractors = ((home_data["products"] as unknown[] | undefined) ?? []).length;
+        if (isEcommerceProfile && productsAfterExtractors === 0 && !sitemapAttemptedEarly) {
+          try {
+            const lateResult = await fetchProductsViaSitemap(effectiveUrl, {
+              timeoutMs: settings.fetch_timeout_ms,
+              maxProductFetches: 8,
+            });
+            if (lateResult.products.length > 0) {
+              home_data["products"] = lateResult.products;
+              const imgs = lateResult.products.flatMap((p) => p.image_urls).filter(Boolean);
+              const existingImgs = (home_data["product_images"] as string[] | undefined) ?? [];
+              home_data["product_images"] = Array.from(
+                new Set([...imgs, ...existingImgs]),
+              ).slice(0, 60);
+              report.succeeded.push("products:sitemap_fallback");
+              sitemapResult = lateResult;
+            } else {
+              report.failed.push({
+                name: "products:sitemap_fallback",
+                reason:
+                  lateResult.sitemap_urls.length > 0
+                    ? `sitemap had ${lateResult.sitemap_urls.length} candidate URLs but none yielded JSON-LD Product or og:image+title`
+                    : "no product sitemap discovered",
+              });
+              sitemapResult = lateResult;
+            }
+          } catch (err) {
+            report.failed.push({
+              name: "products:sitemap_fallback",
+              reason: err instanceof Error ? err.message : String(err),
+            });
+          }
+        }
+
+        // 13. Build response.
         const response = buildFullResult({
           company,
           effectiveUrl,
@@ -626,6 +775,19 @@ LIMITATIONS:
           depthMode,
           startedAt,
           extraPagesCount: extraPages.length,
+          platform,
+          sitemapDiagnostics: sitemapResult?.diagnostics ?? null,
+          llmFallbackHints:
+            productsAfterExtractors === 0 &&
+            isEcommerceProfile &&
+            ((home_data["products"] as unknown[] | undefined) ?? []).length === 0
+              ? {
+                  platform_detected: platform,
+                  sitemap_urls_to_try: sitemapResult?.sitemap_urls ?? [],
+                  next_steps_for_agent:
+                    "MCP no pudo extraer productos automáticamente. Tres opciones para el LLM: (1) WebFetch sobre algunos sitemap_urls_to_try y buscar og:image / JSON-LD Product manualmente; (2) pedir al usuario 2-3 URLs específicas de productos y re-llamar deep_research con website_url override apuntando a una de ellas; (3) seguir con generación AI sin reference_image_url y avisar al usuario explícitamente que los assets no van a parecerse al catálogo real.",
+                }
+              : null,
         });
 
         return ok(response);
@@ -881,7 +1043,14 @@ function buildFetchFailedResult(
       recommendations: [
         "verify the company website URL is correct",
         "ask the user to provide brand assets directly",
+        "try fetching the company sitemap.xml or robots.txt manually with WebFetch; if either is reachable, the home block may be a UA/firewall issue that the LLM can route around",
       ],
+    },
+    hints_for_llm_fallback: {
+      attempted_url: url,
+      error,
+      next_steps_for_agent:
+        "MCP no pudo alcanzar la home page del sitio. Opciones: (1) WebFetch desde el LLM puede tener un UA distinto y atravesar el firewall; intentá fetchear directamente la home, el sitemap.xml o un product URL conocido; (2) pedir al usuario que verifique la URL en Company.website (typo, http vs https, dominio nuevo); (3) pedirle al usuario que pase 2-3 fotos de producto directamente al chat para subirlas con upload_images_from_urls.",
     },
     meta: {
       pages_crawled: [],
@@ -896,6 +1065,13 @@ function buildFetchFailedResult(
   };
 }
 
+interface SpaHints {
+  platform_detected: EcommercePlatform | null;
+  platform_fast_path_error: string | null;
+  sitemap_urls_found: string[];
+  sitemap_diagnostics: { fetched_count: number; extracted_count: number; sitemap_url: string | null } | null;
+}
+
 function buildSpaShortCircuitResult(
   company: Company,
   url: string,
@@ -904,13 +1080,20 @@ function buildSpaShortCircuitResult(
   spa: SpaDetectionResult,
   depth: string,
   startedAt: number,
+  hints: SpaHints,
 ) {
+  const hasSitemapUrls = hints.sitemap_urls_found.length > 0;
+  const nextSteps = hints.platform_detected
+    ? `Site appears to be ${hints.platform_detected} but the catalog API did not return products${hints.platform_fast_path_error ? ` (error: ${hints.platform_fast_path_error})` : ""}. ${hasSitemapUrls ? `The sitemap exposes ${hints.sitemap_urls_found.length} product URLs (see sitemap_urls_to_try). WebFetch a few of them and look for JSON-LD Product or og:image to retrieve real catalog photos.` : "Ask the user for 2-3 product URLs directly; the deep_research tool accepts a website_url override that can point at a specific product page."}`
+    : hasSitemapUrls
+      ? `Home requires JS render, but the sitemap exposes ${hints.sitemap_urls_found.length} product-shaped URLs. WebFetch some of those URLs from sitemap_urls_to_try and read JSON-LD Product or og:image to retrieve catalog photos.`
+      : "Home requires JS render and no usable sitemap was discovered. Ask the user for 2-3 product URLs directly, or for them to drop a few photos into the chat; upload_images_from_urls can ingest them into the asset library.";
   return {
     detected_industry: {
       id: "generic_business" as IndustryId,
       display_name: "Negocio genérico / sin clasificación específica",
       confidence: "low",
-      reasoning: `${spa.reason}. The current depth (${depth}) does not include JS rendering; re-run with depth: thorough to invoke a headless render pipeline.`,
+      reasoning: `${spa.reason}. The current depth (${depth}) does not include JS rendering; re-run with depth: thorough to invoke a deeper crawl.`,
       detection_method: "fallback",
     },
     common: {
@@ -926,11 +1109,19 @@ function buildSpaShortCircuitResult(
     content_pillars_inferred: [],
     sufficiency: {
       score: "thin" as const,
-      missing_for_high_quality_plan: ["JS-rendered content not extracted"],
+      missing_for_high_quality_plan: ["JS-rendered content not extracted, platform fast-path and sitemap fallback also did not yield products"],
       recommendations: [
         "re-run deep_research with depth: thorough",
-        "ask the user for brand assets directly (logo, product photos, copy)",
+        "follow hints_for_llm_fallback.next_steps_for_agent below to recover catalog imagery via WebFetch or user upload",
       ],
+    },
+    hints_for_llm_fallback: {
+      platform_detected: hints.platform_detected,
+      platform_fast_path_error: hints.platform_fast_path_error,
+      sitemap_urls_to_try: hints.sitemap_urls_found,
+      sitemap_diagnostics: hints.sitemap_diagnostics,
+      og_image: og.og_image ?? null,
+      next_steps_for_agent: nextSteps,
     },
     meta: {
       pages_crawled: [url],
@@ -960,6 +1151,13 @@ interface BuildFullResultInput {
   depthMode: "fast" | "standard" | "thorough";
   startedAt: number;
   extraPagesCount: number;
+  platform: EcommercePlatform | null;
+  sitemapDiagnostics: { fetched_count: number; extracted_count: number; sitemap_url: string | null } | null;
+  llmFallbackHints: {
+    platform_detected: EcommercePlatform | null;
+    sitemap_urls_to_try: string[];
+    next_steps_for_agent: string;
+  } | null;
 }
 
 function buildFullResult(input: BuildFullResultInput) {
@@ -1009,6 +1207,11 @@ function buildFullResult(input: BuildFullResultInput) {
     industry_specific: { industry: input.profile.id, data: input.data } as IndustrySpecificData,
     content_pillars_inferred: inferContentPillars(input.profile, input.data),
     sufficiency: scoreSufficiency(input.profile, input.data, input.report),
+    ...(input.llmFallbackHints
+      ? {
+          hints_for_llm_fallback: input.llmFallbackHints,
+        }
+      : {}),
     meta: {
       pages_crawled: [input.effectiveUrl],
       duration_ms: Date.now() - input.startedAt,
@@ -1019,6 +1222,8 @@ function buildFullResult(input: BuildFullResultInput) {
       depth: input.depthMode,
       effective_url: input.effectiveUrl,
       extra_pages_crawled: input.extraPagesCount,
+      platform_detected: input.platform,
+      sitemap_diagnostics: input.sitemapDiagnostics,
     },
     cache_suggestion: {
       field: "description",
