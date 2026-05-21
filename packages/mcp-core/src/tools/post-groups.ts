@@ -5,6 +5,7 @@ import { z } from "zod";
 import type { RegisterOptions } from "../index.js";
 import { DESTRUCTIVE, MUTATION, READ_ONLY } from "../lib/annotations.js";
 import { toolError, toolErrorFromException } from "../lib/tool-error.js";
+import { normalizePreferences } from "../lib/normalize-preferences.js";
 import { gatherRuntimeContext } from "../specs/runtime-context.js";
 import type { NetworkType, ProductType, SpecWarning } from "../specs/types.js";
 import { validateAgainstSpec } from "../specs/validate.js";
@@ -485,19 +486,23 @@ RETURNS: { post_group, posts: Post[], validation: { warnings_by_post: SpecWarnin
         const runtimeContextByNetwork = new Map<NetworkType, Awaited<ReturnType<typeof gatherRuntimeContext>>>();
         const warningsByPost: SpecWarning[][] = [];
         const mergedPreferencesByPost: Record<string, unknown>[] = [];
+        const normalizationNoticesByPost: string[][] = [];
         for (const post of input.posts) {
           let ctx = runtimeContextByNetwork.get(post.social_network_type);
           if (!ctx) {
             ctx = await gatherRuntimeContext(input.company_id, post.social_network_type, client);
             runtimeContextByNetwork.set(post.social_network_type, ctx);
           }
-          const mergedPreferences: Record<string, unknown> = { ...(post.preferences ?? {}) };
+          let mergedPreferences: Record<string, unknown> = { ...(post.preferences ?? {}) };
           if (
             BULK_NETWORKS_NEEDING_MEDIA_PRODUCT_TYPE.has(post.social_network_type) &&
             !("media_product_type" in mergedPreferences)
           ) {
             mergedPreferences["media_product_type"] = BULK_PRODUCT_TYPE_TO_FOLLOWR[post.product_type];
           }
+          const normalized = normalizePreferences(mergedPreferences, post.social_network_type);
+          mergedPreferences = normalized.normalized;
+          normalizationNoticesByPost.push(normalized.notices);
           mergedPreferencesByPost.push(mergedPreferences);
           const warnings = validateAgainstSpec(
             {
@@ -589,6 +594,7 @@ RETURNS: { post_group, posts: Post[], validation: { warnings_by_post: SpecWarnin
           }),
         );
 
+        const allNotices = normalizationNoticesByPost.flat();
         return {
           content: [
             {
@@ -600,6 +606,9 @@ RETURNS: { post_group, posts: Post[], validation: { warnings_by_post: SpecWarnin
                   validation: {
                     warnings_by_post: warningsByPost,
                     total_warnings: warningsByPost.reduce((acc, w) => acc + w.length, 0),
+                    ...(allNotices.length > 0
+                      ? { preference_normalization_notices: allNotices }
+                      : {}),
                   },
                   runtime_context_by_network: Object.fromEntries(runtimeContextByNetwork),
                 },

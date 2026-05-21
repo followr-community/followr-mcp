@@ -5,6 +5,7 @@ import { z } from "zod";
 import type { RegisterOptions } from "../index.js";
 import { MUTATION } from "../lib/annotations.js";
 import { toolError, toolErrorFromException } from "../lib/tool-error.js";
+import { normalizePreferences } from "../lib/normalize-preferences.js";
 import { gatherRuntimeContext } from "../specs/runtime-context.js";
 import type { NetworkType, ProductType, SpecWarning } from "../specs/types.js";
 import { validateAgainstSpec } from "../specs/validate.js";
@@ -129,7 +130,18 @@ Once a video asset id is available, then call create_post with assets=[{id, type
         preferences: z
           .record(z.string(), z.unknown())
           .optional()
-          .describe("Network-specific extras passed through to Followr. e.g. board_id (Pinterest), privacy_level + duet_disabled (TikTok), category_id (YouTube), notify_followers (IG). media_product_type is auto-injected from product_type for IG/FB/YouTube if not already set."),
+          .describe(
+            "Network-specific extras passed through to Followr. Case-sensitive — Followr rejects subtle wrong forms with HTTP 422.\n" +
+              "CANONICAL VALUES (the MCP auto-corrects the unambiguous ones and emits notices in the response):\n" +
+              "- media_product_type (IG, FB, YouTube): UPPERCASE singular. FEED | REEL | STORY | SHORT. Plurals like REELS/SHORTS return 422. Auto-injected from product_type if you do not pass it.\n" +
+              "- privacy_level (YouTube): lowercase. public | unlisted | private. Uppercase returns 422.\n" +
+              "- privacy_level (TikTok): UPPERCASE with underscores. PUBLIC_TO_EVERYONE | MUTUAL_FOLLOW_FRIENDS | SELF_ONLY | FOLLOWER_OF_CREATOR. The allowed set varies per account; call validate_against_specs to discover the live options.\n" +
+              "- category_id (YouTube): STRING, not number. \"22\" not 22. Numbers return 422.\n" +
+              "- board_id (Pinterest): required for Pinterest posts. Numeric board id.\n" +
+              "- disable_duet / disable_comment / disable_stitch (TikTok): boolean.\n" +
+              "- brand_content_toggle / brand_organic_toggle (TikTok): boolean.\n" +
+              "- notify_followers (IG): boolean (1/0 also accepted by the API).",
+          ),
         comments_to_create: z
           .array(z.unknown())
           .optional()
@@ -147,14 +159,23 @@ Once a video asset id is available, then call create_post with assets=[{id, type
       // 1. Gather runtime context (Twitter verified, TikTok tier) with cache
       const context = await gatherRuntimeContext(input.company_id, input.social_network_type, client);
 
-      // 2. Build merged preferences (auto-inject media_product_type where needed)
-      const mergedPreferences: Record<string, unknown> = { ...(input.preferences ?? {}) };
+      // 2. Build merged preferences (auto-inject media_product_type where
+      // needed) and run quirk normalization so the Followr API never sees
+      // wrong case / plural / wrong primitive type. Sources of error:
+      //   - LLM passes "reel" lowercase from memory (Followr expects REEL).
+      //   - LLM passes UPPERCASE YouTube privacy_level (Followr expects lower).
+      //   - LLM passes number for category_id (Followr expects string).
+      // The normalizer auto-corrects unambiguous cases and emits notices we
+      // surface in the response so the user/agent learns the canonical form.
+      let mergedPreferences: Record<string, unknown> = { ...(input.preferences ?? {}) };
       if (
         NETWORKS_NEEDING_MEDIA_PRODUCT_TYPE.has(input.social_network_type) &&
         !("media_product_type" in mergedPreferences)
       ) {
         mergedPreferences["media_product_type"] = PRODUCT_TYPE_TO_FOLLOWR[input.product_type];
       }
+      const normalized = normalizePreferences(mergedPreferences, input.social_network_type);
+      mergedPreferences = normalized.normalized;
 
       // 3. Run validation (uses merged preferences so the validator sees what Followr sees)
       const warnings = validateAgainstSpec(
@@ -230,13 +251,16 @@ Once a video asset id is available, then call create_post with assets=[{id, type
 
       const post = await client.createPost(input.post_group_id, body);
 
-      // 5. Return post + warnings
+      // 5. Return post + warnings + preference normalization notices
       const response = {
         post,
         validation: {
           warning_count: warnings.length,
           warnings,
           runtime_context: context,
+          ...(normalized.notices.length > 0
+            ? { preference_normalization_notices: normalized.notices }
+            : {}),
         },
       };
       return {

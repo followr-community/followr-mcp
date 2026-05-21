@@ -953,7 +953,9 @@ PRECONDITION: company_id required. If multiple companies and the user hasn't nam
 
 LATENCY: 2-15 minutes depending on the model. Default timeout 1200s (20 min). Set the user's expectation.
 
-IMAGE-TO-VIDEO: image_url is OPTIONAL. Pass it to seed the clip with a reference frame (image-to-video mode). Empirical per-model support is not yet verified; if a model rejects image_url the call will fail and the agent should retry without it. Do not promise the user a specific reference-fidelity outcome.`,
+IMAGE-TO-VIDEO: image_url is OPTIONAL and takes EXACTLY ONE URL. Pass it to seed the clip with a reference frame (image-to-video mode). Empirical per-model support is not yet verified; if a model rejects image_url the call will fail and the agent should retry without it. Do not promise the user a specific reference-fidelity outcome.
+
+NEVER HALLUCINATE MULTI-REFERENCE COMPOSITES: there is no composite mode for AI video. If the user asks for "a clip with all 4 colors of the hoodie" or "a video combining 3 products", the single image_url cannot anchor the missing items; the model will invent them. Refuse to plan that as a single AI clip and propose: (a) a carousel of images, one per item, on networks that accept it, (b) generate_avatar_video with multi-scene where each scene takes its own reference, or (c) restrict the clip to ONE item with its own reference. Surface the constraint to the user before generating; do not silently produce hallucinated frames.`,
       inputSchema: {
         company_id: z.number().int().positive(),
         prompt: z.string().min(1).describe("Visual prompt describing the single scene to generate. Keep it focused on ONE moment / action / shot — these models render ~8 seconds of video. See PROMPT DESIGN FOR ~8 SECONDS in the tool description."),

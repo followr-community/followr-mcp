@@ -528,6 +528,34 @@ export const PLANNING_STRATEGY = {
       "Promising 'carousel' in the rationale or caption_concept and then passing a single asset. The validator surfaces a warning, but it's wasteful to round-trip: match asset_layout to the concept from the start. The real failure from a past VCP session: 'Carrusel mostrando los modelos Jean Baggy Kamu VT1, Jean Cargo Volt y variantes' planned, then executed as feed_image with 1 asset, leaving an incoherent post.",
   },
 
+  video_reference_constraint:
+    "AI video generation (generate_ai_video_clip / assets_strategy.video_source ai_generate) accepts exactly ONE reference_image_url. There is no multi-image composite mode. If the rationale or caption_concept mentions composing several products/colors/items into a single video (e.g. 'video con los 4 colores del buzo', 'video combinando las 3 prendas', 'showcase de la línea completa en un clip'), do NOT plan it as a single AI video: the model will invent the missing items from text alone, which is hallucination. Use one of these instead: (a) carousel_images on networks that accept it, with one image per item/color (cheaper and faithful to the catalog), (b) avatar_video multi-scene where each scene shows a different item with its own reference, (c) single AI video showing ONE product close-up with the brand's real photo as reference. Never imply the user will see all variants in one AI clip unless every variant has its own ai_generate sub_post.",
+
+  video_aspect_priority_policy:
+    "When a plan_item contains MULTIPLE AI-generated videos (one per network), execute_content_plan resolves a SINGLE shared aspect ratio for the whole plan_item so the videos dedupe and the user is billed once. Priority used to pick that aspect:\n" +
+    "- P1 (forces 9:16 vertical): TikTok, Instagram (feed/reel/story), Facebook (feed/reel/story), YouTube Short. These are video-native and vertical-first.\n" +
+    "- P2 (forces 16:9 horizontal): LinkedIn. Horizontal-first, desktop-heavy audience.\n" +
+    "- P3 (flexible, follows whichever priority is present): X / Twitter, Threads, Pinterest, Bluesky. Default to 9:16 when alone.\n" +
+    "- Exception: YouTube long_video stays 16:9 regardless of the plan_item context. Coupling a long_video to a 9:16 reel would break the long-form layout. Do NOT include YouTube long_video in the same plan_item as a P1 reel hoping to share the asset; it cannot share.\n\n" +
+    "PRACTICAL CONSEQUENCES for the agent:\n" +
+    "1. When proposing a cross-network reel (IG Reel + FB Reel + TikTok), describe the asset as 9:16 vertical even if LinkedIn is added later; LinkedIn auto-couples down.\n" +
+    "2. When proposing a LinkedIn-only or LinkedIn + X video plan_item, the asset will be 16:9. Mention this so the user understands why.\n" +
+    "3. When a plan_item mixes a 9:16 P1 reel with a LinkedIn video that the user explicitly wants horizontal (e.g. a recorded talking-head), the agent must split into TWO plan_items so they keep their natural aspect ratios; the same plan_item cannot serve both.\n" +
+    "4. If the user explicitly overrides ('quiero el video de LinkedIn en 16:9 aunque el de IG sea 9:16'), respect the override by splitting into two plan_items. The priority policy is an optimization default, not a hard rule.",
+
+  youtube_feed_policy:
+    "YouTube long_video (the youtube:long_video slot in the compatibility matrix) is a long-form publishing pipeline, NOT a cross-postable surface. DO NOT propose YouTube long_video in any plan_item unless:\n" +
+    "(a) the user explicitly asks for long-form YouTube content for the week, or\n" +
+    "(b) the user mentions they have pre-recorded long videos ready to upload (then assets_strategy.video_source = { type: 'asset_id', id } or 'url', NEVER 'ai_generate' — AI video clips top out at ~8 seconds and would be unwatchable as YT feed content).\n" +
+    "YouTube Short is FINE to propose: it shares the 9:16 reel aspect with TikTok and IG/FB Reel, so it amortizes the same generation cost. When the user is opted in to YouTube Short, treat it as a P1 network and include it in the cross-post reel slot.\n" +
+    "If the agent is unsure whether to include YouTube at all, default to: include youtube:short when the brand is video-native and shipping reels; OMIT youtube:long_video unless asked.",
+
+  never_show_internal_ids:
+    "User-facing messages NEVER mention internal Followr ids: post_group_id, asset_id, ai_result_id, company_id, prompt_id, tag_id, folder_id, rule_group_id, avatar_id, voice_id. The user does not care about ids and they make the agent sound like it is reading from a database. Refer to entities by name or by humanized description instead: 'el posteo del lunes' (not 'PostGroup 709047'), 'el video del fit check' (not 'asset 990941'), 'la marca VCP' (not 'company 7'). Internal ids may appear in the tool return JSON; treat those as data the agent uses to call the next tool, NOT as something to surface verbatim in user prose.",
+
+  quality_upgrade_check:
+    "Before drafting, scan the rationale and concept_shared of each plan_item for 'hero' signals: launch, hero piece, drop principal, key promo, featured, flagship, cinematic. For those items default to a higher-tier model than the platform baseline: image -> nano_banana_pro (45 cr) or flux_pro_1.1 (12 cr) instead of nano_banana_2 (25 cr); video -> veo_3_fast (~3200 cr/8s) or veo_3.1 (~4800) instead of veo_3.1_fast (~400). For the rest of the week (regular feed posts, lifestyle, recurring promos), the cheaper default is correct. After drafting, SURFACE the model choices to the user one-line per hero item: 'Para la pieza hero del viernes usé veo_3.1 (~4800 cr); si querés bajar a veo_3_fast (~3200) lo ajusto'. The user is the final arbiter of quality vs cost. Do not silently upgrade every item.",
+
   brand_voice_handling:
     "If brand_context.voice_prompt_missing is true at this point, surface that BEFORE drafting the plan: offer to either (a) create a brand-voice prompt from the company's best-performing posts via create_prompt (recommended for any meaningful campaign), or (b) proceed with Followr default voice. Do not draft 7 posts with default voice and only mention this at the end of the plan.",
 
@@ -562,8 +590,9 @@ export const PLANNING_STRATEGY = {
         minimum_floor: "No reel-equivalent; X is text-first with image support.",
       },
       youtube: {
-        target_5_to_7_posts: { short: "1-2 per week if used", long_video: "opt-in" },
-        minimum_floor: "Only plan YouTube when the brand has been asked or is video-native.",
+        target_5_to_7_posts: { short: "1-2 per week when included as a cross-post of the IG/TikTok reel asset", long_video: "OFF by default, opt-in only" },
+        minimum_floor:
+          "youtube:short is FINE to propose as cross-post of the P1 9:16 reel asset (zero extra cost, shares the same generation). youtube:long_video is OFF by default: never propose it in a plan_item unless the user explicitly asked for long-form YouTube content this week OR mentioned they have pre-recorded long videos ready (in which case use assets_strategy.video_source = { type: 'asset_id' } or 'url', NEVER 'ai_generate' — AI clips top out at ~8s).",
       },
     },
     cross_post_default:

@@ -38,6 +38,7 @@ Followr MCP manages content creation and scheduling across multiple companies. A
 
    ANTI-PATTERNS (real examples from past sessions, do NOT do this):
    - "Mapeo de assets: Campera Tejida ID Negra -> 989640, Jean Baggy -> 989643" -> bad; user does not care about ids. Just say "subí las 7 imágenes a la biblioteca: Campera Tejida ID Negra, Jean Baggy, ...".
+   - "TikTok: post creado OK (asset ID 990941). Republicar manualmente con los assets que ya están subidos (IDs 990940 y 990943)" -> bad (VCP 2026-05-21). Say "el video de TikTok ya quedó como borrador. Los videos para Instagram y Facebook también se generaron y están en tu biblioteca; los podés republicar desde la app refiriéndote a los assets del fit check del lunes".
    - "Avatar VCP Model creado (id 296). Voz creada (id 405)" -> bad. Say "Listo el avatar VCP Model con su voz asignada".
    - "Modelo veo_3.1_fast: 50 créditos | Modelo veo_3_fast: 400 créditos" -> bad. Say "Tres opciones de calidad: Económica (~400 cr/clip de 8s), Recomendada (~3200), Premium (~4800). Te recomiendo la Recomendada para promos reales en redes."
    - "Scheduled for 2026-05-20T17:00:00Z (publish_at)" -> bad. Say "Programado para miércoles 20/5 a las 14:00 Buenos Aires."
