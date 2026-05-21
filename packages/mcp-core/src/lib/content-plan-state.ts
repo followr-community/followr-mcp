@@ -105,7 +105,7 @@ export interface AssetPlan {
   reference_asset_ids?: number[];
   /** URL of the product detail page on the company website, for traceability. */
   source_website_product_url?: string;
-  /** Recommended model id (e.g. "nano_banana_2", "veo_3_1_fast"). */
+  /** Recommended model id (e.g. "nano_banana_2", "veo_3.1_fast"). */
   model_recommendation?: string;
   /** How confident the agent is in this plan; surfaces during validation as a soft warning when low. */
   confidence_level?: "high" | "medium" | "low";

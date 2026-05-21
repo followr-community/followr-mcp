@@ -112,12 +112,15 @@ function aiBudgetHandler(client: FollowrClient) {
     // Resolve plan + addons (best-effort, never blocks the response).
     const { plan, addons } = await resolvePlanAndAddons(client, balance);
 
-    // Model recommendations, plan-aware.
+    // Model recommendations, plan-aware. IDs use Followr's canonical format:
+    // dots for major.minor versions (veo_3.1_fast, wan_2.2) and no separator
+    // for some (hailuo_02_*). Underscored variants like veo_3_1_fast do NOT
+    // exist in Followr and return 422 "selected model is invalid".
     const imageDefault = "nano_banana_2";
-    const videoDefault = followrPlusEnabled ? "veo_3_1_fast" : "wan_2";
+    const videoDefault = followrPlusEnabled ? "veo_3.1_fast" : "wan_2.2";
     const modelNote = followrPlusEnabled
-      ? "The user can use any AI model. Default to nano_banana_2 for image and veo_3_1_fast for video. If the user asks for higher video quality, the recommended ladder is veo_3_fast then veo_3_1 then veo_3 (confirm cost with the user before veo_3)."
-      : "The user has premium models blocked on the current plan. Default to nano_banana_2 for image and wan_2 for video. If the user requests a premium model (nano_banana_pro, gpt_image_2, the Veo set), do NOT attempt the call; explain the plan limitation and direct the user to the Followr web to activate the Followr Plus add-on. The MCP cannot activate add-ons.";
+      ? "The user can use any AI model. Default to nano_banana_2 for image and veo_3.1_fast for video. If the user asks for higher video quality, the recommended ladder is veo_3_fast then veo_3.1 then veo_3 (confirm cost with the user before veo_3)."
+      : "The user has premium models blocked on the current plan. The ONLY models accessible without Followr Plus are: nano_banana_2 and z_image_turbo for image, wan_2.2 for video. Any other model (nano_banana_pro, gpt_image_2, imagen4_*, ideogram_v3, flux_pro_1.1, all Veo, all SeeDance, all Hailuo) returns HTTP 422 'selected model is invalid'. Do NOT attempt those calls; explain the plan limitation and direct the user to the Followr web to activate the Followr Plus add-on. The MCP cannot activate add-ons.";
 
     const wrapped = {
       summary: `Plan: ${plan.label} (${plan.family}). Text: ${balance.words_spent}/${balance.words_allowed}. Image and video (shared): ${balance.images_spent}/${balance.images_allowed}. Storage: ${(bytesSpent / 1e9).toFixed(2)}GB / ${(balance.bytes_allowed / 1e9).toFixed(2)}GB. Followr Plus: ${followrPlusEnabled ? "yes" : "no"}.`,

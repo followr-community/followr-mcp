@@ -38,6 +38,12 @@ import type { AiPreferences } from "@followr-mcp/shared";
  *
  * If you add a model to the catalog, add it here too.
  */
+// IMPORTANT: keys MUST match the model IDs Followr actually accepts. Followr
+// uses dots for major.minor versions (veo_3.1_fast, wan_2.2, seedance_1.1_*,
+// seedance_2.0_*) and NO separator for some (hailuo_02_*). Verified
+// empirically against /api/aiResults responses on 2026-05-20. Underscored
+// version variants like veo_3_1_fast do NOT exist in Followr and trigger
+// HTTP 422 "selected model is invalid".
 export const MODEL_DRIVER_HINTS: Record<string, string> = {
   // Image models
   nano_banana_2: "fal",
@@ -45,22 +51,22 @@ export const MODEL_DRIVER_HINTS: Record<string, string> = {
   imagen4_preview: "fal",
   imagen4_preview_fast: "fal",
   ideogram_v3: "fal",
-  flux_pro_1_1: "fal",
+  "flux_pro_1.1": "fal",
   z_image_turbo: "fal",
   // gpt_image_2: deliberately omitted, let backend infer (probably "openai")
 
   // Video models
-  veo_3_1_fast: "fal",
+  "veo_3.1_fast": "fal",
   veo_3_fast: "fal",
-  veo_3_1: "fal",
+  "veo_3.1": "fal",
   veo_3: "fal",
-  wan_2: "fal",
-  seedance_1_1_light: "fal",
-  seedance_1_1_pro: "fal",
-  seedance_2_0_fast: "fal",
-  seedance_2_0: "fal",
-  hailuo_0_2_standard: "fal",
-  hailuo_0_2_premium: "fal",
+  "wan_2.2": "fal",
+  "seedance_1.1_light": "fal",
+  "seedance_1.1_pro": "fal",
+  "seedance_2.0_fast": "fal",
+  "seedance_2.0": "fal",
+  hailuo_02_standard: "fal",
+  hailuo_02_premium: "fal",
 };
 
 export type Modality = "image" | "video" | "text" | "audio";

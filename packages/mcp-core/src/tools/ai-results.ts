@@ -898,18 +898,23 @@ Shape detail: each transition is encoded as a video-element-scoped block inside 
   // Catalog is hardcoded because the backend does not yet expose a models
   // listing endpoint (see docs/followr-api/_gaps.md). When that lands, swap
   // the enum for a free string and add a list_ai_video_models tool.
+  // Model IDs match Followr's canonical format (verified empirically against
+  // /api/aiResults responses 2026-05-20). Followr uses dots for major.minor
+  // (veo_3.1_fast, wan_2.2, seedance_1.1_*, seedance_2.0_*) and no separator
+  // for some (hailuo_02_*). Older underscore variants like veo_3_1_fast do
+  // NOT exist in Followr and trigger HTTP 422 "selected model is invalid".
   const AI_VIDEO_MODEL_ENUM = [
-    "veo_3_1_fast",
+    "veo_3.1_fast",
     "veo_3_fast",
-    "veo_3_1",
+    "veo_3.1",
     "veo_3",
-    "wan_2",
-    "seedance_1_1_light",
-    "seedance_1_1_pro",
-    "seedance_2_0_fast",
-    "seedance_2_0",
-    "hailuo_0_2_standard",
-    "hailuo_0_2_premium",
+    "wan_2.2",
+    "seedance_1.1_light",
+    "seedance_1.1_pro",
+    "seedance_2.0_fast",
+    "seedance_2.0",
+    "hailuo_02_standard",
+    "hailuo_02_premium",
   ] as const;
 
   server.registerTool(
@@ -928,12 +933,14 @@ WHAT THIS IS NOT:
 
 COST MODEL (verified 2026-05-20): Followr charges PER SECOND of generated video, not per clip. Since Veo models produce ~8-second clips, multiply the per-second rate by 8 to estimate the cost per clip. Do NOT quote the per-second number to the user as if it were the total cost.
 
-RECOMMENDED MODELS (all produce ~8-second clips):
-- veo_3_1_fast (50 cr/seg = ~400 cr per 8s clip): cheapest of the recommended set. Use only for genuinely disposable content, internal tests, or quick idea checks.
+RECOMMENDED MODELS (all produce ~8-second clips, all require followr_plus_enabled=true):
+- veo_3.1_fast (50 cr/seg = ~400 cr per 8s clip): cheapest of the recommended set. Use only for genuinely disposable content, internal tests, or quick idea checks.
 - veo_3_fast (400 cr/seg = ~3200 cr per 8s clip): safer default for real social-media content. Good quality / cost balance.
-- veo_3_1 (600 cr/seg = ~4800 cr per 8s clip): hero piece, launch promo, key shot. Better subject consistency and motion fidelity than veo_3_fast.
+- veo_3.1 (600 cr/seg = ~4800 cr per 8s clip): hero piece, launch promo, key shot. Better subject consistency and motion fidelity than veo_3_fast.
 
-ALSO AVAILABLE (the agent should NOT auto-pick these — surface them only if the user explicitly asks for a non-Veo model or a different cost point): veo_3 (1000 cr/seg = ~8000 cr per 8s clip, never use without explicit user authorization), wan_2 (150 cr/seg = ~1200), seedance_1_1_light (20 cr/seg = ~160), seedance_1_1_pro (40 cr/seg = ~320), seedance_2_0_fast (100 cr/seg = ~800), seedance_2_0 (175 cr/seg = ~1400), hailuo_0_2_standard (20 cr/seg = ~160), hailuo_0_2_premium (30 cr/seg = ~240). Empirical quality / behavior of non-Veo models is not yet documented per-model.
+PLAN GATING: on accounts WITHOUT followr_plus_enabled the ONLY accepted video model is wan_2.2. Every other model in this enum (veo_*, seedance_*, hailuo_*) requires Followr Plus and the backend rejects them with HTTP 422 "selected model is invalid" on non-Plus accounts. Read followr_plus_enabled from get_ai_budget BEFORE picking a model and respect company ai_preferences.video_model if set (the SPA ensures the company's stored default is compatible with the plan).
+
+ALSO AVAILABLE (the agent should NOT auto-pick these — surface them only if the user explicitly asks for a non-Veo model or a different cost point): veo_3 (1000 cr/seg = ~8000 cr per 8s clip, never use without explicit user authorization), wan_2.2 (150 cr/seg = ~1200, the only model accessible without Followr Plus), seedance_1.1_light (20 cr/seg = ~160), seedance_1.1_pro (40 cr/seg = ~320), seedance_2.0_fast (100 cr/seg = ~800), seedance_2.0 (175 cr/seg = ~1400), hailuo_02_standard (20 cr/seg = ~160), hailuo_02_premium (30 cr/seg = ~240). Empirical quality / behavior of non-Veo models is not yet documented per-model.
 
 CHOOSING A MODEL: do NOT auto-pick the cheapest model to "validate" the prompt. If the result fails, you cannot tell whether the prompt or the model is at fault, and regenerating with a higher-quality model means paying twice. Instead, ASK the user about the quality bar before picking. If the user has no preference, default to veo_3_fast and surface the cost via get_credits_balance before calling. Never call veo_3 (~8000 cr per 8s clip) without explicit user authorization of the cost.
 
@@ -950,7 +957,7 @@ IMAGE-TO-VIDEO: image_url is OPTIONAL. Pass it to seed the clip with a reference
       inputSchema: {
         company_id: z.number().int().positive(),
         prompt: z.string().min(1).describe("Visual prompt describing the single scene to generate. Keep it focused on ONE moment / action / shot — these models render ~8 seconds of video. See PROMPT DESIGN FOR ~8 SECONDS in the tool description."),
-        model: z.enum(AI_VIDEO_MODEL_ENUM).describe("AI video model. Cost is per SECOND of video; Veo clips are ~8s. Recommended: veo_3_1_fast (~400 cr per 8s clip), veo_3_fast (~3200), veo_3_1 (~4800). Confirm cost with the user before calling, especially for veo_3 (~8000)."),
+        model: z.enum(AI_VIDEO_MODEL_ENUM).describe("AI video model. Cost is per SECOND of video; Veo clips are ~8s. Recommended on Followr Plus accounts: veo_3.1_fast (~400 cr per 8s clip), veo_3_fast (~3200), veo_3.1 (~4800). On accounts WITHOUT Followr Plus, only wan_2.2 is accepted; every other model returns 'selected model is invalid'. Confirm cost with the user before calling, especially for veo_3 (~8000)."),
         aspect_ratio: z.enum(["9:16", "16:9"]).optional().describe("Default 9:16 (vertical, for Reels/Shorts/TikTok). Use 16:9 for landscape (LinkedIn, YouTube long-form thumbnails)."),
         image_url: z.string().url().optional().describe("Optional reference frame for image-to-video mode. Per-model support varies; the call may fail on models that do not accept it."),
         driver: z.string().optional().describe("Optional driver override. Most callers should omit; the backend resolves the driver from the model."),
