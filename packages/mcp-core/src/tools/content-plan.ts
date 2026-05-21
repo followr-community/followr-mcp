@@ -308,23 +308,58 @@ async function loadBudgets(client: FollowrClient): Promise<AllBudgets | null> {
 // the first entry unless the user explicitly asks for a different one.
 // When prefs.video_model is set, that model is bumped to recommended_rank 0
 // (company preference overrides catalog default).
-function annotateVideoModels(imageVideoRemaining: number, prefs?: AiPreferences) {
+//
+// Plan gating: premium-bucket models (Veo 3/3.1 variants) require
+// followr_plus_enabled=true. On accounts without it the backend rejects them
+// with HTTP 422 "selected model is invalid". When plus is off we mark every
+// premium model as blocked_by_plan + non-affordable, and promote wan_2 (the
+// documented fallback) to rank 0 so the agent's "pick first entry" policy
+// surfaces a model that actually works.
+function annotateVideoModels(
+  imageVideoRemaining: number,
+  followrPlusEnabled: boolean,
+  prefs?: AiPreferences,
+) {
   const preferredModelId = prefs?.video_model;
   const annotated = VIDEO_MODELS.map((m) => {
     const isCompanyDefault = preferredModelId === m.model_id;
+    const blocked_by_plan = m.bucket === "premium" && !followrPlusEnabled;
+    const affordable =
+      m.bucket === "premium"
+        ? followrPlusEnabled && m.cost_for_default_duration <= imageVideoRemaining
+        : m.cost_for_default_duration <= imageVideoRemaining;
+    // Treat wan_2.2 as the recommended default (rank 0) for accounts without
+    // Followr Plus, since the catalog's rank-0 (veo_3.1_fast) is gated. It is
+    // the only regular-bucket video model the backend accepts. Other models
+    // stay non-recommended; the user can pick them on request.
+    const isWanFallbackDefault = !followrPlusEnabled && m.model_id === "wan_2.2";
+    const overrides: Partial<{ recommended: boolean; recommended_rank: number; is_company_default: true; is_plan_fallback_default: true }> = {};
+    if (isCompanyDefault) {
+      overrides.recommended = true;
+      overrides.recommended_rank = 0;
+      overrides.is_company_default = true;
+    } else if (isWanFallbackDefault) {
+      overrides.recommended = true;
+      overrides.recommended_rank = 0;
+      overrides.is_plan_fallback_default = true;
+    } else if (blocked_by_plan) {
+      // Demote: keep visible in the catalog (so the agent can answer
+      // questions about it) but push to the back of the sort so "pick first"
+      // never lands here.
+      overrides.recommended = false;
+      overrides.recommended_rank = 99;
+    }
     return {
       ...m,
-      affordable_at_default_duration: m.cost_for_default_duration <= imageVideoRemaining,
+      affordable_at_default_duration: affordable,
+      blocked_by_plan,
       cost_note: `${m.cost_per_second} credits per second of video (${m.default_duration_seconds}s default = ${m.cost_for_default_duration} cr total).`,
-      // Company preference wins. We override the catalog's recommended/rank
-      // for this model so the agent picks it as the default.
-      ...(isCompanyDefault
-        ? { recommended: true, recommended_rank: 0, is_company_default: true as const }
-        : {}),
+      ...overrides,
     };
   });
-  // Sort: company default first (rank 0 via override), then platform-curated
-  // recommended ladder by recommended_rank, then non-recommended by cost.
+  // Sort: company default first (rank 0 via override), then plan-fallback
+  // (wan_2 when plus is off), then platform-curated recommended ladder by
+  // recommended_rank, then non-recommended by cost.
   return annotated.sort((a, b) => {
     const aRank = a.recommended ? a.recommended_rank ?? 99 : 100;
     const bRank = b.recommended ? b.recommended_rank ?? 99 : 100;
@@ -496,8 +531,21 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
       // Read company AI preferences so we can highlight the user-configured
       // default model in the catalog response (recommended_rank 0).
       const companyPrefs = (companyResolved as Company & { ai_preferences?: AiPreferences }).ai_preferences;
-      const videoModels = annotateVideoModels(imageVideoRemaining, companyPrefs);
+      const videoModels = annotateVideoModels(imageVideoRemaining, followrPlusEnabled, companyPrefs);
       const imageModels = annotateImageModels(imageVideoRemaining, followrPlusEnabled, companyPrefs);
+
+      // Detect deep_research cache marker on description. deep_research
+      // suggests appending "[industry:<id>@<YYYY-MM-DD>]" to Company.description
+      // via update_company so subsequent sessions can read the cached
+      // classification without re-fetching. When present, we surface the
+      // cached industry directly. When missing, we emit a warning telling the
+      // agent to call deep_research BEFORE drafting (Rule 19 in instructions).
+      const description = companyResolved.description ?? "";
+      const cacheRe = /\[industry:([a-z_]+)@(\d{4}-\d{2}-\d{2})\]/i;
+      const cacheMatch = cacheRe.exec(description);
+      const cachedIndustry = cacheMatch
+        ? { industry_id: cacheMatch[1], cached_at: cacheMatch[2] }
+        : null;
 
       // 6. Persist the context snapshot for later validation by
       // draft_content_plan.
@@ -542,6 +590,10 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
             ? null
             : "This company has no brand voice prompt loaded. Generated copies will use Followr default voice. Strongly consider creating one with create_prompt (preferably derived from the company's best-performing posts) BEFORE drafting a multi-post plan; the quality improvement is large.",
           default_brand_voice_prompts_by_network: defaultsByNetwork,
+          cached_industry: cachedIndustry,
+          industry_cache_warning: cachedIndustry
+            ? null
+            : "No industry classification cached on this company. Per instructions Rule 19 (INDUSTRY-AWARE PLANNING), call deep_research(company_id) BEFORE drafting a non-trivial content plan to get detected_industry, industry_specific.data (products, menu items, articles, properties, etc. depending on industry), content_pillars_inferred, and references like product image URLs for use as reference_image_url in ai_generate sources. After deep_research succeeds, persist the cache_suggestion suffix to Company.description via update_company so future sessions skip the re-fetch.",
         },
         ai_budgets: budgets ?? {
           _error: "Could not load subscription balance. Budget gating below may be unreliable.",
@@ -609,10 +661,18 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
           ultrathink_required: PLANNING_STRATEGY.ultrathink_required,
           planning_strategy: PLANNING_STRATEGY,
           recommended_video_model_policy:
-            "available_video_models is pre-sorted: the FIRST entry is the recommended default for this company (company ai_preferences.video_model if set, otherwise the platform default veo_3_1_fast). Use that by default. The next 3 entries (veo_3_fast, veo_3_1, veo_3) are the quality-step ladder, only use them when the user explicitly asks for higher quality and you confirm the cost. NEVER default to seedance / hailuo / wan unless the user explicitly requests a cheaper model. If followr_plus_enabled is false on the user budget, fall back to wan_2 for video.",
+            "available_video_models is pre-sorted: the FIRST entry is the recommended default for this company. ALWAYS pick the first entry, and ALWAYS use the model_id verbatim from the catalog. Do NOT invent model IDs from memory: Followr's canonical format uses dots for major.minor versions (veo_3.1_fast, veo_3.1, wan_2.2, seedance_1.1_light, seedance_2.0_fast, etc.) and no separator for hailuo (hailuo_02_standard, hailuo_02_premium). Underscored variants like veo_3_1_fast or hailuo_0_2_premium do NOT exist in Followr; the backend rejects them with HTTP 422 'selected model is invalid'. The sort accounts for company ai_preferences.video_model (rank 0 when set, with is_company_default: true) and for plan gating (when followr_plus_enabled is false, wan_2.2 is promoted to rank 0 with is_plan_fallback_default: true and every premium-bucket model is marked blocked_by_plan: true and affordable_at_default_duration: false). On accounts WITHOUT Followr Plus the ONLY accepted video model is wan_2.2; never recommend a premium-bucket model on those accounts. If the user explicitly asks for a premium model and followr_plus_enabled is false, explain the limitation and point them to followr.ai to activate the Followr Plus add-on.",
           recommended_image_model_policy:
-            "available_image_models is pre-sorted: the FIRST entry is the recommended default (company ai_preferences.image_model if set, otherwise nano_banana_2). Use that by default. Other models are available on request. Premium models (nano_banana_pro, gpt_image_2) require followr_plus_enabled true; if false, default to nano_banana_2 and explain the limitation if the user asks for premium.",
-          next_step: "ask_user_clarifying_question_then_draft",
+            "available_image_models is pre-sorted: the FIRST entry is the recommended default (company ai_preferences.image_model if set, otherwise nano_banana_2). ALWAYS use the model_id verbatim from the catalog (e.g. flux_pro_1.1 with a dot, not flux_pro_1_1 with an underscore). On accounts WITHOUT followr_plus_enabled the ONLY accepted image models are nano_banana_2 and z_image_turbo; every other model (nano_banana_pro, gpt_image_2, imagen4_*, ideogram_v3, flux_pro_1.1) is premium-bucket and the backend rejects them with HTTP 422 'selected model is invalid'. If the user asks for a premium model on a non-Plus account, surface the limitation and offer nano_banana_2 as the alternative.",
+          website_grounding_strategy:
+            "brand_context.website_summary is a SHALLOW metadata scrape (title, meta description, og:* tags, top headings). It does NOT contain product image URLs. When the company has a product website AND the plan involves product imagery (fashion, beauty, food, retail, packaging), STRONGLY CONSIDER calling deep_research(company_id) BEFORE draft_content_plan to retrieve real product URLs and image URLs. Use the resulting image URLs as reference_image_url on each ai_generate source so the generated assets resemble the actual brand catalog instead of generic AI imaginings. If you skip this step on a product-heavy brand, mention it explicitly to the user so they can opt in.",
+          per_item_preview_strategy:
+            "Plan size playbook for confirmation flows. NEVER decide the detail level alone: always ASK the user first which view they want, presenting 2-3 options sized to the plan. Then act on the answer. Plan-size defaults to offer:\n(1) 1-3 items: surface summary_for_user, then ask 'Te muestro el detalle completo de cada uno (copy + descripción de cada imagen y video), o te alcanza con el resumen y avanzamos?'. If user picks detail, call preview_plan_item per item.\n(2) 4-7 items: surface summary_for_user, then ask 'Querés (a) ver el detalle completo de los 5, (b) que te muestre solo uno representativo y aprobás todos juntos, o (c) avanzamos con el resumen?'. Use preview_plan_item only on the chosen subset.\n(3) 8-15 items: surface summary_for_user, then ask 'Es un plan grande. Te lo (a) agrupo por día y vamos día por día, (b) te muestro 2-3 representativos (uno por concept type) y aprobás todo de una, (c) te dejo el resumen y avanzamos?'. Group by date or by concept_shared keyword.\n(4) 16+ items: surface summary_for_user, then ask 'Plan extenso. Para no abrumarte, te propongo (a) spot-check de 2-3 representativos antes de aprobar todo, (b) agrupar por semana y aprobar por semana, (c) avanzar con el resumen tal cual?'. Default recommendation: option (a) for product-heavy industries, (b) for cadence-based plans.\nNEVER dump 30 detailed previews in a row - it is unusable. NEVER pick the view yourself without asking.",
+          industry_grounding_strategy:
+            "Before drafting any non-trivial content plan, check brand_context.cached_industry. When null, call deep_research(company_id) to retrieve detected_industry, industry_specific.data (products, menu_items, articles, properties, etc. depending on the industry), content_pillars_inferred, and reference assets like product image URLs. Then persist the cache_suggestion suffix on Company.description via update_company so the next session reads from cache. The MCP does NOT auto-call deep_research; it is the agent's responsibility per instructions Rule 19. Skipping it means the plan grounds on shallow website metadata only and AI assets get generated without product references, producing generic visuals that do not look like the real catalog.",
+          next_step: cachedIndustry
+            ? "ask_user_clarifying_question_then_draft"
+            : "call_deep_research_then_ask_clarifying_then_draft",
           required_user_clarifications: [
             "time_window (start and end dates, default: the week starting next Monday)",
             "posts_per_day (default: 1)",
@@ -1156,6 +1216,66 @@ OUTPUT: same shape as draft_content_plan (plan_id, status, summary_for_user, tot
   );
 
   // ────────────────────────────────────────────────────────────────────────
+  // preview_plan_item (natural-language detail for one plan_item)
+  // ────────────────────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "preview_plan_item",
+    {
+      annotations: READ_ONLY,
+      title: "Render a detailed natural-language preview of one plan_item for user confirmation",
+      description: `Return a human-readable preview of a single plan_item, designed to be surfaced to the user BEFORE asking for execute confirmation. The summary table returned by draft_content_plan / update_content_plan is intentionally compact (one row per network). This tool fills the other side: full caption text per network, plain-language description of each asset (what each image will show, what the video will look like), credit estimate, and any flags worth raising (model blocked_by_plan, brand voice missing, etc.).
+
+USE THIS when the user asks to advance item by item ("arranca con el primero", "andá pidiendo confirmación", "uno por uno") or when they explicitly ask for more detail about a specific post before approving. Call it once per plan_item right BEFORE you call execute_content_plan(plan_id, plan_item_slugs: [slug], confirm: true).
+
+OUTPUT: { plan_id, slug, concept, publish_at_local, networks: [{ network_display, format, caption_final, assets: [{ kind, description, model?, cost_credits }] }], totals: { credits, estimated_generation_minutes }, flags: [...], rendered_markdown }. The agent can either surface rendered_markdown verbatim or quote individual fields.
+
+NO MUTATION. Pure read of in-memory plan state.`,
+      inputSchema: {
+        plan_id: z.string().min(1),
+        slug: z
+          .string()
+          .min(1)
+          .describe("The slug of the plan_item to preview (see plan.plan_items[].slug from get_content_plan or draft_content_plan)."),
+      },
+    },
+    async ({ plan_id, slug }) => {
+      const plan = getPlan(plan_id);
+      if (!plan) {
+        return toolError({
+          reason: "plan_id_not_found",
+          user_message:
+            "No encuentro ese plan. Puede haber expirado (los planes viven 2hs en memoria) o nunca fue creado.",
+          blocking: true,
+        });
+      }
+      const item = plan.plan_items.find((it) => it.slug === slug);
+      if (!item) {
+        return toolError({
+          reason: "plan_item_slug_not_found",
+          user_message: `No encontré el item con slug "${slug}" en el plan. Slugs disponibles: ${plan.plan_items.map((it) => it.slug).join(", ")}.`,
+          blocking: true,
+        });
+      }
+      // Load plus status so we only flag premium-blocked models when the
+      // account actually can't use them. Without this the preview would emit
+      // a "requires Followr Plus" warning for every premium model regardless
+      // of whether the user already has Plus, which is noise (Plus users see
+      // those models work fine). Best-effort: on a failed budget load, we
+      // skip the gating flag rather than misfire.
+      let followrPlusEnabled: boolean | null = null;
+      try {
+        const b = await loadBudgets(client);
+        followrPlusEnabled = b?.followr_plus_enabled ?? null;
+      } catch {
+        followrPlusEnabled = null;
+      }
+      const preview = buildItemPreview(plan, item, followrPlusEnabled);
+      return { content: [{ type: "text" as const, text: JSON.stringify(preview, null, 2) }] };
+    },
+  );
+
+  // ────────────────────────────────────────────────────────────────────────
   // execute_content_plan
   // ────────────────────────────────────────────────────────────────────────
 
@@ -1181,7 +1301,11 @@ ASSET STRATEGIES SUPPORTED IN v1:
 
 OUTPUT: { plan_id, status (succeeded / completed_with_partial_failures / failed_all), results (per plan_item: status, post_group_id when created, asset_ids per sub_post, credits_consumed, error and recovery_suggestion when failed), totals (count succeeded / failed, total credits consumed, budget remaining after). next_actions guides what the user can do next.
 
-DO NOT CALL this without explicit user confirmation in chat. The MCP rejects calls without confirm: true.`,
+DO NOT CALL this without explicit user confirmation in chat. The MCP rejects calls without confirm: true.
+
+PARTIAL EXECUTION: pass plan_item_slugs to execute only a subset of items (e.g. ["lun-drop-campera"] to execute just Monday). Items not in the list are left intact in the plan and can be executed later by calling execute_content_plan again with a different slug list. The plan's status only flips to 'executed' once every item has been attempted; partial executions keep the plan in 'draft' so it can be resumed. Use this when the user asks to ship "the first one only" or "Monday and Tuesday but wait on the rest" - this is the supported flow, NOT update_content_plan + remove_item as a workaround.
+
+ITEM-BY-ITEM CONFIRMATION FLOW: when the user asks to advance one item at a time, the right sequence is: (1) call preview_plan_item(plan_id, slug) for the next item; (2) surface the preview to the user (caption verbatim, plain-language asset descriptions, cost); (3) wait for explicit approval; (4) call execute_content_plan(plan_id, plan_item_slugs: [slug], confirm: true); (5) on success, repeat for the next slug listed in the response's remaining_slugs. Do NOT skip step 1 - the compact summary table is too thin for per-item approval.`,
       inputSchema: {
         plan_id: z.string().min(1),
         confirm: z
@@ -1189,9 +1313,17 @@ DO NOT CALL this without explicit user confirmation in chat. The MCP rejects cal
           .describe(
             "Must be the literal boolean true. Any other value or omission causes the tool to refuse. This is the chat-side confirmation gate: the agent must have asked the user out loud, received explicit approval, and only then passes confirm: true.",
           ),
+        plan_item_slugs: z
+          .array(z.string().min(1).max(80))
+          .min(1)
+          .max(60)
+          .optional()
+          .describe(
+            "Optional subset of plan_item slugs to execute. When set, only matching items run; the rest stay in the plan untouched and can be executed in a later call. When omitted, every item in the plan runs. Use this for confirm-each-item flows ('arranca con el primero', 'andá pidiendo confirmación') - it is the supported alternative to removing items via update_content_plan and re-adding them later.",
+          ),
       },
     },
-    async ({ plan_id, confirm }) => {
+    async ({ plan_id, confirm, plan_item_slugs }) => {
       if (confirm !== true) {
         return toolError({
           reason: "confirmation_required",
@@ -1227,6 +1359,32 @@ DO NOT CALL this without explicit user confirmation in chat. The MCP rejects cal
         });
       }
 
+      // Resolve which plan_items to execute this call. When plan_item_slugs is
+      // present we honor it; missing slugs are reported up front so the agent
+      // does not silently skip work. The plan stays intact either way; we
+      // only mutate the in-memory copy on items we actually executed.
+      let itemsToRun: PlanItem[];
+      const unknownSlugs: string[] = [];
+      if (plan_item_slugs && plan_item_slugs.length > 0) {
+        const slugSet = new Set(plan_item_slugs);
+        itemsToRun = plan.plan_items.filter((it) => slugSet.has(it.slug));
+        for (const s of plan_item_slugs) {
+          if (!plan.plan_items.some((it) => it.slug === s)) unknownSlugs.push(s);
+        }
+        if (itemsToRun.length === 0) {
+          return toolError({
+            reason: "plan_item_slugs_no_match",
+            user_message:
+              "Ninguno de los plan_item_slugs solicitados existe en el plan. Llamá get_content_plan para ver los slugs disponibles.",
+            blocking: true,
+            details: { requested_slugs: plan_item_slugs, available_slugs: plan.plan_items.map((it) => it.slug) },
+          });
+        }
+      } else {
+        itemsToRun = plan.plan_items;
+      }
+      const isPartialExecution = itemsToRun.length < plan.plan_items.length;
+
       // Re-validate before execute to catch any quota / state drift since draft.
       const v = await runValidation({
         plan_items: plan.plan_items,
@@ -1258,7 +1416,7 @@ DO NOT CALL this without explicit user confirmation in chat. The MCP rejects cal
       // and let the API treat it as local in the requested timezone. Followr
       // stores in UTC; we send ISO with the offset computed from the IANA tz.
       const itemResults: Array<Record<string, unknown>> = [];
-      const executions = plan.plan_items.map(async (item) => {
+      const executions = itemsToRun.map(async (item) => {
         try {
           const result = await executePlanItem(client, plan.company_id, item, prefs);
           itemResults.push(result);
@@ -1298,8 +1456,23 @@ DO NOT CALL this without explicit user confirmation in chat. The MCP rejects cal
         budgetAfter = null;
       }
 
+      // Compute remaining slugs (items that were not part of this run). On a
+      // partial run the plan stays in 'draft' so the caller can keep going
+      // item by item; on a full run we transition to 'executed' (or 'failed'
+      // when nothing succeeded).
+      const ranSlugs = new Set(itemsToRun.map((it) => it.slug));
+      const remainingSlugs = plan.plan_items.filter((it) => !ranSlugs.has(it.slug)).map((it) => it.slug);
+
+      let nextStatus: ContentPlan["status"];
+      if (isPartialExecution) {
+        nextStatus = "draft";
+      } else if (overallStatus === "failed_all") {
+        nextStatus = "failed";
+      } else {
+        nextStatus = "executed";
+      }
       updatePlanInState(plan_id, {
-        status: overallStatus === "failed_all" ? "failed" : "executed",
+        status: nextStatus,
         execution_finished_at_ms: Date.now(),
       });
 
@@ -1308,43 +1481,60 @@ DO NOT CALL this without explicit user confirmation in chat. The MCP rejects cal
         0,
       );
 
+      const nextActions =
+        overallStatus === "succeeded"
+          ? isPartialExecution
+            ? [
+                `Quedan ${remainingSlugs.length} items pendientes en el plan: ${remainingSlugs.join(", ")}. Pasalos a execute_content_plan con plan_item_slugs cuando el usuario apruebe avanzar.`,
+                "Revisar los drafts creados en app.followr.ai (cada PostGroup quedó como draft).",
+              ]
+            : [
+                "Revisar los drafts en app.followr.ai (cada PostGroup creado quedó como draft).",
+                "Programar los publish times desde la app o llamar publish_post_group_now si querés publicar uno ahora.",
+              ]
+          : overallStatus === "completed_with_partial_failures"
+            ? [
+                "Revisar los drafts que se crearon OK en app.followr.ai.",
+                "Mirar el campo error_message de los items que fallaron para entender la causa.",
+                "Para reintentar solo los fallidos: usar update_content_plan para ajustar ese sub_post y volver a llamar execute_content_plan con plan_item_slugs apuntando solo a los slugs fallidos.",
+                ...(remainingSlugs.length > 0
+                  ? [`Quedan ${remainingSlugs.length} items que ni siquiera se intentaron en este call (${remainingSlugs.join(", ")}). Pasalos en una llamada posterior con plan_item_slugs.`]
+                  : []),
+              ]
+            : [
+                "Ningún item se creó. Revisar el error_message de cada fila para entender la causa raíz.",
+                "Si fue por modelo bloqueado por plan (followr_plus_enabled=false): cambiá el video a wan_2.2 (único video regular) con update_content_plan y reintentá. En cuentas con Plus, el ID equivocado es la causa más común: confirmá que el model_id viene verbatim del catálogo (veo_3.1_fast con punto, no veo_3_1_fast con underscore).",
+                "Si fue por quota: cambiar modelos a alternativas más baratas con update_content_plan y reintentar.",
+                "Si fue por un asset URL que ya no existe: corregir la URL con update_content_plan y reintentar.",
+              ];
+
+      const responseBody: Record<string, unknown> = {
+        plan_id,
+        status: overallStatus,
+        partial_execution: isPartialExecution,
+        executed_slugs: itemsToRun.map((it) => it.slug),
+        remaining_slugs: remainingSlugs,
+        results: itemResults,
+        totals: {
+          plan_items_attempted: itemResults.length,
+          succeeded,
+          failed,
+          estimated_credits_consumed: consumedEstimate,
+          ai_image_and_video_budget_remaining: budgetAfter,
+        },
+        next_actions: nextActions,
+      };
+      if (unknownSlugs.length > 0) {
+        responseBody["unknown_slugs_skipped"] = unknownSlugs;
+        responseBody["unknown_slugs_note"] =
+          "Algunos plan_item_slugs solicitados no existen en el plan y fueron ignorados. Llamá get_content_plan para ver los slugs reales.";
+      }
+
       return {
         content: [
           {
             type: "text" as const,
-            text: JSON.stringify(
-              {
-                plan_id,
-                status: overallStatus,
-                results: itemResults,
-                totals: {
-                  plan_items_attempted: itemResults.length,
-                  succeeded,
-                  failed,
-                  estimated_credits_consumed: consumedEstimate,
-                  ai_image_and_video_budget_remaining: budgetAfter,
-                },
-                next_actions:
-                  overallStatus === "succeeded"
-                    ? [
-                        "Revisar los drafts en app.followr.ai (cada PostGroup creado quedó como draft).",
-                        "Programar los publish times desde la app o llamar publish_post_group_now si querés publicar uno ahora.",
-                      ]
-                    : overallStatus === "completed_with_partial_failures"
-                      ? [
-                          "Revisar los drafts que se crearon OK en app.followr.ai.",
-                          "Mirar el campo error_message de los items que fallaron para entender la causa.",
-                          "Para reintentar solo los fallidos: usar update_content_plan para ajustar ese sub_post y volver a llamar execute_content_plan (los items ya creados no se duplican porque generan nuevos PostGroups).",
-                        ]
-                      : [
-                          "Ningún item se creó. Revisar el error_message de cada fila para entender la causa raíz.",
-                          "Si fue por quota: cambiar modelos a alternativas más baratas con update_content_plan y reintentar.",
-                          "Si fue por un asset URL que ya no existe: corregir la URL con update_content_plan y reintentar.",
-                        ],
-              },
-              null,
-              2,
-            ),
+            text: JSON.stringify(responseBody, null, 2),
           },
         ],
       };
@@ -1518,15 +1708,33 @@ async function executePlanItem(
   const anyFail = assetResolutions.find((r) => r.error);
   const creditsConsumed = assetResolutions.reduce((a, r) => a + r.credits_consumed, 0);
   if (anyFail) {
+    // List the sub_posts that completed asset resolution successfully along
+    // with the asset ids they ended up with. The agent can swap those into
+    // the plan via update_content_plan + replace_sub_post with assets_strategy
+    // pointing at { type: "asset_id", id } so a retry does not re-bill the
+    // credits already spent on this attempt.
+    const succeededSubPostAssets = assetResolutions
+      .filter((r) => !r.error && r.asset_ids.length > 0)
+      .map((r) => ({
+        sub_post_index: r.sub_post_index,
+        asset_ids: r.asset_ids,
+        credits_consumed: r.credits_consumed,
+      }));
+    const failedSubPost = item.sub_posts[anyFail.sub_post_index];
     return {
       slug: item.slug,
       date: item.date,
       status: "failed_resolving_assets",
       error_message: anyFail.error,
       failed_sub_post_index: anyFail.sub_post_index,
+      failed_sub_post_network: failedSubPost?.social_network ?? null,
+      failed_sub_post_strategy: failedSubPost?.assets_strategy ?? null,
+      succeeded_sub_post_assets: succeededSubPostAssets,
       credits_consumed_estimate: creditsConsumed,
       recovery_suggestion:
-        "One sub_post failed to resolve its assets. The other sub_posts may have generated credits already. Fix the failing sub_post with update_content_plan and retry execute_content_plan (already-created assets in the library can be referenced via asset_id to avoid regeneration).",
+        succeededSubPostAssets.length > 0
+          ? `Sub_post #${anyFail.sub_post_index} failed but ${succeededSubPostAssets.length} other sub_post(s) generated assets successfully (${creditsConsumed} cr already spent). To retry WITHOUT double-billing: (1) call update_content_plan with one replace_sub_post per entry in succeeded_sub_post_assets, swapping assets_strategy to { type: "asset_id", id: <asset_id> } for each completed asset. (2) Separately fix the failing sub_post (e.g. swap to a non-premium video model when blocked_by_plan, change prompt, point at an asset_id). (3) Call execute_content_plan(plan_id, plan_item_slugs: ["${item.slug}"], confirm: true) to retry just this item.`
+          : `One sub_post failed to resolve its assets and no other sub_post had completed yet. Fix the failing sub_post with update_content_plan (e.g. change the video model when blocked_by_plan is true on the chosen model) and retry execute_content_plan with plan_item_slugs: ["${item.slug}"] to retry just this item.`,
     };
   }
 
@@ -1818,6 +2026,322 @@ function displayLayout(layout: AssetLayout, product: ProductType): string {
   return product;
 }
 
+// ── Natural-language preview (for preview_plan_item) ──────────────────────
+
+interface AssetPreview {
+  kind: "ai_image" | "url_image" | "library_image" | "ai_video" | "url_video" | "library_video" | "avatar_lipsync" | "avatar_video";
+  description: string;
+  model?: string;
+  duration_seconds?: number;
+  cost_credits: number;
+  reference_image_url?: string;
+}
+
+interface NetworkPreview {
+  network: SocialNetwork;
+  network_display: string;
+  format: string;
+  caption_final: string;
+  assets: AssetPreview[];
+  flags: string[];
+}
+
+interface ItemPreview {
+  plan_id: string;
+  slug: string;
+  date: string;
+  publish_at_local: string;
+  timezone: string;
+  concept: string;
+  rationale: string;
+  paired_with: string[];
+  networks: NetworkPreview[];
+  totals: {
+    asset_count: number;
+    image_ai_count: number;
+    video_ai_count: number;
+    upload_count: number;
+    reuse_count: number;
+    credits: number;
+    estimated_generation_minutes: { min: number; max: number };
+  };
+  flags: string[];
+  rendered_markdown: string;
+}
+
+function describeAiImage(prompt: string): string {
+  const clean = prompt.replace(/\s+/g, " ").trim();
+  return clean.length > 320 ? clean.slice(0, 317) + "..." : clean;
+}
+
+function describeAssetSource(
+  src: NonNullable<AssetsStrategy["image_source"] | AssetsStrategy["video_source"]> | NonNullable<AssetsStrategy["carousel_sources"]>[number],
+  mode: "image" | "video",
+): AssetPreview {
+  if (src.type === "url") {
+    return {
+      kind: mode === "image" ? "url_image" : "url_video",
+      description: `Asset desde URL: ${src.url}`,
+      cost_credits: 0,
+    };
+  }
+  if (src.type === "asset_id") {
+    return {
+      kind: mode === "image" ? "library_image" : "library_video",
+      description: `Reusa el asset #${src.id} de la biblioteca de Followr`,
+      cost_credits: 0,
+    };
+  }
+  if (src.type === "ai_generate" && mode === "image") {
+    const modelId = ("model" in src && src.model) || "nano_banana_2";
+    const m = IMAGE_MODELS.find((x) => x.model_id === modelId);
+    const desc: AssetPreview = {
+      kind: "ai_image",
+      description: describeAiImage(src.prompt),
+      model: modelId,
+      cost_credits: m?.cost_per_image ?? 25,
+    };
+    if ("reference_image_url" in src && src.reference_image_url) {
+      desc.reference_image_url = src.reference_image_url;
+    }
+    return desc;
+  }
+  if (src.type === "ai_generate" && mode === "video") {
+    const modelId = "model" in src ? src.model : undefined;
+    const m = modelId ? VIDEO_MODELS.find((x) => x.model_id === modelId) : undefined;
+    const dur = "duration_seconds" in src ? (src.duration_seconds ?? m?.default_duration_seconds ?? 8) : 8;
+    const desc: AssetPreview = {
+      kind: "ai_video",
+      description: describeAiImage(src.prompt),
+      model: modelId,
+      duration_seconds: dur,
+      cost_credits: m ? m.cost_per_second * dur : 400 * dur,
+    };
+    if ("reference_image_url" in src && src.reference_image_url) {
+      desc.reference_image_url = src.reference_image_url;
+    }
+    return desc;
+  }
+  if (src.type === "ai_avatar_lipsync") {
+    return {
+      kind: "avatar_lipsync",
+      description: `Avatar lipsync (avatar #${src.avatar_id}). Script: "${describeAiImage(src.script)}"`,
+      cost_credits: 25 * 12,
+    };
+  }
+  if (src.type === "ai_avatar_video") {
+    return {
+      kind: "avatar_video",
+      description: `Avatar video con ${src.scripts.length} escena(s) (avatar #${src.avatar_id})${src.generate_backgrounds ? ", con backgrounds generados" : ""}.`,
+      cost_credits: 25 * 10 * src.scripts.length + (src.generate_backgrounds ? 60 * src.scripts.length : 0),
+    };
+  }
+  return { kind: "ai_image", description: "(asset desconocido)", cost_credits: 0 };
+}
+
+function buildItemPreview(
+  plan: ContentPlan,
+  item: PlanItem,
+  followrPlusEnabled: boolean | null,
+): ItemPreview {
+  const networks: NetworkPreview[] = [];
+  const flags: string[] = [];
+  let imageAiCount = 0;
+  let videoAiCount = 0;
+  let uploadCount = 0;
+  let reuseCount = 0;
+  let creditsTotal = 0;
+  let maxVideoSeconds = 0;
+
+  // Only flag premium-bucket models as plan-blocked when the account actually
+  // lacks Followr Plus. For Plus users premium models are simply premium-tier
+  // (informational, not actionable), so the warning would be noise. When plus
+  // status could not be determined (null), skip the flag to avoid misfiring.
+  const flagBlockedByPlan = followrPlusEnabled === false;
+
+  for (const sp of item.sub_posts) {
+    const assets: AssetPreview[] = [];
+    const networkFlags: string[] = [];
+
+    const checkImagePlanBlock = (a: AssetPreview) => {
+      if (!flagBlockedByPlan || a.kind !== "ai_image" || !a.model) return;
+      const im = IMAGE_MODELS.find((m) => m.model_id === a.model);
+      if (im && im.bucket === "premium") {
+        networkFlags.push(
+          `La imagen usa ${im.display_name} (premium). Esta cuenta no tiene Followr Plus activado y el backend va a rechazar el modelo con "selected model is invalid". Cambiá a nano_banana_2 o z_image_turbo con update_content_plan antes de ejecutar.`,
+        );
+      }
+    };
+
+    if (sp.assets_strategy.image_source) {
+      const a = describeAssetSource(sp.assets_strategy.image_source, "image");
+      assets.push(a);
+      if (a.kind === "ai_image") imageAiCount += 1;
+      else if (a.kind === "url_image") uploadCount += 1;
+      else if (a.kind === "library_image") reuseCount += 1;
+      creditsTotal += a.cost_credits;
+      checkImagePlanBlock(a);
+    }
+    if (sp.assets_strategy.carousel_sources) {
+      for (const s of sp.assets_strategy.carousel_sources) {
+        const a = describeAssetSource(s, "image");
+        assets.push(a);
+        if (a.kind === "ai_image") imageAiCount += 1;
+        else if (a.kind === "url_image") uploadCount += 1;
+        else if (a.kind === "library_image") reuseCount += 1;
+        creditsTotal += a.cost_credits;
+        checkImagePlanBlock(a);
+      }
+    }
+    if (sp.assets_strategy.video_source) {
+      const a = describeAssetSource(sp.assets_strategy.video_source, "video");
+      assets.push(a);
+      if (a.kind === "ai_video") videoAiCount += 1;
+      else if (a.kind === "url_video") uploadCount += 1;
+      else if (a.kind === "library_video") reuseCount += 1;
+      else if (a.kind === "avatar_lipsync" || a.kind === "avatar_video") videoAiCount += 1;
+      creditsTotal += a.cost_credits;
+      if (a.duration_seconds && a.duration_seconds > maxVideoSeconds) {
+        maxVideoSeconds = a.duration_seconds;
+      }
+      if (flagBlockedByPlan && a.model) {
+        const vm = VIDEO_MODELS.find((m) => m.model_id === a.model);
+        if (vm && vm.bucket === "premium") {
+          networkFlags.push(
+            `El video usa ${vm.display_name} (premium). Esta cuenta no tiene Followr Plus activado y el backend va a rechazar el modelo con "selected model is invalid". Cambiá a wan_2.2 (único video regular) con update_content_plan antes de ejecutar.`,
+          );
+        }
+      }
+    }
+    networks.push({
+      network: sp.social_network,
+      network_display: displayNetworkName(sp.social_network),
+      format: displayLayout(sp.asset_layout, sp.product_type),
+      caption_final: sp.copy_draft && sp.copy_draft.trim().length > 0 ? sp.copy_draft : sp.caption_concept,
+      assets,
+      flags: networkFlags,
+    });
+  }
+
+  if (!plan.use_brand_voice) {
+    flags.push("use_brand_voice está en false: los copys finales no van a usar el brand voice prompt aunque esté cargado.");
+  }
+
+  const minGen = imageAiCount > 0 ? 1 : 0;
+  const maxGen = imageAiCount * 0.5 + (videoAiCount > 0 ? 10 : 0);
+  const rendered = renderMarkdown({
+    plan,
+    item,
+    networks,
+    totals: { imageAiCount, videoAiCount, uploadCount, reuseCount, creditsTotal },
+    estimatedGenerationMinutes: { min: Math.max(1, Math.round(minGen)), max: Math.max(2, Math.round(maxGen)) },
+    flags,
+  });
+
+  return {
+    plan_id: plan.plan_id,
+    slug: item.slug,
+    date: item.date,
+    publish_at_local: item.publish_at_time_local,
+    timezone: item.timezone,
+    concept: item.concept_shared,
+    rationale: item.rationale,
+    paired_with: item.paired_with ?? [],
+    networks,
+    totals: {
+      asset_count: imageAiCount + videoAiCount + uploadCount + reuseCount,
+      image_ai_count: imageAiCount,
+      video_ai_count: videoAiCount,
+      upload_count: uploadCount,
+      reuse_count: reuseCount,
+      credits: creditsTotal,
+      estimated_generation_minutes: { min: Math.max(1, Math.round(minGen)), max: Math.max(2, Math.round(maxGen)) },
+    },
+    flags,
+    rendered_markdown: rendered,
+  };
+}
+
+function renderMarkdown(args: {
+  plan: ContentPlan;
+  item: PlanItem;
+  networks: NetworkPreview[];
+  totals: { imageAiCount: number; videoAiCount: number; uploadCount: number; reuseCount: number; creditsTotal: number };
+  estimatedGenerationMinutes: { min: number; max: number };
+  flags: string[];
+}): string {
+  const { item, networks, totals, estimatedGenerationMinutes, flags } = args;
+  const lines: string[] = [];
+  lines.push(`### ${item.date} a las ${item.publish_at_time_local} (${item.timezone})`);
+  lines.push("");
+  lines.push(`**Concepto:** ${item.concept_shared}`);
+  lines.push("");
+  if (item.rationale) {
+    lines.push(`**Por qué este post:** ${item.rationale}`);
+    lines.push("");
+  }
+  for (const n of networks) {
+    lines.push(`#### ${n.network_display} (${n.format})`);
+    lines.push("");
+    lines.push(`**Copy:**`);
+    lines.push("");
+    lines.push(`> ${n.caption_final.replace(/\n/g, "\n> ")}`);
+    lines.push("");
+    if (n.assets.length === 1) {
+      const a = n.assets[0]!;
+      lines.push(`**Asset:** ${describeAssetKind(a)}`);
+      lines.push("");
+      lines.push(`${a.description}`);
+      if (a.reference_image_url) {
+        lines.push("");
+        lines.push(`Imagen de referencia: ${a.reference_image_url}`);
+      }
+      lines.push("");
+    } else {
+      lines.push(`**Assets (${n.assets.length}):**`);
+      lines.push("");
+      n.assets.forEach((a, i) => {
+        lines.push(`${i + 1}. ${describeAssetKind(a)}. ${a.description}${a.reference_image_url ? ` (ref: ${a.reference_image_url})` : ""}`);
+      });
+      lines.push("");
+    }
+    if (n.flags.length > 0) {
+      for (const f of n.flags) {
+        lines.push(`> ⚠️ ${f}`);
+      }
+      lines.push("");
+    }
+  }
+  lines.push(`**Totales:** ${totals.imageAiCount} imágenes AI + ${totals.videoAiCount} videos AI${totals.uploadCount ? ` + ${totals.uploadCount} subidas` : ""}${totals.reuseCount ? ` + ${totals.reuseCount} assets reusados` : ""}. Costo estimado: ${totals.creditsTotal} créditos. Tiempo de generación: ${estimatedGenerationMinutes.min}-${estimatedGenerationMinutes.max} min.`);
+  if (flags.length > 0) {
+    lines.push("");
+    lines.push("**Alertas:**");
+    for (const f of flags) lines.push(`- ${f}`);
+  }
+  return lines.join("\n");
+}
+
+function describeAssetKind(a: AssetPreview): string {
+  switch (a.kind) {
+    case "ai_image":
+      return `Imagen AI (${a.model ?? "nano_banana_2"}, ${a.cost_credits} cr)`;
+    case "url_image":
+      return "Imagen desde URL externa";
+    case "library_image":
+      return "Imagen de la biblioteca";
+    case "ai_video":
+      return `Video AI (${a.model ?? "?"}, ${a.duration_seconds ?? "?"}s, ${a.cost_credits} cr)`;
+    case "url_video":
+      return "Video desde URL externa";
+    case "library_video":
+      return "Video de la biblioteca";
+    case "avatar_lipsync":
+      return `Avatar lipsync (${a.cost_credits} cr)`;
+    case "avatar_video":
+      return `Avatar video multi-escena (${a.cost_credits} cr)`;
+  }
+}
+
 function displayAssetStrategy(strategy: AssetsStrategy, layout: AssetLayout): string {
   if (layout === "single_image" && strategy.image_source) {
     if (strategy.image_source.type === "url") return "Foto del sitio";
@@ -1844,7 +2368,13 @@ function displayAssetStrategy(strategy: AssetsStrategy, layout: AssetLayout): st
 // ── Shared validation pipeline ──────────────────────────────────────────────
 
 interface ValidationCtx {
+  company_id: number;
   networks_connected: SocialNetwork[];
+  // Initial snapshot captured at prepare_content_plan_context time. Used only
+  // as a fallback when the live re-fetch fails. The validation logic
+  // re-queries listPrompts on every run so creating a brand voice mid-session
+  // and then calling update_content_plan clears the brand_voice_missing
+  // warning right away.
   brand_has_voice_prompt: boolean;
 }
 
@@ -2065,12 +2595,27 @@ async function runValidation(args: {
     });
   }
 
-  if (!ctx.brand_has_voice_prompt && use_brand_voice) {
-    warnings.push({
-      issue: "brand_voice_missing",
-      detail:
-        "use_brand_voice is true but this company has no brand voice prompt loaded. Copies will fall back to Followr default voice. Offer the user to create one with create_prompt BEFORE executing.",
-    });
+  if (use_brand_voice) {
+    // Re-check brand voice presence against the LIVE prompt list, not the
+    // (potentially stale) ctx snapshot captured at prepare_content_plan_context
+    // time. Without this, an agent that creates brand voice prompts mid-session
+    // and then calls update_content_plan still sees the brand_voice_missing
+    // warning because the snapshot remembers the pre-creation state.
+    let hasVoicePromptLive = ctx.brand_has_voice_prompt;
+    try {
+      const prompts = await client.listPrompts({ companyId: ctx.company_id, pageSize: 1 });
+      hasVoicePromptLive = prompts.length > 0;
+    } catch {
+      // If the live check fails, fall back to the ctx snapshot so we don't
+      // accidentally drop the warning when prompts actually are missing.
+    }
+    if (!hasVoicePromptLive) {
+      warnings.push({
+        issue: "brand_voice_missing",
+        detail:
+          "use_brand_voice is true but this company has no brand voice prompt loaded. Copies will fall back to Followr default voice. Offer the user to create one with create_prompt BEFORE executing.",
+      });
+    }
   }
 
   return { blockers, warnings, totals, budget_remaining: budgetRemaining };
