@@ -81,7 +81,7 @@ PRESENTING: refer to external users by name or username, not by id. Surface unre
       title: "Get messages in a conversation (text only, no attachments)",
       description: `Return text messages within a single conversation, newest first. Reads from Followr's local cache; works for ANY conversation regardless of age.
 
-ATTACHMENT GAP: this endpoint does NOT expose attachments (image/video). Messages that arrived as attachment-only show up with message: "". For Instagram and Facebook conversations that may contain media, prefer list_platform_messages — it returns the raw Meta Graph shape including attachments.data[*].image_data / video_data.
+ATTACHMENT GAP: this endpoint does NOT expose attachments (image/video). Messages that arrived as attachment-only show up with message: "". For Instagram and Facebook conversations that may contain media, prefer list_platform_messages: it returns the raw Meta Graph shape including attachments.data[*].image_data / video_data.
 
 USE THIS when: text-only summary is enough; or when working with a network without a platform-specific endpoint (LinkedIn, TikTok, X, Threads, Bluesky etc).
 

@@ -126,12 +126,12 @@ Once a video asset id is available, then call create_post with assets=[{id, type
         assets: z
           .array(AssetInputSchema)
           .optional()
-          .describe("Media to attach. Asset ids are extracted into the API's assets_ids array. The full metadata (type, width, height, size, duration) is used for validation only — not sent to the API."),
+          .describe("Media to attach. Asset ids are extracted into the API's assets_ids array. The full metadata (type, width, height, size, duration) is used for validation only, not sent to the API."),
         preferences: z
           .record(z.string(), z.unknown())
           .optional()
           .describe(
-            "Network-specific extras passed through to Followr. Case-sensitive — Followr rejects subtle wrong forms with HTTP 422.\n" +
+            "Network-specific extras passed through to Followr. Case-sensitive: Followr rejects subtle wrong forms with HTTP 422.\n" +
               "CANONICAL VALUES (the MCP auto-corrects the unambiguous ones and emits notices in the response):\n" +
               "- media_product_type (IG, FB, YouTube): UPPERCASE singular. FEED | REEL | STORY | SHORT. Plurals like REELS/SHORTS return 422. Auto-injected from product_type if you do not pass it.\n" +
               "- privacy_level (YouTube): lowercase. public | unlisted | private. Uppercase returns 422.\n" +
@@ -231,7 +231,7 @@ Once a video asset id is available, then call create_post with assets=[{id, type
             all_warnings: warnings,
             runtime_context: context,
             override_hint:
-              "Pass acknowledge_validation_errors=true to create the post anyway (not recommended — the network will reject it).",
+              "Pass acknowledge_validation_errors=true to create the post anyway (not recommended: the network will reject it).",
           },
         });
       }

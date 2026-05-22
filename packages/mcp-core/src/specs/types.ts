@@ -135,7 +135,7 @@ export interface PostPayload {
 // ──────────────────────────────────────────────────────────
 
 /**
- * Severity of a validation warning. None block execution — they're advisory.
+ * Severity of a validation warning. None block execution; they're advisory.
  *
  * - `hard_fail`: The network's API will reject this. Strong signal to fix.
  * - `display_behavior`: Network accepts the upload but transforms it

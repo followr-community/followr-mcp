@@ -96,7 +96,7 @@ USE FOR: confirming a freshly created voice has its sample uploaded; retrieving 
 NO COMPANY NEEDED. The output is used to pick an elevenlabs_voice_id to pass into create_voice_from_elevenlabs.
 
 REGIONAL VOICE SEARCH PATTERN:
-- For an Argentine Spanish voice: pass language='es' AND locale='es-AR' (the proxy paginates ~505 unique Argentine voices in the catalog). Some are tagged accent='argentine' (~58) and others accent='latin american' + locale='es-AR' (~447) — both are geographically Argentine.
+- For an Argentine Spanish voice: pass language='es' AND locale='es-AR' (the proxy paginates ~505 unique Argentine voices in the catalog). Some are tagged accent='argentine' (~58) and others accent='latin american' + locale='es-AR' (~447); both are geographically Argentine.
 - For Mexican: language='es' + locale='es-MX'.
 - For British: language='en' + locale='en-GB' (or accent='british').
 - For American: language='en' + locale='en-US' (or accent='american').
@@ -113,11 +113,11 @@ SERVER-SIDE FILTERS (forwarded by Followr proxy, verified empirically 2026-05-20
 - featured_only (boolean, mapped to featured=1 server-side)
 - min_notice_period_days (filter floor on the voice's notice period)
 
-CLIENT-SIDE FILTERS (Followr proxy silently ignores these — applied locally after fetching):
+CLIENT-SIDE FILTERS (Followr proxy silently ignores these; applied locally after fetching):
 - use_case (advertisement / characters_animation / conversational / entertainment_tv / informative_educational / narrative_story / social_media)
 - descriptive (calm / confident / deep / warm / upbeat / professional / gentle / casual / mature / etc.)
 
-PAGINATION: auto-paginates server-side using has_more (the meta.total field is misleading — do NOT trust it). Default max_pages=3 fetches up to ~300 voices per call. Increase max_pages for exhaustive searches.
+PAGINATION: auto-paginates server-side using has_more (the meta.total field is misleading; do NOT trust it). Default max_pages=3 fetches up to ~300 voices per call. Increase max_pages for exhaustive searches.
 
 PRESENTING TO USER: never dump 100+ voices to the user. Pick a shortlist of 5-10 best matches and include their preview_url so the user can actually listen before picking. Reference voices by NAME, never by voice_id.
 
@@ -125,7 +125,7 @@ KNOWN QUIRK: when accent + page>0 are combined, the next page falls back to mixe
       inputSchema: {
         language: z.string().optional().describe("ISO 639-1 code. Server-side. The primary filter for narrowing by spoken language."),
         locale: z.string().optional().describe("Locale tag like es-AR (Argentine), en-US, pt-BR. Server-side. The most reliable regional filter via Followr proxy."),
-        accent: z.string().optional().describe("Voice accent like argentine, mexican, british. Server-side; requires language context for coherent results. Many Argentine voices use accent='latin american' + locale='es-AR' — for full Argentine coverage prefer locale=es-AR over accent=argentine alone."),
+        accent: z.string().optional().describe("Voice accent like argentine, mexican, british. Server-side; requires language context for coherent results. Many Argentine voices use accent='latin american' + locale='es-AR'; for full Argentine coverage prefer locale=es-AR over accent=argentine alone."),
         gender: z.enum(["male", "female", "non-binary"]).optional().describe("Server-side."),
         age: z.enum(["young", "middle_aged"]).optional().describe("Server-side."),
         category: z.enum(["professional", "high_quality"]).optional().describe("Server-side."),
