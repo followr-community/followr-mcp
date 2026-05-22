@@ -1012,7 +1012,7 @@ PRECONDITION: company_id required. If multiple companies and the user hasn't nam
 
 PRIMARY USE: recover prior generations and reference their URLs without paying credits to regenerate. Especially valuable for images/audio/video which are expensive.
 
-INCLUDE: for images pass include="image,image.thumbnail"; for videos include="videos,videos.thumbnail". The base resource doesn't always hydrate file fields without an explicit include.
+INCLUDE: for images pass include="images,images.thumbnail" (PLURAL); for videos include="videos,videos.thumbnail". The base resource doesn't always hydrate file fields without an explicit include. NOTE: the API rejects the singular form "image,image.thumbnail" with HTTP 400; use plural even when filtering type=image.
 
 Sorted newest first by default.`,
       inputSchema: {
@@ -1022,7 +1022,7 @@ Sorted newest first by default.`,
           .optional()
           .describe("Filter by generation type. Omit for all types."),
         model: z.string().optional().describe("Filter by exact model id. Useful for Viral Shorts (creatomate_short)."),
-        include: z.string().optional().describe("Comma-separated includes. e.g. 'image,image.thumbnail' for images, 'videos,videos.thumbnail' for videos."),
+        include: z.string().optional().describe("Comma-separated includes. e.g. 'images,images.thumbnail' for images (plural even for type=image), 'videos,videos.thumbnail' for videos. Singular 'image,image.thumbnail' is REJECTED by the API."),
         page_size: z.number().int().positive().max(100).optional(),
         sort: z.string().optional().describe("Default -created_at."),
       },

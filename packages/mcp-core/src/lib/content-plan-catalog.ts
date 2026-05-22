@@ -546,7 +546,7 @@ export const PLANNING_STRATEGY = {
   youtube_feed_policy:
     "YouTube long_video (the youtube:long_video slot in the compatibility matrix) is a long-form publishing pipeline, NOT a cross-postable surface. DO NOT propose YouTube long_video in any plan_item unless:\n" +
     "(a) the user explicitly asks for long-form YouTube content for the week, or\n" +
-    "(b) the user mentions they have pre-recorded long videos ready to upload (then assets_strategy.video_source = { type: 'asset_id', id } or 'url', NEVER 'ai_generate' — AI video clips top out at ~8 seconds and would be unwatchable as YT feed content).\n" +
+    "(b) the user mentions they have pre-recorded long videos ready to upload (then assets_strategy.video_source = { type: 'asset_id', id } or 'url', NEVER 'ai_generate' because AI video clips top out at ~8 seconds and would be unwatchable as YT feed content).\n" +
     "YouTube Short is FINE to propose: it shares the 9:16 reel aspect with TikTok and IG/FB Reel, so it amortizes the same generation cost. When the user is opted in to YouTube Short, treat it as a P1 network and include it in the cross-post reel slot.\n" +
     "If the agent is unsure whether to include YouTube at all, default to: include youtube:short when the brand is video-native and shipping reels; OMIT youtube:long_video unless asked.",
 
@@ -592,7 +592,7 @@ export const PLANNING_STRATEGY = {
       youtube: {
         target_5_to_7_posts: { short: "1-2 per week when included as a cross-post of the IG/TikTok reel asset", long_video: "OFF by default, opt-in only" },
         minimum_floor:
-          "youtube:short is FINE to propose as cross-post of the P1 9:16 reel asset (zero extra cost, shares the same generation). youtube:long_video is OFF by default: never propose it in a plan_item unless the user explicitly asked for long-form YouTube content this week OR mentioned they have pre-recorded long videos ready (in which case use assets_strategy.video_source = { type: 'asset_id' } or 'url', NEVER 'ai_generate' — AI clips top out at ~8s).",
+          "youtube:short is FINE to propose as cross-post of the P1 9:16 reel asset (zero extra cost, shares the same generation). youtube:long_video is OFF by default: never propose it in a plan_item unless the user explicitly asked for long-form YouTube content this week OR mentioned they have pre-recorded long videos ready (in which case use assets_strategy.video_source = { type: 'asset_id' } or 'url', NEVER 'ai_generate' since AI clips top out at ~8s).",
       },
     },
     cross_post_default:
@@ -604,4 +604,101 @@ export const PLANNING_STRATEGY = {
     anti_pattern:
       "Planning 5 IG posts for the week with 0 reels because the brand has no past reels and falling back to 'safe' feed/carousel. This is the EXACT inertia the planner should help break, not reinforce. Defaulting to feed because 'past data shows feed' (or because past data is empty) is reinforcement of status quo, not strategy. Pick the most movement-friendly concept of the week (try-on, transition, BTS, before/after) and propose it as a reel even when the brand has only posted statics before. The user can always push back; the planner should not silently default to the safe choice.",
   },
+
+  copy_drafting_principle:
+    "EVERY sub_post needs TWO fields when running inside an interactive session: caption_concept (your editorial brief, NOT shown to the user) AND copy_draft (the publication-ready text the user will actually see in Followr). copy_draft is the user-facing post body; caption_concept is your reasoning trace.\n\n" +
+    "WHY both: execute_content_plan persists copy_draft verbatim into the post's description. If you leave copy_draft undefined, the resolver falls back to a server-side generate_text call using caption_concept as the brief (path B, costs ai_text_budget words, OK quality), and if THAT fails too, the directive itself becomes the post body (path C, looks like reading a prompt). The 2026-05-21 audit found a PostApprove session where 10 posts shipped as drafts containing literal directive text ('Hook: \"X\". Explicar el flow de 3 pasos: schedule normal, ...'). That is the failure mode this field exists to prevent.\n\n" +
+    "PER-NETWORK COPY GUIDELINES (target length, hashtag count) when you write copy_draft:\n" +
+    "- LinkedIn: 100-200 words. Include 3-5 hashtags at the end. Hook on line 1, value on lines 2-4, CTA at the end. Professional tone unless brand declares otherwise.\n" +
+    "- Instagram feed/carousel: 100-150 words. 5-8 hashtags on the last line (mix of broad + niche). First sentence is the hook; the rest can be more conversational.\n" +
+    "- Instagram Reel/Story: 60-120 words. 3-5 hashtags. Hook-heavy because Reels surface from suggested feeds.\n" +
+    "- X / Twitter: <=280 characters total. 1-3 hashtags integrated in the body, not as a tail.\n" +
+    "- TikTok: 50-150 characters. 3-5 hashtags integrated or trailing. Trending-hashtag-aware (use sparingly when relevant).\n" +
+    "- Threads: <=500 characters. 0-3 hashtags optional.\n" +
+    "- Pinterest: 20-80 character title; hashtags are NOT useful (Pinterest is keyword-driven). Skip them.\n" +
+    "- Facebook feed: 80-180 words. 1-3 hashtags optional, light usage works best.\n" +
+    "- YouTube Short: 60-120 words description, 3-5 hashtags. YouTube long_video: 150-400 words with timestamps if applicable.\n" +
+    "- Bluesky: <=300 characters, 1-3 hashtags optional.\n\n" +
+    "LANGUAGE: copy_draft must match user_answers.language (default = company.language). Do NOT mix languages between sub_posts of the same plan_item (the 2026-05-21 PostApprove audit had LinkedIn in English and Instagram in Spanish for the same concept, wrong; both should match the audience's language). When the audience is LATAM but company.language is 'en', ASK the user to pick before writing copy.\n\n" +
+    "HASHTAG POLICY: if user_answers.hashtags_policy === 'off', include NO hashtags in any network. Otherwise apply the per-network counts above.\n\n" +
+    "ANTI-PATTERN: writing copy_draft only for Instagram and leaving LinkedIn / X / TikTok with empty copy_draft. That dumps the fallback path onto every other network and produces inconsistent quality across the same plan_item. Be consistent: either write copy_draft for all sub_posts, or none (and rely on path B fallback for the whole plan_item).",
+
+  image_reuse_principle:
+    "Within a single plan_item, when two sub_posts (typically two different networks) need conceptually the same asset (cover slide, step illustration, CTA card), DO NOT duplicate the AssetSourceAiImage with two prompts that only differ by a stylistic adjective. The 2026-05-21 PostApprove audit found two cases (cover LinkedIn vs cover IG; step01 LinkedIn vs step01 IG) where the prompts differed only by 'generous negative space' / 'professional SaaS aesthetic' at the tail. The model rendered visually indistinguishable outputs and burned 2 credits per pair for zero differentiation (28% of the post's image budget wasted).\n\n" +
+    "PRINCIPLE: differentiation by ADJECTIVE in the prompt is decorative and unreliable; differentiation by ASPECT_RATIO or COPY-TEXT is structural and reliable.\n\n" +
+    "Practical rules:\n" +
+    "1. SAME CONCEPT, SAME RATIO, SAME COPY-TEXT-ON-IMAGE: use ONE AssetSourceAiImage with shared_concept_key set (e.g. 'cover', 'step-01'). Reference the SAME ref by shared_concept_key in carousel_sources of both networks. The resolver collapses them to one generation. This is the canonical path and the validator looks for it.\n" +
+    "2. DIFFERENT RATIO (LinkedIn 16:9 vs IG 1:1): generate TWO refs but set aspect_ratio explicitly on each, with the same prompt text. The fingerprint includes aspect_ratio so they are distinct generations, but the differentiation is meaningful and structural.\n" +
+    "3. DIFFERENT COPY TEXT ON IMAGE (localized covers, e.g. EN vs ES): generate TWO refs with prompts that include the different copy text. The differentiation is meaningful.\n" +
+    "4. Prompt variations like 'generous negative space', 'professional aesthetic', 'minimalist', etc.: the model treats these as soft style hints and rarely produces visibly different outputs. NEVER use them as the ONLY differentiation between two near-identical concepts.\n\n" +
+    "ASPECT RATIO defaults per network and product_type (use aspect_ratio explicitly in AssetSourceAiImage to override the company's ai_preferences.image_aspect_ratio):\n" +
+    "- LinkedIn feed single_image: 1.91:1 closest enum = 16:9 (or 1:1 for portrait-friendly). LinkedIn carousel: 1:1.\n" +
+    "- Instagram feed single_image: 1:1 (default) or 3:4 for portrait emphasis. Instagram carousel: 1:1.\n" +
+    "- Instagram Reel / Story: 9:16.\n" +
+    "- Facebook feed: 1:1 or 16:9. Facebook Reel: 9:16.\n" +
+    "- TikTok: 9:16 ALWAYS (the network only accepts 9:16 video; for the cover/preview image, still 9:16 if used).\n" +
+    "- YouTube Short: 9:16. YouTube long_video thumbnail: 16:9.\n" +
+    "- X / Twitter: 16:9 or 1:1.\n" +
+    "- Pinterest: 3:4 vertical (2:3 vertical also accepted; 3:4 is the closest enum).\n" +
+    "- Threads: same as Instagram, 1:1 default.\n" +
+    "- Bluesky: 16:9 or 1:1.\n\n" +
+    "VALIDATOR BACKSTOP: draft_content_plan runs a normalized Levenshtein similarity check between every pair of AssetSourceAiImage prompts inside the same plan_item. Pairs >=85% similar surface a non-blocking warning with resolution_options (merge_with_shared_concept_key / differentiate_by_aspect_ratio / acknowledge_and_proceed). Take the merge_with_shared_concept_key option unless the user has a creative reason to keep them distinct.",
+
+  no_networks_connected_handling:
+    "When prepare_content_plan_context returns connected_networks.length === 0, STOP before drafting the plan. The _assistant_guidance.no_networks_connected_blocker field will be populated; surface its user_message verbatim and ask the user to pick one of the resolution_options (abort_and_connect / proceed_as_drafts_only). The point is to avoid spending the agent's context on a 7-day plan that will sit as un-publishable drafts because no LinkedIn / IG / TikTok integration exists.",
+
+  brand_voice_setup_handling:
+    "When prepare_content_plan_context returns brand_voice_setup_proposal != null (i.e. the company has no brand voice prompt loaded), STOP before drafting the plan. Surface the proposal's user_message verbatim. If the user picks 'create_brand_voice_first', call create_prompt with the suggested_create_prompt_seed values from the response (a single tool call). After it succeeds, re-call prepare_content_plan_context to refresh the brief, then proceed with draft_content_plan. If the user picks 'proceed_with_default_voice', acknowledge the trade-off and continue.",
+
+  validator_auto_resolve_principle:
+    "When draft_content_plan returns warnings with resolution_options (e.g. rationale_suggests_carousel_but_layout_is_single, near_duplicate_ai_image_prompts, ai_video_implies_multiple_references), do NOT pass the decision to the user every time. For the OBVIOUS fixes apply them via update_content_plan automatically and tell the user 'lo corregí porque la diferencia era trivial, avisame si querías que se quede así'. Specifically:\n" +
+    "- rationale_suggests_carousel_but_layout_is_single: auto-promote to carousel_images with 3-5 AssetSourceAiImage slides based on the rationale + caption_concept. The single_image was a planner slip, not a deliberate choice.\n" +
+    "- near_duplicate_ai_image_prompts (similarity >= 0.95): auto-merge using shared_concept_key derived from the concept (e.g. 'cover-{date}', 'step-01-{slug}'). Tell the user 'unifiqué la cover entre redes; eran prompts casi idénticos'.\n" +
+    "- network_not_connected: auto-drop the sub_post and mention it to the user 'saqué LinkedIn del lunes porque no está conectada'.\n" +
+    "Use the user's judgment ONLY for warnings where the trade-off is genuinely subjective (quality_upgrade_check, format_mix_per_network suggestions, near_duplicate at 0.85-0.94 which could be intentional). Don't dump every warning as a question.",
+
+  brand_visual_identity_principle:
+    "Followr's Brand Visual Identity (BVI) is a persistent visual style profile for a company, stored as a delimited JSON block inside Company.description (parsed via parseBrandIdentityFromDescription). When BVI is configured, execute_content_plan AUTO-INJECTS it into every AI image generation: the brief is appended to the prompt, and 3-5 tagged template/element assets are added as reference_image_urls.\n\n" +
+    "LIFECYCLE (5-tool setup + 2-tool refresh):\n" +
+    "  Setup: assess_brand_visual_identity -> draft_brand_visual_identity -> execute_brand_visual_identity -> manufacture_brand_templates (cost-gated, ~325 cr for 12 templates) -> finalize_brand_templates.\n" +
+    "  Refresh: propose_brand_template_refresh -> apply_brand_template_refresh.\n\n" +
+    "WHEN TO SUGGEST SETUP:\n" +
+    "  - Any time prepare_content_plan_context returns brand_visual_identity_status='missing' AND the user is about to generate >=3 AI images, surface the setup proactively. The output quality gap is dramatic: brands without BVI ship generic stock-looking visuals; brands with BVI ship cohesive on-brand content.\n" +
+    "  - When the user explicitly says 'quiero que mis posts se sientan más mi marca' or similar.\n" +
+    "  - When the user complains that a previous generation was off-brand.\n\n" +
+    "WHEN NOT TO SUGGEST SETUP:\n" +
+    "  - The user is generating 1-2 throwaway / experimental images.\n" +
+    "  - The user explicitly said 'no quiero brand grounding'.\n" +
+    "  - The company has fewer than 30 days of activity (too early for past-winner refresh signal).\n\n" +
+    "PER-CALL OPT-OUT:\n" +
+    "  AssetSourceAiImage.use_brand_visual_identity = false skips BVI auto-injection for that source. Useful for anti-pattern examples, brand-agnostic mockups, or comparison material. Defaults to true.\n\n" +
+    "USER NEVER MENTIONS THE BLOCK BY NAME. The block lives inside description but the agent surfaces it as 'identidad visual cargada' or 'tu paleta y refs de marca'. NEVER quote the JSON to the user.",
+
+  carousel_consistency_principle:
+    "When a carousel sub_post has 2+ AI image slides, execute_content_plan automatically processes them SEQUENTIALLY (not in parallel) and feeds slide N-1's output URL as an extra reference into slide N's generation. This produces visual continuity across slides: same typography, same lighting, same framing. The trade-off is latency: a 5-slide chained carousel takes 5 × generation_time instead of max(generation_times).\n\n" +
+    "DETECTION: shouldChainCarousel returns true when asset_layout='carousel_images' AND >=2 carousel_sources are AI image generations. Mixed carousels (asset_id + ai_generate) still chain because the asset_id slides have stable URLs that can be passed forward.\n\n" +
+    "WHEN TO PROACTIVELY OFFER CHAINING:\n" +
+    "  The agent does not toggle chaining manually; it's auto-detected. But mention the latency in the preview when a chained carousel is detected: 'es un carrusel de 5 slides AI, voy a generarlas en cadena para que se sientan parte del mismo set. Va a tardar ~5 minutos en lugar de 1, pero la consistencia visual mejora notoriamente'.\n\n" +
+    "FINGERPRINT IMPACT:\n" +
+    "  The fingerprint includes reference_image_urls. Chained slides get unique fingerprints because the injected previous-URL differs per slide. No accidental cache hits.\n\n" +
+    "PARTIAL FAILURES:\n" +
+    "  If slide N fails, slide N+1 (and onward) get whatever URL was last successfully resolved as their chain ref. The agent surfaces partial output in the result so the user can decide whether to retry the missing slides.",
+
+  typography_reference_principle:
+    "Asset tagged with brand:typography-reference provides ONLY typographic style guidance (font weight, letter shapes, kerning, alignment). The resolver auto-detects when such a ref is included in an AI image generation and appends a 'negative literal copy' suffix to the prompt instructing the model to use the typographic STYLE without copying the literal text from the reference.\n\n" +
+    "USE CASES:\n" +
+    "  - User uploaded a screenshot of their brand wordmark or a banner with their custom font. Tag as TYPOGRAPHY_REFERENCE in __brand_elements. The resolver picks it up and applies the suffix automatically.\n" +
+    "  - Aspirational brand og:images often contain typography (wordmark + headline). autoClassifyAsset auto-tags them as both ASPIRATIONAL and TYPOGRAPHY_REFERENCE so the resolver applies the suffix.\n\n" +
+    "MULTI-REF FOR STRONGER SIGNAL:\n" +
+    "  A single typography reference gives the model one example to abstract from. 2-3 references of the SAME font in DIFFERENT contexts (banner, headline, body text) gives the model better signal that 'typography is the constant, content varies'. The current 5-ref cap limits how many typography refs we can include; subject of TODO_V2.md item.\n\n" +
+    "ANTI-PATTERN:\n" +
+    "  Including typography refs WITHOUT the suffix → the model copies the literal text into the output. NEVER turn off the suffix while typography refs are present.",
+
+  ai_image_styles_neutralization_principle:
+    "Company.ai_image_styles is a Followr UI field where the user can pick from 69 preset image styles (Hyperrealism, Anime, Watercolor, etc.). Empirical A/B test on 2026-05-22 with company id 7 and nano_banana_2 confirmed the field is VESTIGIAL: setting 'Pencil Art' did NOT affect the output of a 'red apple' generation, and the POST body to /api/aiResults/image does NOT include ai_image_styles in any form.\n\n" +
+    "IMPLICATIONS FOR PLANNING:\n" +
+    "  - The MCP does NOT need to manage ai_image_styles for generation correctness. It has no effect on nano_banana_2.\n" +
+    "  - During setup_brand_visual_identity the wizard offers to clear ai_image_styles (defensive: cosmetic only, but avoids user confusion seeing 'Hyperrealism selected' in Followr UI while the brand identity says otherwise).\n" +
+    "  - Unverified for premium image models (gpt_image_2, imagen4_*, ideogram_v3, flux_pro_1.1). If a future test shows premium models DO consume the field, this principle needs updating. Tracked in TODO_V2.md.\n\n" +
+    "DO NOT spend agent context explaining ai_image_styles to the user. If they ask, say 'es un campo de Followr UI sin efecto en la generación con el modelo default; no afecta tu Brand Visual Identity'.",
 };

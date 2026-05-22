@@ -23,6 +23,7 @@ import { registerAiResultsTools } from "./tools/ai-results.js";
 import { registerAnalyticsTools } from "./tools/analytics.js";
 import { registerAssetTools } from "./tools/assets.js";
 import { registerAvatarTools } from "./tools/avatars.js";
+import { registerBrandIdentityTools } from "./tools/brand-identity.js";
 import { registerCanvaTools } from "./tools/canva.js";
 import { registerCompanyTools } from "./tools/companies.js";
 import { registerContentPlanTools } from "./tools/content-plan.js";
@@ -75,6 +76,7 @@ export function registerFollowrTools(
   registerAssetTools(server, client, options);
   registerCanvaTools(server, client, options);
   registerContentPlanTools(server, client, options);
+  registerBrandIdentityTools(server, client, options);
   registerResearchTools(server, client, options);
   registerFollowrResources(server, client, options);
   registerFollowrPrompts(server, client, options);

@@ -43,11 +43,20 @@ import {
   VIDEO_MODELS,
   compatibilityFor,
 } from "../lib/content-plan-catalog.js";
+import {
+  BRAND_TAGS,
+  type BrandTag,
+  type BrandVisualIdentity,
+  lookupAssetsByTag,
+  parseBrandIdentityFromDescription,
+  suggestedTagsForConcept,
+} from "../lib/brand-identity.js";
 import { resolveDriver } from "../lib/driver-resolver.js";
 import { normalizePreferences } from "../lib/normalize-preferences.js";
 import { getAiPreferences } from "../lib/preferences.js";
 import {
   type AssetLayout,
+  type AssetSourceAiImage,
   type AssetsStrategy,
   type ContentPlan,
   type PlanItem,
@@ -799,6 +808,80 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
         _assistant_guidance: {
           ultrathink_required: PLANNING_STRATEGY.ultrathink_required,
           planning_strategy: PLANNING_STRATEGY,
+          // EARLY BLOCKER: when zero social networks are connected on the
+          // company, the entire content plan would produce drafts that the
+          // user cannot publish until they connect networks. This used to
+          // surface only as a per-sub_post warning AFTER the agent built
+          // the whole plan, wasting tokens. Now we raise the alarm at
+          // bootstrap so the agent can ask upfront: "abort and connect
+          // networks first, or build drafts anyway?".
+          no_networks_connected_blocker: connectedNetworks.length === 0
+            ? {
+                severity: "blocker_at_flow_start",
+                user_message:
+                  "Esta empresa todavía no tiene ninguna red social conectada en Followr. Si seguimos adelante, todo el plan va a quedar como drafts y no se va a poder publicar hasta que conectes al menos una red. ¿Querés (a) abortar el plan y conectar redes primero, o (b) armar drafts igual para revisarlos y publicar manualmente más adelante?",
+                resolution_options: [
+                  {
+                    id: "abort_and_connect",
+                    description:
+                      "Detener el flujo. El usuario abre Followr (Settings > Social Networks) y conecta las redes objetivo. Una vez conectadas, re-llamar prepare_content_plan_context para que connected_networks deje de estar vacío.",
+                  },
+                  {
+                    id: "proceed_as_drafts_only",
+                    description:
+                      "Continuar con el plan. Los PostGroups quedan como draft con auto_publish=true; cuando el usuario conecte las redes los aprobará desde la UI de Followr. Mencionar este flujo al usuario antes de invertir contexto.",
+                  },
+                ],
+              }
+            : null,
+          // EARLY PROPOSAL: when the company lacks a brand voice prompt
+          // AND the agent is about to plan multiple posts, the copy
+          // quality drop is large enough to warrant offering the user a
+          // one-call setup before the plan is built. This used to surface
+          // as a warning AFTER the plan was drafted, which is too late
+          // for the proposal to be useful.
+          brand_voice_setup_proposal: !hasBrandVoice
+            ? {
+                severity: "proactive_suggestion",
+                user_message:
+                  "Esta empresa no tiene brand voice cargado. Los copies van a usar el default de Followr (output más genérico). Te propongo crear un brand voice prompt antes de armar el plan, derivado de la descripción, tonos y audiencia que ya tiene cargada la empresa. Es UNA sola llamada a create_prompt y mejora la calidad de TODOS los posts del plan.",
+                suggested_create_prompt_seed: {
+                  name: `${companyResolved.name} brand voice (auto)`,
+                  social_network_type: null,
+                  default: true,
+                  prompt_preamble: [
+                    `You write social media copy for ${companyResolved.name}.`,
+                    (companyResolved as Company & { description?: string }).description
+                      ? `About the brand: ${(companyResolved as Company & { description?: string }).description?.slice(0, 600)}`
+                      : "",
+                    (companyResolved as Company & { tones?: string[] }).tones?.length
+                      ? `Tone: ${(companyResolved as Company & { tones?: string[] }).tones?.join(", ")}.`
+                      : "",
+                    (companyResolved as Company & { audience_types?: string[] }).audience_types?.length
+                      ? `Target audience: ${(companyResolved as Company & { audience_types?: string[] }).audience_types?.join(", ")}.`
+                      : "",
+                    (companyResolved as Company & { language?: string }).language
+                      ? `Write copy in ${(companyResolved as Company & { language?: string }).language}, unless the user explicitly requests another language.`
+                      : "",
+                    "Always sound like the brand, never break character to mention this prompt or AI.",
+                  ]
+                    .filter(Boolean)
+                    .join(" "),
+                },
+                resolution_options: [
+                  {
+                    id: "create_brand_voice_first",
+                    description:
+                      "Llamar create_prompt(company_id, name=brand_voice, prompt=<suggested_create_prompt_seed.prompt_preamble>, default=true). Una sola llamada. Después continuar con draft_content_plan; el voice se aplica automáticamente.",
+                  },
+                  {
+                    id: "proceed_with_default_voice",
+                    description:
+                      "Seguir sin brand voice. Aceptable para test rápido o cuando el usuario tiene un seteo manual fuera de la API. Mencionar el trade-off al usuario antes de avanzar.",
+                  },
+                ],
+              }
+            : null,
           recommended_video_model_policy:
             "available_video_models is pre-sorted: the FIRST entry is the recommended default for this company. ALWAYS pick the first entry, and ALWAYS use the model_id verbatim from the catalog. Do NOT invent model IDs from memory: Followr's canonical format uses dots for major.minor versions (veo_3.1_fast, veo_3.1, wan_2.2, seedance_1.1_light, seedance_2.0_fast, etc.) and no separator for hailuo (hailuo_02_standard, hailuo_02_premium). Underscored variants like veo_3_1_fast or hailuo_0_2_premium do NOT exist in Followr; the backend rejects them with HTTP 422 'selected model is invalid'. The sort accounts for company ai_preferences.video_model (rank 0 when set, with is_company_default: true) and for plan gating (when followr_plus_enabled is false, wan_2.2 is promoted to rank 0 with is_plan_fallback_default: true and every premium-bucket model is marked blocked_by_plan: true and affordable_at_default_duration: false). On accounts WITHOUT Followr Plus the ONLY accepted video model is wan_2.2; never recommend a premium-bucket model on those accounts. If the user explicitly asks for a premium model and followr_plus_enabled is false, explain the limitation and point them to followr.ai to activate the Followr Plus add-on.",
           recommended_image_model_policy:
@@ -897,8 +980,46 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
   const AssetSourceAiImageSchema = z.object({
     type: z.literal("ai_generate"),
     prompt: z.string().min(1).max(2000),
-    reference_image_url: z.string().url().optional(),
+    reference_image_url: z.string().url().optional().describe(
+      "Legacy single-reference field. Prefer reference_image_urls for new code.",
+    ),
+    reference_image_urls: z
+      .array(z.string().url())
+      .max(5)
+      .optional()
+      .describe(
+        "Up to 5 reference images passed alongside the prompt as image-to-image guidance. Useful for keeping subject / style continuity (logo + hero + recent post). The resolver auto-injects brand reference URLs from the BrandVisualIdentity when use_brand_visual_identity is true; explicit URLs here are MERGED with brand auto-refs, capped at 5 total. The fingerprint cache includes this list, so refs that differ produce distinct generations even when the prompt is identical.",
+      ),
     model: z.string().optional(),
+    aspect_ratio: z
+      .enum(["1:1", "4:3", "16:9", "3:4", "9:16"])
+      .optional()
+      .describe(
+        "Output aspect ratio for the AI image. When omitted, the platform falls back to the company's ai_preferences.image_aspect_ratio. Recommended per-network defaults: LinkedIn feed = 1.91:1 closest match is 16:9 (otherwise 1:1); LinkedIn carrusel = 1:1; Instagram feed/carousel = 1:1 (4:5 if you want vertical, choose 3:4 here as the closest enum value); Instagram Reel / Story = 9:16; TikTok / YouTube Short = 9:16; YouTube long = 16:9; Twitter = 16:9 or 1:1; Pinterest = 3:4 vertical. PREFER differentiating by aspect_ratio (structural) over differentiating by adjectives in the prompt (decorative). Two near-identical prompts that only differ in style words will produce near-identical outputs and burn credits for zero differentiation.",
+      ),
+    shared_concept_key: z
+      .string()
+      .min(1)
+      .max(40)
+      .optional()
+      .describe(
+        "Optional dedupe hint. When two AssetSourceAiImage sources within the same plan_item share the same shared_concept_key, the resolver guarantees ONE generation and reuses the asset across all sub_posts that reference that key. Use this when the cover or a step slide is the same concept across networks (covers, step illustrations, CTA cards). Without this key, dedupe falls back to exact prompt-equality, which silently misses near-duplicates.",
+      ),
+    use_brand_visual_identity: z
+      .boolean()
+      .optional()
+      .default(true)
+      .describe(
+        "When true (default), the resolver auto-injects this company's BrandVisualIdentity: appends the brief + palette + typography + anti-patterns to the prompt, AND adds 3-5 tagged template/element assets as reference_image_urls. Set false ONLY when generating fresh untouched content (anti-pattern examples, brand-agnostic mockups). No-op if the company has no brand identity configured.",
+      ),
+    inspired_by_brand: z
+      .string()
+      .min(1)
+      .max(80)
+      .optional()
+      .describe(
+        "Optional aspirational brand name (e.g. 'Stripe', 'Notion') to fetch one extra reference from at execute time. Use sparingly; each ref dilutes the brand's own identity. Reserved for forward compat: in this version the field is accepted but not yet consumed by the resolver (tracked in TODO_V2.md).",
+      ),
   });
   const AssetSourceAiVideoSchema = z.object({
     type: z.literal("ai_generate"),
@@ -931,7 +1052,10 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
       .array(z.union([AssetSourceUrlSchema, AssetSourceAssetIdSchema, AssetSourceAiImageSchema]))
       .min(2)
       .max(20)
-      .optional(),
+      .optional()
+      .describe(
+        "Ordered list of carousel slides. Array position equals display order in the published carousel: index 0 is the cover, the last index is the closing slide. The order is preserved end-to-end (validator, resolver, execute_content_plan, create_post). Plan accordingly: cover -> steps in numeric order -> CTA, or hero -> details -> CTA. NEVER assume the platform re-sorts; it does not.",
+      ),
     video_source: z
       .union([
         AssetSourceUrlSchema,
@@ -948,7 +1072,21 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
     product_type: ProductTypeEnum,
     asset_layout: AssetLayoutEnum,
     assets_strategy: AssetsStrategySchema,
-    caption_concept: z.string().min(1).max(2000),
+    caption_concept: z
+      .string()
+      .min(1)
+      .max(2000)
+      .describe(
+        "INTERNAL DIRECTIVE. Short brief that captures intent of the copy: hook, key points, tone hints, CTA, length target. This field is your reasoning trace, NOT the published copy. The user does NOT see it (unless copy_draft is empty, in which case it falls back to this string verbatim as a last resort). Always pair this with copy_draft when you have the conversational context.",
+      ),
+    copy_draft: z
+      .string()
+      .min(1)
+      .max(3000)
+      .optional()
+      .describe(
+        "FINAL COPY in the post's language, ready to publish. The agent SHOULD write this during draft_content_plan when running inside an interactive session, using brand_context (tones, audience, language, brand_voice_prompts) + the user's stated intent + the network's format constraints. execute_content_plan persists this string verbatim as the post description. Leave it undefined ONLY for non-interactive flows (scheduled cron, autonomous loops) where you want Followr's generate_text to fill it server-side at execute time using caption_concept as the prompt. Length guidelines per network: LinkedIn feed 100-200 words; Instagram feed 100-150 words + 3-8 hashtags; X/Twitter <=280 chars; TikTok caption 50-150 chars; Threads <=500 chars. Match the language declared in user_answers.language (default = company.language).",
+      ),
     tags: z.array(z.string()).optional(),
   });
 
@@ -975,6 +1113,10 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
       annotations: MUTATION_IDEMPOTENT,
       title: "Validate a structured content plan and persist it for review before execution",
       description: `Take a fully-structured plan_items array (each plan_item = one PostGroup with one or more per-network sub_posts) and validate it against the connected networks, per-network specs, asset layout compatibility, carousel limits and the user's current AI budget. On success, persists the plan in session memory with a plan_id that the user can later approve via execute_content_plan.
+
+EVERY sub_post must have BOTH caption_concept (your editorial brief) AND copy_draft (the publication-ready text) when running interactively. caption_concept is your reasoning trace; copy_draft is what the user actually sees in Followr. If you omit copy_draft, execute_content_plan falls back to Followr's generate_text using caption_concept as the brief (path B); the fallback works but produces more generic copy than a Claude-written draft. See PLANNING_STRATEGY.copy_drafting_principle for length and hashtag guidance per network. The 2026-05-21 PostApprove audit shipped 10 drafts where the directive text leaked into the post body as the visible copy because copy_draft did not exist yet; this field is what prevents that failure mode.
+
+For AI image generation, when two sub_posts in the same plan_item need conceptually the same asset (cover, step illustration, CTA), set shared_concept_key on BOTH AssetSourceAiImage refs so the resolver collapses them to ONE generation. See PLANNING_STRATEGY.image_reuse_principle. The validator flags near-duplicate prompts (>=85% similar) within the same plan_item as a non-blocking warning with merge_with_shared_concept_key as the recommended resolution.
 
 PRECONDITION: must have called prepare_content_plan_context first and pass its context_id here. The context anchors the company, the networks connected and the budget snapshot. If the context_id expired (2h TTL), re-call prepare_content_plan_context.
 
@@ -1004,6 +1146,20 @@ AFTER THIS RETURNS: show the summary table to the user verbatim, list any warnin
             networks_intent: z.array(SocialNetworkEnum).optional(),
             theme: z.string().max(500).optional(),
             promo_context: z.string().max(500).optional(),
+            language: z
+              .string()
+              .min(2)
+              .max(10)
+              .optional()
+              .describe(
+                "ISO-like language tag for ALL copy_draft strings and AI text generations (e.g. 'es', 'en', 'es-AR', 'pt-BR'). When omitted, the platform defaults to company.language. The validator surfaces a warning if any copy_draft is in a different language than the declared one. Use this to disambiguate when the company's language setting doesn't match the audience (e.g. company language is en but the audience is LATAM => set language='es-LA' or 'es-AR').",
+              ),
+            hashtags_policy: z
+              .enum(["auto", "off"])
+              .optional()
+              .describe(
+                "Auto-include hashtags policy. 'auto' (default) means each network's copy_draft includes its typical hashtag count: Instagram 5-8, LinkedIn 3-5, X 1-3, TikTok 3-5, Threads 0-3. 'off' suppresses hashtags entirely. Past behavior generated hashtags only on Instagram; this field makes the cross-network expectation explicit so LinkedIn copy doesn't end up barren.",
+              ),
           })
           .optional(),
         plan_items: z.array(PlanItemSchema).min(1).max(60),
@@ -1430,6 +1586,90 @@ NO MUTATION. Pure read of in-memory plan state.`,
   );
 
   // ────────────────────────────────────────────────────────────────────────
+  // preview_content_plan (batch preview of all plan_items, optionally filtered)
+  // ────────────────────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "preview_content_plan",
+    {
+      annotations: READ_ONLY,
+      title: "Render detailed previews for ALL plan_items (or a subset) in one call",
+      description: `Batch version of preview_plan_item. Returns the same per-item preview structure for EVERY plan_item in the plan (or only the slugs in 'slugs' when provided). Avoids the round-trip cost of calling preview_plan_item N times when the user asks to see "todo el detalle" up front.
+
+USE WHEN: the user asked to see the full week / multi-item breakdown at once ("mostrame el detalle completo de los 5 días", "preview de todo el plan"), or when running an autonomous flow where you want every preview cached client-side before deciding which to surface.
+
+PRECONDITION: plan_id exists in session memory. Plan must not have expired.
+
+OUTPUT: { plan_id, previews: [<ItemPreview>...], summary: { item_count, total_credits, total_image_ai, total_video_ai } }. Each preview is identical in shape to preview_plan_item output (same rendered_markdown, same asset_reuse_matrix, same flags).
+
+PRESENTING TO THE USER: do NOT dump all 5 rendered_markdown blocks one after another, that is unusable. Pick the right strategy per PLANNING_STRATEGY.per_item_preview_strategy: for 1-3 items show all; for 4-7 show a representative spot-check; for 8+ group by week or by concept type.`,
+      inputSchema: {
+        plan_id: z.string().min(1),
+        slugs: z
+          .array(z.string().min(1))
+          .optional()
+          .describe(
+            "Optional subset filter. When provided, only the matching plan_item slugs are previewed. When omitted, every plan_item in the plan is previewed.",
+          ),
+      },
+    },
+    async ({ plan_id, slugs }) => {
+      const plan = getPlan(plan_id);
+      if (!plan) {
+        return toolError({
+          reason: "plan_id_not_found",
+          user_message:
+            "No encuentro ese plan. Puede haber expirado (los planes viven 2hs en memoria) o nunca fue creado.",
+          blocking: true,
+        });
+      }
+      const slugSet = slugs && slugs.length > 0 ? new Set(slugs) : null;
+      const items = slugSet
+        ? plan.plan_items.filter((it) => slugSet.has(it.slug))
+        : plan.plan_items;
+      if (items.length === 0) {
+        return toolError({
+          reason: "no_matching_items",
+          user_message: `Ninguno de los slugs solicitados existe en el plan. Slugs disponibles: ${plan.plan_items.map((it) => it.slug).join(", ")}.`,
+          blocking: true,
+        });
+      }
+      let followrPlusEnabled: boolean | null = null;
+      try {
+        const b = await loadBudgets(client);
+        followrPlusEnabled = b?.followr_plus_enabled ?? null;
+      } catch {
+        followrPlusEnabled = null;
+      }
+      const previews = items.map((it) => buildItemPreview(plan, it, followrPlusEnabled));
+      const summary = {
+        item_count: previews.length,
+        total_credits: previews.reduce((acc, p) => acc + p.totals.credits, 0),
+        total_image_ai: previews.reduce((acc, p) => acc + p.totals.image_ai_count, 0),
+        total_video_ai: previews.reduce((acc, p) => acc + p.totals.video_ai_count, 0),
+        total_uploads: previews.reduce((acc, p) => acc + p.totals.upload_count, 0),
+        total_reuses: previews.reduce((acc, p) => acc + p.totals.reuse_count, 0),
+      };
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                plan_id: plan.plan_id,
+                previews,
+                summary,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    },
+  );
+
+  // ────────────────────────────────────────────────────────────────────────
   // execute_content_plan
   // ────────────────────────────────────────────────────────────────────────
 
@@ -1439,6 +1679,10 @@ NO MUTATION. Pure read of in-memory plan state.`,
       annotations: MUTATION_IDEMPOTENT,
       title: "Execute a previously drafted content plan against Followr (uploads, AI generations, PostGroup creation, in parallel)",
       description: `Take a draft content plan (created via draft_content_plan, optionally iterated via update_content_plan), validate that it is still consistent with current state, and execute it against Followr: upload assets from URLs, generate AI images and videos, create one PostGroup per plan_item with all its per-network sub_posts, and report granular per-item results.
+
+COPY RESOLUTION: each per-network Post's description is resolved as follows. Path A (preferred): use sp.copy_draft verbatim. Path B (fallback when copy_draft is empty): call Followr generate_chat with sp.caption_concept + brand context (company description, tones, audience) + per-network length and hashtag policy + the plan's language; persist the response as the description. Costs ai_text_budget words (very large budget by default). Path C (last resort when generation fails): persist sp.caption_concept verbatim. The chosen path is surfaced per sub_post in the response as copy_resolution_path: "copy_draft" | "generated" | "directive_fallback" so the agent can tell the user whether the copy was their own draft, server-generated, or the directive fallback.
+
+ASSET RESOLUTION: AssetSourceAiImage refs with the same shared_concept_key collapse to ONE generation inside a plan_item, regardless of prompt drift. Without shared_concept_key, dedupe falls back to exact (model, aspect_ratio, prompt) equality. Aspect_ratio is honored from the ref when set, otherwise from the company's ai_preferences.image_aspect_ratio.
 
 PRECONDITION: plan_id must exist in session memory (created by draft_content_plan, not yet executed, not expired). The agent MUST have surfaced the plan summary to the user and received EXPLICIT approval ("dale", "ejecutalo", "OK", etc) BEFORE calling this. The MCP requires confirm: true literal to proceed.
 
@@ -1563,7 +1807,32 @@ ITEM-BY-ITEM CONFIRMATION FLOW: when the user asks to advance one item at a time
       // them down to executePlanItem and resolveSubPostAssets so each call
       // can pick the right driver per modality without repeating the
       // getCompany roundtrip per sub_post.
-      const prefs = await getAiPreferences(client, plan.company_id);
+      // Load the Company too: we need its language + tones + audience to
+      // synthesize copy_draft fallbacks when a sub_post lacks one.
+      // Also load the BrandContext (parsed BrandVisualIdentity block +
+      // asset_id->url lookup) so the AI image resolver can auto-inject
+      // brand grounding (F3). All three in parallel to keep latency flat.
+      // Tolerant: failures degrade gracefully (no brand grounding when the
+      // company has no identity block; no copy_draft fallback when getCompany
+      // fails).
+      const [prefs, companyForCopy, brandContext] = await Promise.all([
+        getAiPreferences(client, plan.company_id),
+        client.getCompany(plan.company_id).catch(() => null),
+        loadBrandContext(client, plan.company_id),
+      ]);
+      const copyCtx: CopyResolutionContext = {
+        companyName: companyForCopy?.name ?? "the company",
+        companyDescription: companyForCopy?.description ?? null,
+        companyLanguage:
+          (companyForCopy as (Company & { language?: string | null }) | null)?.language ??
+          (companyForCopy as (Company & { language_iso_code?: string | null }) | null)?.language_iso_code ??
+          null,
+        tones: (companyForCopy as (Company & { tones?: string[] | null }) | null)?.tones ?? null,
+        audience:
+          (companyForCopy as (Company & { audience_types?: string[] | null }) | null)?.audience_types ?? null,
+        planLanguage: plan.user_answers.language ?? null,
+        hashtagsPolicy: plan.user_answers.hashtags_policy ?? "auto",
+      };
 
       // Compute publish_at UTC per item if auto_publish_schedule is set or
       // each item carries its own. We pass publish_at_local as YYYY-MM-DDTHH:mm
@@ -1572,7 +1841,7 @@ ITEM-BY-ITEM CONFIRMATION FLOW: when the user asks to advance one item at a time
       const itemResults: Array<Record<string, unknown>> = [];
       const executions = itemsToRun.map(async (item) => {
         try {
-          const result = await executePlanItem(client, plan.company_id, item, prefs);
+          const result = await executePlanItem(client, plan.company_id, item, prefs, copyCtx, brandContext);
           itemResults.push(result);
           return result;
         } catch (e) {
@@ -1703,6 +1972,14 @@ type VideoSrc = NonNullable<AssetsStrategy["video_source"]>;
 
 interface ResolvedAsset {
   asset_id: number;
+  /**
+   * Followr CDN URL of the resolved asset, when we have it. Populated by
+   * URL uploads and AI generations (via uploadFromUrl's return). NULL for
+   * asset_id reuse (no extra GET) and for paths that don't track it.
+   * Used by the carousel chaining pass to feed slide N-1's URL as a
+   * reference into slide N's generation.
+   */
+  asset_url: string | null;
   credits_consumed: number;
   ai_result_id: number | null;
 }
@@ -1816,10 +2093,35 @@ function fingerprintAssetSource(ref: AssetSourceRef): string {
   if (src.type === "url") return `url:${src.url}`;
   if (src.type === "asset_id") return `id:${src.id}`;
   if (src.type === "ai_generate") {
+    // Combine reference_image_url + reference_image_urls into one canonical
+    // list for fingerprinting. Refs that differ produce distinct generations
+    // even when the prompt is identical (this is what makes carousel
+    // chaining safe: slide N has slide N-1's URL injected, fingerprint
+    // changes, no accidental cache hit).
+    const collectedRefs = (() => {
+      if (mode !== "image") return [] as string[];
+      const imgSrc = src as Extract<ImageSrc, { type: "ai_generate" }>;
+      const list: string[] = [];
+      if (imgSrc.reference_image_url) list.push(imgSrc.reference_image_url);
+      if (imgSrc.reference_image_urls) list.push(...imgSrc.reference_image_urls);
+      return list;
+    })();
+    void collectedRefs; // referenced below per-branch
     if (mode === "image") {
       const imgSrc = src as Extract<ImageSrc, { type: "ai_generate" }>;
+      // shared_concept_key short-circuits: any two AssetSourceAiImage refs
+      // declaring the same key collapse into ONE generation, regardless of
+      // prompt-level adjective drift. This is the canonical way to express
+      // "the cover for LinkedIn and the cover for Instagram are the same
+      // concept" without having to keep the two prompts byte-identical.
+      if (imgSrc.shared_concept_key) {
+        return `ai_image:shared:${imgSrc.shared_concept_key}`;
+      }
       const model = imgSrc.model ?? "default";
-      return `ai_image:${model}|${imgSrc.reference_image_url ?? ""}|${imgSrc.prompt}`;
+      const ratio = imgSrc.aspect_ratio ?? "default";
+      const refsKey = collectedRefs.length > 0 ? collectedRefs.join(",") : "";
+      const useBrandFlag = (imgSrc.use_brand_visual_identity ?? true) ? "B1" : "B0";
+      return `ai_image:${model}|${ratio}|${useBrandFlag}|${refsKey}|${imgSrc.prompt}`;
     }
     const vidSrc = src as Extract<VideoSrc, { type: "ai_generate" }>;
     return `ai_video:${vidSrc.model}|${aspect_ratio ?? "9:16"}|${vidSrc.duration_seconds ?? 8}|${vidSrc.reference_image_url ?? ""}|${vidSrc.prompt}`;
@@ -1829,15 +2131,408 @@ function fingerprintAssetSource(ref: AssetSourceRef): string {
   return JSON.stringify(src);
 }
 
+/**
+ * Normalized Levenshtein similarity for two prompts. Returns 1.0 for
+ * identical strings (after lowercase + whitespace normalization), 0.0 for
+ * complete mismatch. Used by the validator to detect near-duplicate AI
+ * image prompts inside the same plan_item (the case where covers for
+ * LinkedIn and Instagram only differ by a stylistic adjective and produce
+ * indistinguishable outputs, burning a generation per network for zero
+ * differentiation. Empirical threshold from the 2026-05-21 audit: at
+ * similarity >=0.85 the model renders near-identical images.
+ */
+function levenshteinDistance(a: string, b: string): number {
+  const m = a.length;
+  const n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  let prev = new Array(n + 1) as number[];
+  for (let j = 0; j <= n; j++) prev[j] = j;
+  for (let i = 1; i <= m; i++) {
+    const curr = new Array(n + 1) as number[];
+    curr[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const ca = a[i - 1];
+      const cb = b[j - 1];
+      const cost = ca === cb ? 0 : 1;
+      curr[j] = Math.min((curr[j - 1] ?? 0) + 1, (prev[j] ?? 0) + 1, (prev[j - 1] ?? 0) + cost);
+    }
+    prev = curr;
+  }
+  return prev[n] ?? 0;
+}
+
+function normalizedPromptSimilarity(a: string, b: string): number {
+  const A = a.toLowerCase().trim().replace(/\s+/g, " ");
+  const B = b.toLowerCase().trim().replace(/\s+/g, " ");
+  if (A === B) return 1;
+  const maxLen = Math.max(A.length, B.length);
+  if (maxLen === 0) return 1;
+  const d = levenshteinDistance(A, B);
+  return 1 - d / maxLen;
+}
+
+/**
+ * Threshold over which two AI image prompts inside the same plan_item are
+ * considered near-duplicates worth flagging. 0.85 is empirical from the
+ * 2026-05-21 audit where 96-97% similar prompts produced visually
+ * indistinguishable covers.
+ */
+const PROMPT_DUPLICATE_SIMILARITY_THRESHOLD = 0.85;
+
+/**
+ * Anti-placeholder hardening for AI image prompts. Models like nano_banana_2,
+ * gpt_image_2, ideogram_v3, etc. occasionally leak prompt scaffolding into
+ * the rendered image as visible text (Lorem ipsum, "Title preview", "your
+ * text here", broken image placeholders). The Followr UI verified this
+ * empirically on 2026-05-21: a "Slack message" mockup slide ended up
+ * shipping with "Lorem ipsum dolor sit amet, consectetur adipiscing elit"
+ * inside the chat-bubble preview. Appending a clear negative-list suffix
+ * to every AI image prompt collapses the false positive rate well below 1%.
+ */
+const PLACEHOLDER_PROHIBITION_SUFFIX =
+  "\n\nIMPORTANT: do NOT include any placeholder text on the image. Specifically, NO 'lorem ipsum', NO 'placeholder', NO 'title preview', NO 'your text here', NO 'sample text', NO broken-image icons, NO dummy chat bubbles, NO grey image placeholders. If a mockup needs a label, use the real labels from the prompt itself; otherwise leave the area blank.";
+
+function hardenAiImagePrompt(prompt: string): string {
+  // Idempotent: don't double-append if the caller already injected the suffix.
+  if (prompt.includes("do NOT include any placeholder text")) return prompt;
+  return `${prompt}${PLACEHOLDER_PROHIBITION_SUFFIX}`;
+}
+
+/**
+ * Context needed to fall back to Followr's text AI when a sub_post lacks
+ * copy_draft. Loaded once per execute call and passed down so we don't
+ * round-trip getCompany per sub_post.
+ */
+interface CopyResolutionContext {
+  companyName: string;
+  companyDescription: string | null;
+  companyLanguage: string | null;
+  tones: string[] | null;
+  audience: string[] | null;
+  /** From user_answers.language; overrides companyLanguage when present. */
+  planLanguage: string | null;
+  /** From user_answers.hashtags_policy; defaults to "auto" when absent. */
+  hashtagsPolicy: "auto" | "off";
+}
+
+function lengthGuidanceForNetwork(network: SocialNetwork, productType: ProductType): string {
+  if (network === "linkedin") return productType === "long_video" ? "200-400 words" : "100-200 words";
+  if (network === "instagram") return productType === "reel" || productType === "story" ? "60-120 words" : "100-150 words";
+  if (network === "x") return "<=280 characters";
+  if (network === "tiktok") return "50-150 characters";
+  if (network === "threads") return "<=500 characters";
+  if (network === "pinterest") return "20-80 characters for the title; description optional";
+  if (network === "facebook") return "80-180 words";
+  if (network === "youtube") return productType === "long_video" ? "150-400 words description with timestamps if applicable" : "60-120 words";
+  if (network === "bluesky") return "<=300 characters";
+  return "100-150 words";
+}
+
+function hashtagGuidanceForNetwork(network: SocialNetwork, policy: "auto" | "off"): string {
+  if (policy === "off") return "Do NOT include hashtags.";
+  if (network === "instagram") return "Include 5-8 relevant hashtags at the end, on the last line.";
+  if (network === "linkedin") return "Include 3-5 relevant hashtags at the end.";
+  if (network === "x") return "Include at most 1-3 hashtags integrated in the body.";
+  if (network === "tiktok") return "Include 3-5 hashtags at the end.";
+  if (network === "threads") return "Include 0-3 hashtags, optional.";
+  if (network === "pinterest") return "Hashtags are NOT useful on Pinterest; rely on keywords in the title.";
+  if (network === "facebook") return "Include 1-3 hashtags at the end, optional.";
+  if (network === "youtube") return "Include 3-5 hashtags at the end of the description.";
+  if (network === "bluesky") return "Include 1-3 hashtags optionally.";
+  return "Include 3-5 relevant hashtags at the end.";
+}
+
+function buildCopyFallbackPrompt(sp: SubPost, ctx: CopyResolutionContext): string {
+  const language = ctx.planLanguage ?? ctx.companyLanguage ?? "the company's default language";
+  const lengthHint = lengthGuidanceForNetwork(sp.social_network, sp.product_type);
+  const hashtagHint = hashtagGuidanceForNetwork(sp.social_network, ctx.hashtagsPolicy);
+  const tonesLine = ctx.tones && ctx.tones.length > 0 ? `\n- Tone: ${ctx.tones.join(", ")}` : "";
+  const audienceLine = ctx.audience && ctx.audience.length > 0 ? `\n- Audience: ${ctx.audience.join(", ")}` : "";
+  const descriptionLine = ctx.companyDescription ? `\n- Company description: ${ctx.companyDescription.slice(0, 600)}` : "";
+
+  return [
+    `You are writing the publication-ready copy for a ${displayNetworkName(sp.social_network)} ${sp.product_type} post.`,
+    `Brand: ${ctx.companyName}.${descriptionLine}${tonesLine}${audienceLine}`,
+    `Language: write the copy in ${language}. If the directive below contains text in another language, translate it to ${language}.`,
+    `Length target: ${lengthHint}.`,
+    `Hashtags: ${hashtagHint}`,
+    "",
+    `Directive for this specific post (your editorial brief, NOT the final copy):`,
+    sp.caption_concept,
+    "",
+    "OUTPUT INSTRUCTIONS:",
+    "- Output ONLY the publication-ready copy, nothing else.",
+    "- Do NOT include meta-commentary, preface, or headers like 'Copy:' or 'Here is the post:'.",
+    "- Do NOT include the directive text or any meta-instructions.",
+    "- The first line should be the hook.",
+    "- Match the brand tone, audience expectations, and network conventions.",
+  ].join("\n");
+}
+
+/**
+ * Resolve the description that will be persisted on the per-network Post.
+ *
+ * Path A (preferred): the agent provided `copy_draft` during draft_content_plan,
+ * with full conversational + brand context. Use it verbatim. No extra call,
+ * no extra latency, no extra text-budget consumption.
+ *
+ * Path B (fallback): no copy_draft. Synthesize a prompt that injects brand
+ * context + per-network length / hashtag policy + the caption_concept as the
+ * editorial brief, then call Followr's generate_chat. Cost is paid out of
+ * ai_text_budget (very large by default, see get_ai_budget).
+ *
+ * Path C (last resort): the fallback generation fails (timeout, 5xx, plan
+ * limits). Persist the caption_concept verbatim so the post is at least
+ * created instead of crashing the whole plan. The agent can rewrite via
+ * update_post in a follow-up call.
+ */
+async function resolvePostDescription(
+  client: FollowrClient,
+  companyId: number,
+  sp: SubPost,
+  ctx: CopyResolutionContext,
+): Promise<{ description: string; path: "copy_draft" | "generated" | "directive_fallback"; ai_result_id: number | null }> {
+  if (sp.copy_draft && sp.copy_draft.trim().length > 0) {
+    return { description: sp.copy_draft, path: "copy_draft", ai_result_id: null };
+  }
+  try {
+    const prompt = buildCopyFallbackPrompt(sp, ctx);
+    const initial = await client.generateChat({ q: prompt, company_id: companyId });
+    let final = initial;
+    if (final.status !== "completed" && final.status !== "failed") {
+      final = await client.waitForAiResult(initial.id, { timeoutMs: 120 * 1000 });
+    }
+    if (final.status === "completed" && typeof final.response === "string" && final.response.trim().length > 0) {
+      return { description: final.response.trim(), path: "generated", ai_result_id: final.id };
+    }
+  } catch {
+    // Swallow and fall through to the directive last-resort branch below.
+  }
+  return { description: sp.caption_concept, path: "directive_fallback", ai_result_id: null };
+}
+
+// ── Brand visual identity injection (F3) ──────────────────────────────────
+
+/**
+ * Snapshot of a company's Brand Visual Identity + asset URL lookup table.
+ * Loaded ONCE per execute_content_plan call and propagated down to every
+ * AI image generation so the resolver can auto-inject brand grounding
+ * (brief in the prompt, tagged template/element URLs as image_urls).
+ *
+ * If the company has no BrandVisualIdentity block in description,
+ * `identity` is null and the resolver behaves exactly as before F3.
+ */
+interface BrandContext {
+  identity: BrandVisualIdentity | null;
+  /** asset_id -> Followr CDN url, for refs lookup. */
+  assetIdToUrl: Map<number, string>;
+}
+
+async function loadBrandContext(
+  client: FollowrClient,
+  companyId: number,
+): Promise<BrandContext> {
+  let identity: BrandVisualIdentity | null = null;
+  try {
+    const company = await client.getCompany(companyId);
+    const parsed = parseBrandIdentityFromDescription(company.description ?? null);
+    if (parsed.status === "ok") identity = parsed.identity;
+  } catch {
+    // Best-effort: if Company fetch fails, brand context is empty and
+    // the resolver falls back to non-branded generation.
+  }
+  const assetIdToUrl = new Map<number, string>();
+  if (identity) {
+    try {
+      const assets = await client.listAssets(companyId, {
+        pageSize: 100,
+        include: "image.thumbnail",
+      });
+      for (const a of assets) {
+        const url =
+          (a as Asset & { image?: { url?: string } }).image?.url ??
+          (a as Asset & { url?: string }).url ??
+          null;
+        if (url) assetIdToUrl.set(a.id, url);
+      }
+    } catch {
+      // Same fallback: if listAssets fails, the auto-injection just has
+      // no URLs to inject. Generations still happen with caller-provided
+      // refs (if any).
+    }
+  }
+  return { identity, assetIdToUrl };
+}
+
+/**
+ * Suffix appended to AI image prompts when the company has a Brand Visual
+ * Identity configured. Includes the brief + palette + typography +
+ * anti-patterns. Designed to read as natural prose continuation of the
+ * caller's prompt so the model treats the whole input coherently.
+ */
+function buildBrandPromptSuffix(identity: BrandVisualIdentity): string {
+  const palette = identity.palette_primary
+    .concat(identity.palette_extended)
+    .slice(0, 6)
+    .join(", ");
+  const lines: string[] = ["", "--- BRAND VISUAL IDENTITY GUIDANCE ---"];
+  lines.push(`Brief: ${identity.brief_text}`);
+  if (palette) lines.push(`Palette: ${palette}.`);
+  if (identity.typography_style_text.length > 0) {
+    lines.push(`Typography character: ${identity.typography_style_text}.`);
+  }
+  if (identity.anti_patterns_text.length > 0) {
+    lines.push(`AVOID (anti-patterns): ${identity.anti_patterns_text.join("; ")}.`);
+  }
+  lines.push(
+    "Use these as creative guidance, blended with the specific generation request above. The attached reference images carry the visual style; the brief carries the strategic intent.",
+  );
+  return lines.join("\n");
+}
+
+/**
+ * Output of pickBrandReferenceUrls. Returns not just the URLs but also a
+ * flag indicating whether any typography reference is included, so the
+ * caller can append the negative-literal-copy prompt suffix when it is
+ * (F6).
+ */
+interface PickedBrandRefs {
+  urls: string[];
+  has_typography_ref: boolean;
+}
+
+/**
+ * Pick up to maxRefs reference image URLs from the brand asset library
+ * for a given prompt. Strategy:
+ *   1. Always include the logo (max 1).
+ *   2. Add concept-matched tags via suggestedTagsForConcept.
+ *   3. Reserve 1 slot for a TYPOGRAPHY_REFERENCE asset if available
+ *      (F6: this lets the model use the brand's typographic style
+ *      without copying literal text; the caller appends a special
+ *      prompt suffix when has_typography_ref is true).
+ *   4. Pad with HERO if still under 3 refs.
+ *   5. Pad with ASPIRATIONAL for cold-start brands with <2 refs.
+ *
+ * Returns absolute Followr CDN URLs. Duplicates are filtered. The cap
+ * is the practical max for nano_banana_2 (~5); see TODO_V2.md item for
+ * revisiting per-model.
+ */
+function pickBrandReferenceUrls(
+  ctx: BrandContext,
+  promptText: string,
+  maxRefs: number,
+): PickedBrandRefs {
+  if (!ctx.identity) return { urls: [], has_typography_ref: false };
+  const out: string[] = [];
+  const seen = new Set<string>();
+  let typographyAdded = false;
+  const addByTag = (tag: BrandTag, limit: number): number => {
+    let added = 0;
+    const ids = lookupAssetsByTag(ctx.identity!, tag);
+    for (const id of ids) {
+      if (added >= limit) break;
+      const url = ctx.assetIdToUrl.get(id);
+      if (!url || seen.has(url)) continue;
+      out.push(url);
+      seen.add(url);
+      added += 1;
+      if (tag === BRAND_TAGS.TYPOGRAPHY_REFERENCE) typographyAdded = true;
+      if (out.length >= maxRefs) return added;
+    }
+    return added;
+  };
+  // 1. Always logo first.
+  addByTag(BRAND_TAGS.LOGO, 1);
+
+  // 2. Concept-matched tags. Compute remaining budget BEFORE reserving
+  // 1 slot for the typography ref (so the typography slot doesn't eat
+  // into a concept-relevant slot when both apply).
+  const suggestedTags = suggestedTagsForConcept(promptText);
+  // Reserve one slot for typography ref (if available); the rest goes to concepts.
+  const typoBudget = lookupAssetsByTag(ctx.identity, BRAND_TAGS.TYPOGRAPHY_REFERENCE).length > 0 ? 1 : 0;
+  const conceptBudget = Math.max(0, maxRefs - out.length - typoBudget);
+  let conceptSpent = 0;
+  for (const tag of suggestedTags) {
+    if (conceptSpent >= conceptBudget) break;
+    conceptSpent += addByTag(tag, conceptBudget - conceptSpent);
+  }
+
+  // 3. Typography ref (F6) at the end, leaving its slot reserved.
+  if (typoBudget > 0 && out.length < maxRefs) {
+    addByTag(BRAND_TAGS.TYPOGRAPHY_REFERENCE, 1);
+  }
+
+  // 4. Pad with HERO if still under 3 refs.
+  if (out.length < 3) addByTag(BRAND_TAGS.HERO, maxRefs - out.length);
+  // 5. Final pad with ASPIRATIONAL for cold-start brands.
+  if (out.length < 2) addByTag(BRAND_TAGS.ASPIRATIONAL, maxRefs - out.length);
+
+  return {
+    urls: out.slice(0, maxRefs),
+    has_typography_ref: typographyAdded,
+  };
+}
+
+/**
+ * Suffix appended to AI image prompts when at least one of the
+ * reference_image_urls is a TYPOGRAPHY_REFERENCE asset (F6). Instructs the
+ * model to use the typographic STYLE (font weight, letter shapes, kerning,
+ * alignment) without copying the literal text content of the reference.
+ *
+ * This is essential because vision models otherwise tend to lift the
+ * actual text from the reference into the generated image, producing
+ * outputs that say something different than the user intended.
+ */
+function buildTypographyRefSuffix(): string {
+  return [
+    "",
+    "--- TYPOGRAPHY REFERENCE NOTICE ---",
+    "One or more of the reference images is provided strictly as a TYPOGRAPHY STYLE reference. Use it to inform the typographic character of any text in the generated image: font weight, letter shapes, kerning, alignment style, decorative treatment. DO NOT copy the literal text content from the typography reference. The text in the generated image should follow the prompt above, NOT the words in the reference.",
+  ].join("\n");
+}
+
+/**
+ * Merge caller-provided reference URLs with brand auto-injected URLs,
+ * de-duplicated, capped at 5 (the practical limit for nano_banana_2 and
+ * similar models; more refs beyond 5 yield diminishing returns).
+ */
+function mergeReferenceUrls(
+  callerSingle: string | undefined,
+  callerList: string[] | undefined,
+  brandAuto: string[],
+): string[] {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  const push = (u: string | undefined) => {
+    if (!u || seen.has(u) || out.length >= 5) return;
+    out.push(u);
+    seen.add(u);
+  };
+  push(callerSingle);
+  for (const u of callerList ?? []) push(u);
+  for (const u of brandAuto) push(u);
+  return out;
+}
+
 async function resolveAssetSourceFresh(
   client: FollowrClient,
   companyId: number,
   ref: AssetSourceRef,
   prefs: AiPreferences,
+  brandContext: BrandContext,
 ): Promise<ResolvedAsset> {
   const { src, mode, aspect_ratio } = ref;
   if (src.type === "asset_id") {
-    return { asset_id: src.id, credits_consumed: 0, ai_result_id: null };
+    // For asset_id reuse we can still surface the URL when we have it
+    // (via brandContext.assetIdToUrl loaded at execute time). This unlocks
+    // carousel chaining when a mid-slide is a reused asset.
+    return {
+      asset_id: src.id,
+      asset_url: brandContext.assetIdToUrl.get(src.id) ?? null,
+      credits_consumed: 0,
+      ai_result_id: null,
+    };
   }
   if (src.type === "url") {
     const a = await uploadFromUrl(client, {
@@ -1845,20 +2540,63 @@ async function resolveAssetSourceFresh(
       url: src.url,
       type: mode === "image" ? "image" : "video",
     });
-    return { asset_id: a.id, credits_consumed: 0, ai_result_id: null };
+    return {
+      asset_id: a.id,
+      asset_url: (a as Asset & { url?: string }).url ?? null,
+      credits_consumed: 0,
+      ai_result_id: null,
+    };
   }
   if (src.type === "ai_generate" && mode === "image") {
     const imgSrc = src as Extract<ImageSrc, { type: "ai_generate" }>;
-    // Resolve driver via the shared helper. Without this, the backend
-    // rejects nano_banana_2 and imagen4_* with "selected model is
-    // invalid". See packages/mcp-core/src/lib/driver-resolver.ts.
     const aiDriver = resolveDriver({ prefs, modality: "image", model: imgSrc.model });
+    const resolvedAspectRatio = imgSrc.aspect_ratio ?? prefs.image_aspect_ratio;
+
+    // Decide whether brand-aware grounding applies. Defaults to true; the
+    // agent can opt out per-source by setting use_brand_visual_identity:false.
+    // Skips silently when the company has no brand identity configured.
+    const useBrand = (imgSrc.use_brand_visual_identity ?? true) && brandContext.identity !== null;
+    const brandSuffix = useBrand && brandContext.identity
+      ? buildBrandPromptSuffix(brandContext.identity)
+      : "";
+    const brandRefsPicked = useBrand
+      ? pickBrandReferenceUrls(brandContext, imgSrc.prompt, 4)
+      : { urls: [] as string[], has_typography_ref: false };
+
+    // Merge caller-provided refs (legacy single + new plural) with brand
+    // auto-refs. Cap at 5 total.
+    const finalRefs = mergeReferenceUrls(
+      imgSrc.reference_image_url,
+      imgSrc.reference_image_urls,
+      brandRefsPicked.urls,
+    );
+
+    // F6: when at least one reference is a TYPOGRAPHY_REFERENCE asset,
+    // append the negative-literal-copy suffix so the model uses the
+    // typographic style WITHOUT copying the literal text content.
+    const typoSuffix = brandRefsPicked.has_typography_ref ? buildTypographyRefSuffix() : "";
+
+    // Final prompt: caller prompt + anti-placeholder suffix + brand suffix
+    // + (optional) typography reference notice. Order matters: placeholder
+    // prohibition first (most important), then brand guidance (style),
+    // then typography notice (specific to text rendering). All sit AFTER
+    // the user prompt so they don't dilute its primary intent.
+    const finalPrompt = `${hardenAiImagePrompt(imgSrc.prompt)}${brandSuffix}${typoSuffix}`;
+
     const aiResult = await client.generateImage({
-      q: imgSrc.prompt,
+      q: finalPrompt,
       company_id: companyId,
+      ...(resolvedAspectRatio ? { aspect_ratio: resolvedAspectRatio } : {}),
       ...(imgSrc.model ? { model: imgSrc.model } : {}),
       ...(aiDriver ? { driver: aiDriver } : {}),
-      ...(imgSrc.reference_image_url ? { image_url: imgSrc.reference_image_url } : {}),
+      // Prefer the new plural field when we have more than one ref; fall back
+      // to the legacy singular when only one is present (which is what the
+      // pre-F3 behavior used, so semantics are preserved).
+      ...(finalRefs.length > 1
+        ? { image_urls: finalRefs }
+        : finalRefs.length === 1
+          ? { image_url: finalRefs[0] }
+          : {}),
     });
     const final = await client.waitForAiResult(aiResult.id, { timeoutMs: 5 * 60 * 1000 });
     if (final.status !== "completed") {
@@ -1875,7 +2613,12 @@ async function resolveAssetSourceFresh(
     const m = IMAGE_MODELS.find((x) => x.model_id === (imgSrc.model ?? "nano_banana_2"));
     const credits = m ? m.cost_per_image : 25;
     const a = await uploadFromUrl(client, { companyId, url: imageUrl, type: "image" });
-    return { asset_id: a.id, credits_consumed: credits, ai_result_id: final.id };
+    return {
+      asset_id: a.id,
+      asset_url: (a as Asset & { url?: string }).url ?? null,
+      credits_consumed: credits,
+      ai_result_id: final.id,
+    };
   }
   if (src.type === "ai_generate" && mode === "video") {
     const vidSrc = src as Extract<VideoSrc, { type: "ai_generate" }>;
@@ -1889,7 +2632,6 @@ async function resolveAssetSourceFresh(
       ...(aiDriver ? { driver: aiDriver } : {}),
       ...(vidSrc.reference_image_url ? { image_url: vidSrc.reference_image_url } : {}),
     });
-    // Video clips can take 10-15 min. Give a generous timeout.
     const final = await client.waitForAiResult(aiResult.id, { timeoutMs: 20 * 60 * 1000, intervalMs: 5000 });
     if (final.status !== "completed") {
       throw new Error(
@@ -1906,7 +2648,12 @@ async function resolveAssetSourceFresh(
       throw new Error(`AI video generation completed but no video URL was returned (id=${final.id}).`);
     }
     const a = await uploadFromUrl(client, { companyId, url: videoUrl, type: "video" });
-    return { asset_id: a.id, credits_consumed: credits, ai_result_id: final.id };
+    return {
+      asset_id: a.id,
+      asset_url: (a as Asset & { url?: string }).url ?? null,
+      credits_consumed: credits,
+      ai_result_id: final.id,
+    };
   }
   if (src.type === "ai_avatar_lipsync" || src.type === "ai_avatar_video") {
     throw new Error(
@@ -1920,6 +2667,71 @@ interface SubPostAssetResolution {
   sub_post_index: number;
   asset_ids: number[];
   error?: string;
+}
+
+/**
+ * Returns true when a sub_post should resolve its carousel sources
+ * sequentially (so previous slide's output URL can be passed as a
+ * reference to the next slide's generation). Criterion: 2+ ai_generate
+ * image slides in the carousel. Mixed carousels with asset_id / url
+ * slides still chain because those slides have stable URLs we can pass
+ * forward.
+ */
+function shouldChainCarousel(sp: SubPost, refs: AssetSourceRef[]): boolean {
+  if (sp.asset_layout !== "carousel_images") return false;
+  let aiImageCount = 0;
+  for (const r of refs) {
+    if (r.mode !== "image") continue;
+    if (r.src.type === "ai_generate") aiImageCount += 1;
+  }
+  return aiImageCount >= 2;
+}
+
+/**
+ * Resolve a sequence of carousel sources one after the other, feeding
+ * slide N-1's resolved URL into slide N's reference_image_urls. This is
+ * F4: image-to-image chaining for visual continuity across slides.
+ *
+ * The resolver uses the original resolveOnce closure (which caches by
+ * fingerprint), so chained slides get unique fingerprints (because the
+ * injected ref changes the fingerprint) and resolve to distinct
+ * generations. Non-chained refs (asset_id, url) pass through unchanged.
+ */
+async function resolveCarouselSourcesSequential(
+  refs: AssetSourceRef[],
+  resolveOnce: (ref: AssetSourceRef) => Promise<ResolvedAsset>,
+): Promise<ResolvedAsset[]> {
+  const results: ResolvedAsset[] = [];
+  let previousUrl: string | null = null;
+  for (let i = 0; i < refs.length; i += 1) {
+    const ref = refs[i]!;
+    // Only AI-generated image slides receive the chain reference. Other
+    // types (asset_id, url) pass through with their original ref.
+    if (i > 0 && ref.src.type === "ai_generate" && ref.mode === "image" && previousUrl) {
+      const imgSrc = ref.src as Extract<ImageSrc, { type: "ai_generate" }>;
+      // Append previousUrl as an additional reference_image_urls entry.
+      // mergeReferenceUrls in resolveAssetSourceFresh will cap to 5 total.
+      const chainedImgSrc: typeof imgSrc = {
+        ...imgSrc,
+        reference_image_urls: [
+          ...(imgSrc.reference_image_urls ?? []),
+          previousUrl,
+        ],
+      };
+      const chainedRef: AssetSourceRef = { ...ref, src: chainedImgSrc };
+      const resolved = await resolveOnce(chainedRef);
+      results.push(resolved);
+      previousUrl = resolved.asset_url ?? previousUrl;
+    } else {
+      const resolved = await resolveOnce(ref);
+      results.push(resolved);
+      // Even non-AI slides contribute their URL to the chain so a mid-
+      // carousel asset_id or url slide doesn't break continuity for the
+      // AI slides that come after it.
+      if (resolved.asset_url) previousUrl = resolved.asset_url;
+    }
+  }
+  return results;
 }
 
 function subPostAssetRefs(sp: SubPost, item: PlanItem): AssetSourceRef[] {
@@ -1944,6 +2756,8 @@ async function executePlanItem(
   companyId: number,
   item: PlanItem,
   prefs: AiPreferences,
+  copyCtx: CopyResolutionContext,
+  brandContext: BrandContext,
 ): Promise<Record<string, unknown>> {
   // 1. Build a fingerprint-keyed promise cache so any AI generation
   // (or URL upload) requested by multiple sub_posts is performed exactly
@@ -1958,7 +2772,7 @@ async function executePlanItem(
     const fp = fingerprintAssetSource(ref);
     let p = resolveCache.get(fp);
     if (!p) {
-      p = resolveAssetSourceFresh(client, companyId, ref, prefs);
+      p = resolveAssetSourceFresh(client, companyId, ref, prefs, brandContext);
       resolveCache.set(fp, p);
     }
     return p;
@@ -1970,7 +2784,27 @@ async function executePlanItem(
       item.sub_posts.map(async (sp, idx): Promise<SubPostAssetResolution> => {
         const refs = subPostAssetRefs(sp, item);
         try {
-          const resolved = await Promise.all(refs.map(resolveOnce));
+          // F4: carousel image-to-image chaining. When a sub_post is a
+          // carousel with 2+ AI image generations, we resolve them
+          // SEQUENTIALLY and feed slide N-1's output URL as an extra
+          // reference into slide N. This gives the model strong visual
+          // continuity (typography, lighting, framing) across siblings,
+          // at the cost of N×generation_time latency instead of max().
+          //
+          // Auto-detect criterion: assets_strategy.carousel_sources with
+          // 2+ ai_generate slides. Non-AI slides (asset_id or url) pass
+          // through their resolved URL too, so a mixed carousel still
+          // chains through every slide.
+          //
+          // Single-image / single-video sub_posts and non-AI carousels
+          // continue to resolve in parallel as before.
+          const needsCarouselChaining = shouldChainCarousel(sp, refs);
+          let resolved: ResolvedAsset[];
+          if (needsCarouselChaining) {
+            resolved = await resolveCarouselSourcesSequential(refs, resolveOnce);
+          } else {
+            resolved = await Promise.all(refs.map(resolveOnce));
+          }
           return { sub_post_index: idx, asset_ids: resolved.map((r) => r.asset_id) };
         } catch (e) {
           return {
@@ -2085,6 +2919,12 @@ async function executePlanItem(
     social_network: SocialNetwork;
     status: "created" | "failed";
     error_message?: string;
+    /** Which path resolved the post description. Surfaces in the result so the
+     * agent can tell the user "the copy was generated server-side" vs "the
+     * copy you wrote was used verbatim". */
+    copy_resolution_path?: "copy_draft" | "generated" | "directive_fallback";
+    /** AI result id for the fallback generation. null when copy_draft was used. */
+    copy_ai_result_id?: number | null;
   }> = [];
 
   for (let i = 0; i < item.sub_posts.length; i++) {
@@ -2123,9 +2963,16 @@ async function executePlanItem(
         | "threads"
         | "bluesky";
       const { normalized: preferences } = normalizePreferences(initialPreferences, normalizerNetwork);
+      // Resolve the description BEFORE createPost. Path A uses copy_draft
+      // verbatim (preferred when the agent wrote it during draft). Path B
+      // calls Followr's generate_chat using the caption_concept as the
+      // editorial brief + brand context. Path C falls back to the
+      // directive itself if generation fails. Whatever path is chosen,
+      // the persisted description is publication-ready, not a directive.
+      const copyResolution = await resolvePostDescription(client, companyId, sp, copyCtx);
       await client.createPost(group.id, {
         social_network_type: internalNetworkId,
-        description: sp.caption_concept,
+        description: copyResolution.description,
         assets_ids: resolution.asset_ids,
         preferences,
       });
@@ -2133,6 +2980,8 @@ async function executePlanItem(
         sub_post_index: i,
         social_network: sp.social_network,
         status: "created",
+        copy_resolution_path: copyResolution.path,
+        copy_ai_result_id: copyResolution.ai_result_id,
       });
     } catch (e) {
       postResults.push({
@@ -2189,10 +3038,18 @@ async function executePlanItem(
     uniqueAssetGenerations < totalRequestedSources
       ? ` Se generaron ${uniqueAssetGenerations} asset${uniqueAssetGenerations === 1 ? "" : "s"} reutilizando entre ${totalRequestedSources - uniqueAssetGenerations} redes adicionales (ahorro de ${totalRequestedSources - uniqueAssetGenerations} generación${totalRequestedSources - uniqueAssetGenerations === 1 ? "" : "es"}).`
       : "";
+  // Wording note: we used to say "créditos", but the deprecated `credits`
+  // counter on User mixes legacy AppSumo lifetime credits with topups and
+  // doesn't reflect the actual gating bucket. The real bucket is
+  // ai_image_and_video_budget. Surfacing "generaciones de imagen/video" is
+  // both more accurate (it IS the unit of the budget) and less likely to
+  // confuse the user into checking the wrong counter. Cf. MEMORY note
+  // 'credits != budget'.
+  const generationsLabel = creditsConsumed === 1 ? "generación de imagen/video" : "generaciones de imagen/video";
   const userFacingSummary =
     subPostsFailed === 0
-      ? `Posteo "${item.concept_shared}" del ${item.date} ${item.publish_at_time_local} listo como borrador en ${networksCreated.join(", ")}. Costo: ${creditsConsumed} créditos.${reuseLine}`
-      : `Posteo "${item.concept_shared}" del ${item.date} ${item.publish_at_time_local}: creado para ${networksCreated.join(", ") || "ninguna red"}, falló en ${networksFailed.join(", ")}. Costo: ${creditsConsumed} créditos.${reuseLine}`;
+      ? `Posteo "${item.concept_shared}" del ${item.date} ${item.publish_at_time_local} listo como borrador en ${networksCreated.join(", ")}. Costo: ${creditsConsumed} ${generationsLabel} (ai_image_and_video_budget).${reuseLine}`
+      : `Posteo "${item.concept_shared}" del ${item.date} ${item.publish_at_time_local}: creado para ${networksCreated.join(", ") || "ninguna red"}, falló en ${networksFailed.join(", ")}. Costo: ${creditsConsumed} ${generationsLabel} (ai_image_and_video_budget).${reuseLine}`;
 
   return {
     slug: item.slug,
@@ -2449,7 +3306,7 @@ function buildSummaryTable(plan: ContentPlan): string[] {
       const sharedLabels = sharingForSubPost
         .filter((s) => s.share_group.length > 1)
         .map((s) => `con ${s.share_group.length - 1} más`);
-      const sharedCell = sharedLabels.length > 0 ? sharedLabels.join("; ") : "—";
+      const sharedCell = sharedLabels.length > 0 ? sharedLabels.join("; ") : "-";
       lines.push(
         `| ${item.date} | ${item.publish_at_time_local} | ${i === 0 ? item.concept_shared : "↳ (mismo concepto)"} | ${displayNetworkName(sp.social_network)} | ${displayLayout(sp.asset_layout, sp.product_type)} | ${displayAssetStrategy(sp.assets_strategy, sp.asset_layout)} | ${sharedCell} | ${rowCost > 0 ? `${rowCost} cr` : "0 cr"} |`,
       );
@@ -2526,6 +3383,54 @@ interface SharedAssetPreview {
   aspect_or_orientation?: string;
 }
 
+/**
+ * Compact view of which asset lands in which carousel slot, per network.
+ * Rendered as a table by the agent to surface reuse explicitly:
+ *
+ *   slot | LinkedIn         | Instagram
+ *   -----|------------------|------------------
+ *   1    | cover-li         | cover-ig
+ *   2    | step01-li        | step01-ig
+ *   3    | shared:step02 ✦  | shared:step02 ✦
+ *   4    | shared:step03 ✦  | shared:step03 ✦
+ *   5    | shared:cta ✦     | shared:cta ✦
+ *
+ * Cells flagged with "shared" indicate the asset is reused across networks
+ * (one generation, multiple consumers). Cells WITHOUT the shared marker
+ * are network-unique generations, so the agent can ask "do you really need
+ * two distinct covers?" when it sees two non-shared near-duplicate rows.
+ */
+interface AssetReuseMatrixCell {
+  /**
+   * Stable token identifying the asset for THIS slot+network pair. For
+   * shared assets this matches across networks; for unique assets it
+   * differs.
+   */
+  token: string;
+  /** True when the same asset is consumed by 2+ networks. */
+  is_shared: boolean;
+  /** Networks that consume this exact asset (display names). */
+  consumed_by: string[];
+}
+
+interface AssetReuseMatrixRow {
+  slot_index: number;
+  slot_label: string;
+  /** Map from network display name (e.g. "LinkedIn") to the cell. */
+  cells: Record<string, AssetReuseMatrixCell | null>;
+}
+
+interface AssetReuseMatrix {
+  /** Ordered list of network display names in the preview, for column order. */
+  networks: string[];
+  rows: AssetReuseMatrixRow[];
+  /**
+   * "3 of 7 slides are shared between LinkedIn and Instagram. 2 covers and 2
+   * step01 are network-unique." Pre-rendered prose for the agent.
+   */
+  human_summary: string;
+}
+
 interface ItemPreview {
   plan_id: string;
   slug: string;
@@ -2537,6 +3442,7 @@ interface ItemPreview {
   paired_with: string[];
   networks: NetworkPreview[];
   asset_plan: SharedAssetPreview[];
+  asset_reuse_matrix: AssetReuseMatrix;
   totals: {
     asset_count: number;
     image_ai_count: number;
@@ -2772,11 +3678,13 @@ function buildItemPreview(
 
   const minGen = imageAiCount > 0 ? 1 : 0;
   const maxGen = imageAiCount * 0.5 + (videoAiCount > 0 ? 10 : 0);
+  const reuseMatrix = buildAssetReuseMatrix(item, networks);
   const rendered = renderMarkdown({
     plan,
     item,
     networks,
     asset_plan: sharedAssetPlan,
+    reuse_matrix: reuseMatrix,
     totals: { imageAiCount, videoAiCount, uploadCount, reuseCount, creditsTotal },
     estimatedGenerationMinutes: { min: Math.max(1, Math.round(minGen)), max: Math.max(2, Math.round(maxGen)) },
     flags,
@@ -2793,6 +3701,7 @@ function buildItemPreview(
     paired_with: item.paired_with ?? [],
     networks,
     asset_plan: sharedAssetPlan,
+    asset_reuse_matrix: reuseMatrix,
     totals: {
       asset_count: imageAiCount + videoAiCount + uploadCount + reuseCount,
       image_ai_count: imageAiCount,
@@ -2807,16 +3716,108 @@ function buildItemPreview(
   };
 }
 
+/**
+ * Compute the per-slot, per-network reuse matrix for a plan_item. The matrix
+ * has one row per carousel slot (or one row for single-asset layouts) and
+ * one column per network. Each cell carries a stable token derived from the
+ * asset fingerprint so the agent can spot shared assets at a glance: cells
+ * with the same token across multiple columns are reused, cells with a
+ * unique token are network-specific generations.
+ *
+ * The human_summary line at the bottom is pre-rendered so the agent can
+ * paste it verbatim ("3 of 7 slides are shared across LinkedIn and
+ * Instagram; 2 cover slides and 2 step-01 slides are network-unique").
+ */
+function buildAssetReuseMatrix(item: PlanItem, networks: NetworkPreview[]): AssetReuseMatrix {
+  const networkNames = networks.map((n) => n.network_display);
+  const maxSlots = networks.reduce((acc, n) => Math.max(acc, n.asset_fingerprints.length), 0);
+  // Pre-compute consumer index from fingerprint to networks. Two cells with
+  // the same fingerprint => same asset, reused. The token is a short stable
+  // hash-ish derived from the fingerprint; we use a counter to keep it
+  // readable ("a1", "a2", "shared-a3"...).
+  const fpToToken = new Map<string, string>();
+  const fpToConsumers = new Map<string, Set<string>>();
+  for (const n of networks) {
+    for (const fp of n.asset_fingerprints) {
+      const set = fpToConsumers.get(fp) ?? new Set<string>();
+      set.add(n.network_display);
+      fpToConsumers.set(fp, set);
+    }
+  }
+  let counter = 1;
+  for (const n of networks) {
+    for (const fp of n.asset_fingerprints) {
+      if (!fpToToken.has(fp)) {
+        const isShared = (fpToConsumers.get(fp)?.size ?? 0) > 1;
+        const token = isShared ? `shared-a${counter}` : `a${counter}`;
+        fpToToken.set(fp, token);
+        counter += 1;
+      }
+    }
+  }
+
+  const rows: AssetReuseMatrixRow[] = [];
+  // Slot labels: cover (1), step n, ..., last is CTA when the layout looks
+  // like a step-flow carousel. Otherwise generic "slot N". Best-effort
+  // heuristic. The rendered_markdown still surfaces the actual asset
+  // description from sharedAssetPlan, so a wrong label here doesn't break
+  // anything; it's just a readability hint.
+  const slotLabelFor = (idx: number, total: number): string => {
+    if (total <= 1) return "asset";
+    if (idx === 0) return "cover / slot 1";
+    if (idx === total - 1) return `slot ${idx + 1} (CTA o cierre)`;
+    return `slot ${idx + 1}`;
+  };
+
+  for (let slot = 0; slot < Math.max(1, maxSlots); slot += 1) {
+    const cells: Record<string, AssetReuseMatrixCell | null> = {};
+    for (const n of networks) {
+      const fp = n.asset_fingerprints[slot];
+      if (!fp) {
+        cells[n.network_display] = null;
+        continue;
+      }
+      const token = fpToToken.get(fp) ?? `a${slot}`;
+      const consumers = Array.from(fpToConsumers.get(fp) ?? new Set<string>());
+      cells[n.network_display] = {
+        token,
+        is_shared: consumers.length > 1,
+        consumed_by: consumers,
+      };
+    }
+    rows.push({ slot_index: slot, slot_label: slotLabelFor(slot, Math.max(1, maxSlots)), cells });
+  }
+
+  // Compute human-readable summary.
+  const totalCells = rows.reduce(
+    (acc, r) => acc + Object.values(r.cells).filter((c) => c !== null).length,
+    0,
+  );
+  const sharedCells = rows.reduce(
+    (acc, r) => acc + Object.values(r.cells).filter((c) => c?.is_shared === true).length,
+    0,
+  );
+  const uniqueAssets = new Set(Array.from(fpToToken.values()));
+  const reusedAssets = Array.from(fpToToken.values()).filter((t) => t.startsWith("shared-")).length;
+  const summary =
+    networks.length <= 1
+      ? `Una sola red, ${uniqueAssets.size} asset${uniqueAssets.size === 1 ? "" : "s"} en total.`
+      : `${uniqueAssets.size} asset${uniqueAssets.size === 1 ? "" : "s"} únicos en ${networks.length} redes. ${reusedAssets} asset${reusedAssets === 1 ? "" : "s"} compartidos cubren ${sharedCells} de ${totalCells} celdas. Si dos celdas tienen tokens distintos pero conceptos casi idénticos, considerá unificarlas con shared_concept_key para evitar duplicar la generación.`;
+  void item; // referenced for future per-item label hints
+  return { networks: networkNames, rows, human_summary: summary };
+}
+
 function renderMarkdown(args: {
   plan: ContentPlan;
   item: PlanItem;
   networks: NetworkPreview[];
   asset_plan: SharedAssetPreview[];
+  reuse_matrix: AssetReuseMatrix;
   totals: { imageAiCount: number; videoAiCount: number; uploadCount: number; reuseCount: number; creditsTotal: number };
   estimatedGenerationMinutes: { min: number; max: number };
   flags: string[];
 }): string {
-  const { item, networks, asset_plan, totals, estimatedGenerationMinutes, flags } = args;
+  const { item, networks, asset_plan, reuse_matrix, totals, estimatedGenerationMinutes, flags } = args;
   const lines: string[] = [];
   lines.push(`### ${item.date} a las ${item.publish_at_time_local} (${item.timezone})`);
   lines.push("");
@@ -2874,7 +3875,30 @@ function renderMarkdown(args: {
       lines.push("");
     }
   }
-  lines.push(`**Totales:** ${totals.imageAiCount} imágenes AI + ${totals.videoAiCount} videos AI${totals.uploadCount ? ` + ${totals.uploadCount} subidas` : ""}${totals.reuseCount ? ` + ${totals.reuseCount} assets reusados` : ""}. Costo estimado: ${totals.creditsTotal} créditos. Tiempo de generación: ${estimatedGenerationMinutes.min}-${estimatedGenerationMinutes.max} min.`);
+  // Asset reuse matrix block. Lists each carousel slot as a row and each
+  // network as a column. Shared assets carry the "shared-" prefix on the
+  // token, so the table makes reuse impossible to miss without forcing the
+  // agent to re-explain it in prose. Cells reused across networks are
+  // flagged with the cross-reference marker (✦).
+  if (reuse_matrix.rows.length > 0 && reuse_matrix.networks.length > 1) {
+    lines.push("**Matriz de reuso de assets por slot y red:**");
+    lines.push("");
+    lines.push(`| Slot | ${reuse_matrix.networks.join(" | ")} |`);
+    lines.push(`|------|${reuse_matrix.networks.map(() => "------").join("|")}|`);
+    for (const row of reuse_matrix.rows) {
+      const cells = reuse_matrix.networks.map((n) => {
+        const cell = row.cells[n];
+        if (!cell) return "-";
+        const mark = cell.is_shared ? " ✦" : "";
+        return `${cell.token}${mark}`;
+      });
+      lines.push(`| ${row.slot_label} | ${cells.join(" | ")} |`);
+    }
+    lines.push("");
+    lines.push(`> ${reuse_matrix.human_summary}`);
+    lines.push("");
+  }
+  lines.push(`**Totales:** ${totals.imageAiCount} imágenes AI + ${totals.videoAiCount} videos AI${totals.uploadCount ? ` + ${totals.uploadCount} subidas` : ""}${totals.reuseCount ? ` + ${totals.reuseCount} assets reusados` : ""}. Costo estimado: ${totals.creditsTotal} ${totals.creditsTotal === 1 ? "generación de imagen/video" : "generaciones de imagen/video"} (ai_image_and_video_budget). Tiempo de generación: ${estimatedGenerationMinutes.min}-${estimatedGenerationMinutes.max} min.`);
   if (flags.length > 0) {
     lines.push("");
     lines.push("**Alertas:**");
@@ -3116,6 +4140,92 @@ async function runValidation(args: {
         }
       }
     }
+
+    // Cross-sub_post similarity check within THIS plan_item. Walk every
+    // pair of AssetSourceAiImage references and surface a non-blocking
+    // warning when their prompts are >=85% similar after normalization.
+    // The 2026-05-21 audit found two pairs (cover LinkedIn vs cover IG;
+    // step01 LinkedIn vs step01 IG) where the only diff was a single
+    // adjective at the tail ("generous negative space", "professional SaaS
+    // aesthetic"); the model rendered indistinguishable outputs and burned
+    // 2 credits per pair for zero differentiation. With shared_concept_key
+    // in the schema we now have a first-class way to express the dedupe
+    // intent; this validator nudges the planner toward it.
+    interface AiImageRef {
+      sub_post_index: number;
+      slot_within_sub_post: number;
+      network: SocialNetwork;
+      prompt: string;
+      aspect_ratio: string | undefined;
+      shared_concept_key: string | undefined;
+    }
+    const aiImageRefs: AiImageRef[] = [];
+    for (let i = 0; i < item.sub_posts.length; i++) {
+      const sp = item.sub_posts[i] as SubPost;
+      const collectFromImage = (src: NonNullable<AssetsStrategy["image_source"]>, slot: number) => {
+        if (src.type !== "ai_generate") return;
+        aiImageRefs.push({
+          sub_post_index: i,
+          slot_within_sub_post: slot,
+          network: sp.social_network,
+          prompt: src.prompt,
+          aspect_ratio: (src as AssetSourceAiImage).aspect_ratio,
+          shared_concept_key: (src as AssetSourceAiImage).shared_concept_key,
+        });
+      };
+      if (sp.assets_strategy.image_source) collectFromImage(sp.assets_strategy.image_source, 0);
+      if (sp.assets_strategy.carousel_sources) {
+        sp.assets_strategy.carousel_sources.forEach((s, idx) => collectFromImage(s, idx));
+      }
+    }
+    for (let a = 0; a < aiImageRefs.length; a++) {
+      for (let b = a + 1; b < aiImageRefs.length; b++) {
+        const A = aiImageRefs[a]!;
+        const B = aiImageRefs[b]!;
+        // If both refs declare the SAME shared_concept_key, the resolver
+        // already collapses them to one generation, no warning needed.
+        if (
+          A.shared_concept_key &&
+          B.shared_concept_key &&
+          A.shared_concept_key === B.shared_concept_key
+        ) {
+          continue;
+        }
+        const sim = normalizedPromptSimilarity(A.prompt, B.prompt);
+        if (sim < PROMPT_DUPLICATE_SIMILARITY_THRESHOLD) continue;
+        // Same prompt + same aspect_ratio + same model = the fingerprint
+        // path already dedupes. We surface only when the planner intends
+        // them as DISTINCT generations (e.g. different network, no
+        // shared_concept_key) and would burn extra credits.
+        const aspectDiffers = (A.aspect_ratio ?? null) !== (B.aspect_ratio ?? null);
+        if (aspectDiffers && sim < 0.95) continue;
+        const percent = Math.round(sim * 100);
+        warnings.push({
+          issue: "near_duplicate_ai_image_prompts",
+          item: item.slug,
+          sub_post_index_a: A.sub_post_index,
+          sub_post_index_b: B.sub_post_index,
+          network_a: A.network,
+          network_b: B.network,
+          similarity: sim,
+          detail: `Dos AssetSourceAiImage en este plan_item tienen prompts ${percent}% idénticos (${displayNetworkName(A.network)} slot #${A.slot_within_sub_post + 1} vs ${displayNetworkName(B.network)} slot #${B.slot_within_sub_post + 1}). El modelo va a renderear outputs casi indistinguibles y vas a quemar una generación por cada uno sin diferenciación real. Si el concepto es el mismo, unificá con shared_concept_key en ambas refs (ej "cover", "step-01") para colapsar a una sola generación. Si la diferenciación es por formato, usá aspect_ratio (estructural) en lugar de adjetivos en el prompt (decorativo).`,
+          resolution_options: [
+            {
+              id: "merge_with_shared_concept_key",
+              description: `Llamar update_content_plan para setear shared_concept_key en ambas AssetSourceAiImage refs (ej "cover", "step-01"). El resolver garantiza UNA generación y reusa el asset entre redes.`,
+            },
+            {
+              id: "differentiate_by_aspect_ratio",
+              description: `Si la diferenciación es por formato (LinkedIn 16:9 vs IG 1:1), setear aspect_ratio explícito en cada AssetSourceAiImage y dejar el prompt limpio (sin frases como "generous negative space" que no cambian el output del modelo).`,
+            },
+            {
+              id: "acknowledge_and_proceed",
+              description: `Confirmar explícitamente con el usuario que querés dos generaciones distintas pese a la similitud. Útil cuando hay un motivo creativo real (ej. cover con copy distinto por idioma).`,
+            },
+          ],
+        });
+      }
+    }
   }
 
   // Aggregate plan-level totals using dedupe-aware cost estimate. Each
@@ -3172,7 +4282,7 @@ async function runValidation(args: {
           item: item.slug,
           sub_post_index: i,
           detail:
-            "El plan incluye un sub_post YouTube long_video. Por política, long_video no se propone por defecto — confirmá con el usuario que pidió contenido long-form para YouTube esta semana antes de avanzar (ver PLANNING_STRATEGY.youtube_feed_policy).",
+            "El plan incluye un sub_post YouTube long_video. Por política, long_video no se propone por defecto. Confirmá con el usuario que pidió contenido long-form para YouTube esta semana antes de avanzar (ver PLANNING_STRATEGY.youtube_feed_policy).",
         });
       }
     }

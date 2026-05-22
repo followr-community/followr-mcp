@@ -16,8 +16,55 @@ export type AssetSourceAssetId = { type: "asset_id"; id: number };
 export type AssetSourceAiImage = {
   type: "ai_generate";
   prompt: string;
+  /** Legacy single-ref field. Use reference_image_urls for new code. */
   reference_image_url?: string;
+  /**
+   * Up to 5 reference images passed alongside the prompt. The model uses
+   * them as style guidance (image-to-image). When the resolver auto-injects
+   * brand references (because use_brand_visual_identity is true and a
+   * BrandVisualIdentity block exists), they're concatenated here with the
+   * caller-provided refs, capped at 5 total.
+   */
+  reference_image_urls?: string[];
   model?: string;
+  /**
+   * Output aspect ratio override. When omitted, the platform falls back to
+   * the company's ai_preferences.image_aspect_ratio. Use to differentiate
+   * cover assets between networks structurally (LinkedIn 16:9 vs Instagram
+   * 1:1) instead of via adjective tweaks to the prompt.
+   */
+  aspect_ratio?: "1:1" | "4:3" | "16:9" | "3:4" | "9:16";
+  /**
+   * Optional dedupe key. When two AssetSourceAiImage refs within the same
+   * plan_item share the same shared_concept_key, the resolver collapses
+   * them into ONE generation and reuses the resulting asset across all
+   * sub_posts that referenced it. Use this whenever the cover, a step
+   * illustration, or a CTA card is conceptually the same across networks.
+   * Without this key the dedupe falls back to exact prompt + model +
+   * aspect_ratio equality, which silently misses near-duplicates.
+   */
+  shared_concept_key?: string;
+  /**
+   * When true (default), the resolver auto-injects this company's Brand
+   * Visual Identity into the generation: the brief is appended to the
+   * prompt and 3-5 tagged template/element assets are added as
+   * reference_image_urls. Set to false ONLY when the agent wants a
+   * completely fresh generation untouched by brand grounding (e.g.
+   * generating an example of an anti-pattern, or a brand-agnostic mockup).
+   * The brand identity block must exist on the company; if it doesn't,
+   * this flag is a no-op.
+   */
+  use_brand_visual_identity?: boolean;
+  /**
+   * Optional aspirational brand name (e.g. "Stripe", "Notion") to fetch
+   * an extra style reference from. The resolver fetches the brand's
+   * og:image at generation time and adds it as one more
+   * reference_image_url. Use sparingly: each reference dilutes the
+   * brand's own identity. Not implemented in v1 (lands when the resolver
+   * supports inline aspirational fetch). For now reserved for forward
+   * compat; the field is accepted by the schema but ignored at execute.
+   */
+  inspired_by_brand?: string;
 };
 export type AssetSourceAiVideo = {
   type: "ai_generate";
@@ -182,6 +229,19 @@ export interface ContentPlan {
     networks_intent?: SocialNetwork[];
     theme?: string;
     promo_context?: string;
+    /**
+     * Declared language tag for every copy_draft and AI text generation
+     * triggered by this plan (e.g. "es", "en", "es-AR"). Falls back to
+     * company.language when omitted. The validator surfaces a warning if
+     * any sub_post copy_draft appears to be in a different language.
+     */
+    language?: string;
+    /**
+     * Hashtag inclusion policy across networks. "auto" (default) includes
+     * per-network typical counts (IG 5-8, LinkedIn 3-5, X 1-3, TikTok 3-5,
+     * Threads 0-3). "off" suppresses hashtags entirely.
+     */
+    hashtags_policy?: "auto" | "off";
   };
   plan_items: PlanItem[];
   use_brand_voice: boolean;
