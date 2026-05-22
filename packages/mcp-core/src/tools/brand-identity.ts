@@ -2544,24 +2544,25 @@ function templateTagForCategory(category: TemplateCategory): BrandTag {
  * (nano_banana_2 baseline) for unknown models.
  */
 function perImageCostFor(modelId: string): number {
+  // Mirrors IMAGE_MODELS in lib/content-plan-catalog.ts. Synced 2026-05-22
+  // against the Followr frontend React state (Fix E3). All model_ids here
+  // are the canonical ones the backend accepts.
   const table: Record<string, number> = {
     nano_banana_2: 25,
-    nano_banana_pro: 45,
     nano_banana: 12,
+    nano_banana_pro: 45,
     gpt_image_2: 70,
+    "gpt-image-1-auto": 10,
+    imagen4_preview: 12,
     imagen4_preview_fast: 6,
-    imagen4_fast: 6,
-    imagen4: 12,
-    seedream_v4: 10,
-    wan_2_5_preview: 15,
-    "wan_2.5_preview": 15,
-    flux_pro_1_1: 12,
+    ideogram_v3: 18,
+    wan_25_preview: 15,
     "flux_pro_1.1": 12,
     flux_pro_kontext: 12,
-    "recraft_v3-digital": 3,
-    recraft_v3_digital: 3,
+    flux_dev: 8,
+    seedream_v4: 10,
+    recraftv3: 3,
     z_image_turbo: 2,
-    ideogram_v3: 18,
   };
   return table[modelId] ?? 25;
 }

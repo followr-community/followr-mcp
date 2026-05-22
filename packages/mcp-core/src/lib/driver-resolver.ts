@@ -45,15 +45,24 @@ import type { AiPreferences } from "@followr-mcp/shared";
 // version variants like veo_3_1_fast do NOT exist in Followr and trigger
 // HTTP 422 "selected model is invalid".
 export const MODEL_DRIVER_HINTS: Record<string, string> = {
-  // Image models
+  // Image models. Drivers confirmed against the Followr frontend React
+  // state on 2026-05-22; most route through fal, two are special-cased:
+  // gpt-image-1-auto goes through openai, recraftv3 through recraft.
   nano_banana_2: "fal",
+  nano_banana: "fal",
   nano_banana_pro: "fal",
+  gpt_image_2: "fal",
+  "gpt-image-1-auto": "openai",
   imagen4_preview: "fal",
   imagen4_preview_fast: "fal",
   ideogram_v3: "fal",
+  wan_25_preview: "fal",
   "flux_pro_1.1": "fal",
+  flux_pro_kontext: "fal",
+  flux_dev: "fal",
+  seedream_v4: "fal",
+  recraftv3: "recraft",
   z_image_turbo: "fal",
-  // gpt_image_2: deliberately omitted, let backend infer (probably "openai")
 
   // Video models
   "veo_3.1_fast": "fal",

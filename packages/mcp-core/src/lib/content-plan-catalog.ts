@@ -221,10 +221,22 @@ export interface VideoModelInfo {
 
 const VIDEO_MODEL_RECOMMENDED_DURATION = 8;
 
+// Video models (used by generate_ai_video_clip). All display_name, model_id,
+// cost_per_second and driver values verified against the Followr frontend
+// React state on 2026-05-22 (Fix E4). The display_name format matches what
+// users see in /company-settings/ai-videos, so the agent surfaces names the
+// user can cross-reference verbatim.
+//
+// Out of scope for this catalog (handled by other tools):
+//   - veed_fabric_1.0 / veed_fabric_1.0_fast: lipsync models used internally
+//     by generate_avatar_lipsync_clip and generate_avatar_video; not exposed
+//     as choices for AI video clips.
+//   - creatomate_video / creatomate_short: template-driven video, billed
+//     separately (0 cr/sec in the catalog) and not part of the AI clip flow.
 export const VIDEO_MODELS: VideoModelInfo[] = [
   {
     model_id: "veo_3.1_fast",
-    display_name: "Veo 3.1 Fast",
+    display_name: "Google Veo 3.1 Fast",
     cost_per_second: 50,
     default_duration_seconds: VIDEO_MODEL_RECOMMENDED_DURATION,
     cost_for_default_duration: 50 * VIDEO_MODEL_RECOMMENDED_DURATION,
@@ -236,19 +248,19 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
   },
   {
     model_id: "veo_3_fast",
-    display_name: "Veo 3 Fast",
+    display_name: "Google Veo 3 Fast",
     cost_per_second: 400,
     default_duration_seconds: VIDEO_MODEL_RECOMMENDED_DURATION,
     cost_for_default_duration: 400 * VIDEO_MODEL_RECOMMENDED_DURATION,
     provider: "Google",
-    recommended_for: "first step up in quality from veo_3.1_fast",
+    recommended_for: "first step up in quality from Google Veo 3.1 Fast",
     recommended: true,
     recommended_rank: 1,
     bucket: "premium",
   },
   {
     model_id: "veo_3.1",
-    display_name: "Veo 3.1",
+    display_name: "Google Veo 3.1",
     cost_per_second: 600,
     default_duration_seconds: VIDEO_MODEL_RECOMMENDED_DURATION,
     cost_for_default_duration: 600 * VIDEO_MODEL_RECOMMENDED_DURATION,
@@ -260,7 +272,7 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
   },
   {
     model_id: "veo_3",
-    display_name: "Veo 3",
+    display_name: "Google Veo 3",
     cost_per_second: 1000,
     default_duration_seconds: VIDEO_MODEL_RECOMMENDED_DURATION,
     cost_for_default_duration: 1000 * VIDEO_MODEL_RECOMMENDED_DURATION,
@@ -271,8 +283,10 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
     bucket: "premium",
   },
   {
+    // UI display label is just "Wan 2" (no version suffix) despite the
+    // model_id being wan_2.2. Verified empirically.
     model_id: "wan_2.2",
-    display_name: "Wan 2.2",
+    display_name: "Wan 2",
     cost_per_second: 150,
     default_duration_seconds: VIDEO_MODEL_RECOMMENDED_DURATION,
     cost_for_default_duration: 150 * VIDEO_MODEL_RECOMMENDED_DURATION,
@@ -326,8 +340,10 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
     bucket: "premium",
   },
   {
+    // UI label is "Hailuo 0.2 Standard" (with a dot in the version). The
+    // model_id uses hailuo_02_* with no separator, verified empirically.
     model_id: "hailuo_02_standard",
-    display_name: "Hailuo Standard",
+    display_name: "Hailuo 0.2 Standard",
     cost_per_second: 20,
     default_duration_seconds: VIDEO_MODEL_RECOMMENDED_DURATION,
     cost_for_default_duration: 20 * VIDEO_MODEL_RECOMMENDED_DURATION,
@@ -338,7 +354,7 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
   },
   {
     model_id: "hailuo_02_premium",
-    display_name: "Hailuo Premium",
+    display_name: "Hailuo 0.2 Premium",
     cost_per_second: 30,
     default_duration_seconds: VIDEO_MODEL_RECOMMENDED_DURATION,
     cost_for_default_duration: 30 * VIDEO_MODEL_RECOMMENDED_DURATION,
@@ -363,52 +379,88 @@ export interface ImageModelInfo {
   recommended_rank?: number;
 }
 
+// Image models are sorted by recommendation rank (best → worst). The agent
+// surfaces the first entry as the default. Quality ranking + display names +
+// per-image costs + canonical model_ids all confirmed empirically against
+// the Followr frontend React state on 2026-05-22 (see Fix E3 in the audit).
+//
+// Off-ladder entries (recommended:false) are still callable; the agent only
+// surfaces them when the user explicitly asks for them. Two cases:
+//   1. Nano Banana Pro and Flux Pro Kontext: present in the Followr UI but
+//      not part of the user's explicit quality ranking. Available on request.
+//   2. Z-Image Turbo: cheapest and lowest quality, intended as fallback for
+//      throwaway drafts.
 export const IMAGE_MODELS: ImageModelInfo[] = [
   {
     model_id: "nano_banana_2",
-    display_name: "Nano Banana 2",
+    display_name: "Google Nano Banana 2",
     cost_per_image: 25,
     bucket: "regular",
-    provider: "fal",
-    recommended_for: "platform default for images; works on every plan (regular bucket)",
+    provider: "Google",
+    recommended_for:
+      "platform default for images, balanced quality and cost; works on every plan including Free",
     recommended: true,
     recommended_rank: 0,
   },
   {
-    model_id: "nano_banana_pro",
-    display_name: "Nano Banana Pro",
-    cost_per_image: 45,
-    bucket: "premium",
-    provider: "fal",
-    recommended_for: "higher quality nano variant; requires followr_plus_enabled",
-    recommended: false,
-  },
-  {
     model_id: "gpt_image_2",
-    display_name: "GPT Image 2",
+    display_name: "OpenAI GPT Image 2",
     cost_per_image: 70,
     bucket: "premium",
     provider: "OpenAI",
-    recommended_for: "OpenAI flagship; requires followr_plus_enabled",
-    recommended: false,
+    recommended_for:
+      "flagship-tier quality from OpenAI; recommended ladder step up from the default for hero, launch and brand-critical pieces; requires Followr Plus",
+    recommended: true,
+    recommended_rank: 1,
   },
   {
-    model_id: "imagen4_preview_fast",
-    display_name: "Imagen 4 Fast",
-    cost_per_image: 6,
-    bucket: "premium",
-    provider: "Google",
-    recommended_for: "available on request; requires followr_plus_enabled",
-    recommended: false,
-  },
-  {
-    model_id: "imagen4_preview",
-    display_name: "Imagen 4",
+    // Distinct from nano_banana_2: cheaper (12 cr vs 25) and ranked just
+    // below GPT Image 2 in raw quality per the Followr team.
+    model_id: "nano_banana",
+    display_name: "Google Nano Banana",
     cost_per_image: 12,
     bucket: "premium",
     provider: "Google",
-    recommended_for: "available on request; requires followr_plus_enabled",
-    recommended: false,
+    recommended_for:
+      "high tier Google image model, sits just below GPT Image 2 in raw quality but much cheaper; strong subject and lighting rendering; requires Followr Plus",
+    recommended: true,
+    recommended_rank: 2,
+  },
+  {
+    model_id: "imagen4_preview",
+    display_name: "Google Imagen 4",
+    cost_per_image: 12,
+    bucket: "premium",
+    provider: "Google",
+    recommended_for:
+      "Google premium image model; strong photorealism and lighting; requires Followr Plus",
+    recommended: true,
+    recommended_rank: 3,
+  },
+  {
+    model_id: "imagen4_preview_fast",
+    display_name: "Google Imagen 4 Fast",
+    cost_per_image: 6,
+    bucket: "premium",
+    provider: "Google",
+    recommended_for:
+      "faster (and cheaper) Imagen 4 variant; slight quality dip vs Imagen 4 but well above the regular bucket; requires Followr Plus",
+    recommended: true,
+    recommended_rank: 4,
+  },
+  {
+    // Older OpenAI image model. Uses HYPHENS not underscores in the id
+    // (verified against Followr frontend state); driver is "openai" rather
+    // than "fal" unlike most other premium models.
+    model_id: "gpt-image-1-auto",
+    display_name: "GPT Image",
+    cost_per_image: 10,
+    bucket: "premium",
+    provider: "OpenAI",
+    recommended_for:
+      "older OpenAI image model, cheaper alternative to GPT Image 2 with a noticeable quality dip; requires Followr Plus",
+    recommended: true,
+    recommended_rank: 5,
   },
   {
     model_id: "ideogram_v3",
@@ -416,17 +468,73 @@ export const IMAGE_MODELS: ImageModelInfo[] = [
     cost_per_image: 18,
     bucket: "premium",
     provider: "Ideogram",
-    recommended_for: "available on request, strong text-in-image rendering; requires followr_plus_enabled",
-    recommended: false,
+    recommended_for:
+      "strong text-in-image rendering; use when the design needs legible typographic copy baked into the image (badges, posters, social cards with text); requires Followr Plus",
+    recommended: true,
+    recommended_rank: 6,
+  },
+  {
+    // Backend id has NO dot or underscore between 2 and 5 (it's "wan_25"
+    // not "wan_2.5" nor "wan_2_5"). Unlike Wan video models which DO use a
+    // dot (wan_2.2). Verified empirically.
+    model_id: "wan_25_preview",
+    display_name: "Wan 2.5 Preview",
+    cost_per_image: 15,
+    bucket: "premium",
+    provider: "fal",
+    recommended_for:
+      "Wan preview image model; mid tier quality, distinct aesthetic from the Google and OpenAI families; requires Followr Plus",
+    recommended: true,
+    recommended_rank: 7,
   },
   {
     model_id: "flux_pro_1.1",
-    display_name: "Flux Pro 1.1",
+    display_name: "Fal Flux Pro 1.1",
     cost_per_image: 12,
     bucket: "premium",
     provider: "fal",
-    recommended_for: "available on request; requires followr_plus_enabled",
-    recommended: false,
+    recommended_for:
+      "alternative Flux Pro aesthetic; ranks below the Imagen / GPT options for general use but useful when the brand specifically wants the Flux look and feel; requires Followr Plus",
+    recommended: true,
+    recommended_rank: 8,
+  },
+  {
+    // Backend id is "flux_dev" (no "1" anywhere) despite the UI label
+    // showing "Flux.1 Dev". Verified empirically.
+    model_id: "flux_dev",
+    display_name: "Fal Flux.1 Dev",
+    cost_per_image: 8,
+    bucket: "premium",
+    provider: "fal",
+    recommended_for:
+      "cheaper Flux Dev variant; usable when the user wants Flux aesthetic on a budget; quality dip vs Flux Pro 1.1; requires Followr Plus",
+    recommended: true,
+    recommended_rank: 9,
+  },
+  {
+    model_id: "seedream_v4",
+    display_name: "Seedream V4",
+    cost_per_image: 10,
+    bucket: "premium",
+    provider: "fal",
+    recommended_for:
+      "ByteDance Seedream image model; lower tier in raw quality than the Imagen / GPT / Nano Banana stack, available on request when the user wants a different aesthetic; requires Followr Plus",
+    recommended: true,
+    recommended_rank: 10,
+  },
+  {
+    // Backend id is "recraftv3" (single word, no separator). The "Digital"
+    // suffix from the UI label is implicit; this is the only Recraft v3
+    // variant exposed by Followr today. Driver is "recraft" not "fal".
+    model_id: "recraftv3",
+    display_name: "Recraft v3 - Digital",
+    cost_per_image: 3,
+    bucket: "premium",
+    provider: "Recraft",
+    recommended_for:
+      "cheap digital-illustration style from Recraft; lowest premium-bucket cost, useful for vector / flat illustration aesthetics; requires Followr Plus",
+    recommended: true,
+    recommended_rank: 11,
   },
   {
     model_id: "z_image_turbo",
@@ -434,7 +542,33 @@ export const IMAGE_MODELS: ImageModelInfo[] = [
     cost_per_image: 2,
     bucket: "regular",
     provider: "fal",
-    recommended_for: "cheapest image model; works on every plan (regular bucket)",
+    recommended_for:
+      "cheapest image model; lowest quality of the catalog, OK for rapid drafts and throwaway tests; works on every plan including Free",
+    recommended: false,
+  },
+  {
+    // Active in the Followr UI as "Best New" but excluded from the user's
+    // explicit quality ranking. Available on request; not part of the
+    // default recommended ladder.
+    model_id: "nano_banana_pro",
+    display_name: "Google Nano Banana Pro",
+    cost_per_image: 45,
+    bucket: "premium",
+    provider: "Google",
+    recommended_for:
+      "higher tier Google Nano Banana variant flagged 'best' in the Followr UI; available on request when the user wants more detail than Nano Banana 2; requires Followr Plus",
+    recommended: false,
+  },
+  {
+    // Flux Pro with Kontext mode. Present in the Followr UI but not part of
+    // the user's explicit ranking; available on request.
+    model_id: "flux_pro_kontext",
+    display_name: "Fal Flux Pro Kontext",
+    cost_per_image: 12,
+    bucket: "premium",
+    provider: "fal",
+    recommended_for:
+      "Flux Pro Kontext variant, same cost as Flux Pro 1.1; available on request when the user specifically wants the Kontext capability; requires Followr Plus",
     recommended: false,
   },
 ];

@@ -54,6 +54,7 @@ import {
 import { resolveDriver } from "../lib/driver-resolver.js";
 import { normalizePreferences } from "../lib/normalize-preferences.js";
 import { getAiPreferences } from "../lib/preferences.js";
+import { localDateTimeToUtcIso, resolveTimezone } from "../lib/timezone.js";
 import {
   type AssetLayout,
   type AssetSourceAiImage,
@@ -615,6 +616,22 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
           (defaultsByNetwork[p.social_network_type] ??= []).push(p.name);
         }
       }
+      // Networks that are connected but lack a brand voice prompt. Surface
+      // these so the LLM knows which network-specific voices are still
+      // missing AFTER the initial setup. Useful when the company connects a
+      // new network later: the agent should propose extending the voice.
+      const networksWithoutBrandVoice = connectedNetworks.filter(
+        (net) => !(defaultsByNetwork[net]?.length),
+      );
+
+      // Brand Visual Identity state. Detect by parsing the BrandVisualIdentity
+      // marker in Company.description. When absent we surface a proactive
+      // proposal: setting up BVI before drafting upgrades image generations
+      // from generic-AI to grounded-on-templates. See instructions Rule 8b.
+      const parsedBvi = parseBrandIdentityFromDescription(
+        companyResolved.description ?? null,
+      );
+      const hasBvi = parsedBvi.status === "ok";
 
       const imageVideoRemaining = budgets?.ai_image_and_video_budget.remaining ?? Number.POSITIVE_INFINITY;
       const followrPlusEnabled = budgets?.followr_plus_enabled ?? false;
@@ -834,20 +851,55 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
                 ],
               }
             : null,
+          // EARLY PROPOSAL: when the company lacks a Brand Visual Identity
+          // AND the agent is about to plan content with AI imagery, surface
+          // a proactive setup proposal. Without BVI the generated images
+          // are generic (no curated templates, no palette grounding, no
+          // anti-patterns). Setting it up takes 4 questions plus ~12 AI
+          // template generations (~300 cr image-and-video budget).
+          // The proposal is OPTIONAL: for a quick test plan, fast pivot, or
+          // a brand that already has visuals it does not want to formalize
+          // yet, the agent can proceed without BVI and mention the trade
+          // off to the user. See Rule 8b for the decision framework.
+          brand_visual_identity_setup_proposal: !hasBvi
+            ? {
+                severity: "proactive_suggestion",
+                user_message:
+                  "Esta empresa no tiene identidad visual cargada. Las imágenes que generemos en este plan van a ser genéricas (sin templates curados ni paleta extendida ni anti-patrones). Te propongo cargarla antes en una llamada: lleva 4 preguntas más cerca de 12 templates AI auto-generados (aproximadamente 300 créditos de imagen y video). Para test rápidos o calendarios operativos podemos seguir sin esto y mencionar el trade-off.",
+                bvi_state: parsedBvi.status,
+                resolution_options: [
+                  {
+                    id: "setup_bvi_first",
+                    description:
+                      "Llamar assess_brand_visual_identity(company_id) para arrancar el cold-start flow. Volver al plan cuando la BVI esté lista. Recomendado cuando el plan incluye piezas hero, launch, o cualquier contenido brand-crítico.",
+                  },
+                  {
+                    id: "proceed_without_bvi",
+                    description:
+                      "Avanzar igual. Las imágenes salen sin templates de referencia. OK para test rápido, calendarios operativos (un drop diario, posts cortos), o cuando el usuario no quiere invertir en BVI ahora.",
+                  },
+                ],
+              }
+            : null,
           // EARLY PROPOSAL: when the company lacks a brand voice prompt
           // AND the agent is about to plan multiple posts, the copy
           // quality drop is large enough to warrant offering the user a
           // one-call setup before the plan is built. This used to surface
           // as a warning AFTER the plan was drafted, which is too late
           // for the proposal to be useful.
+          // The proposal expands to handle the multi-network case via
+          // create_brand_voice_for_company (see prompts.ts), which loops
+          // every connected network and creates one prompt per. When the
+          // company already has some voices but is missing them for newly
+          // connected networks, networks_without_brand_voice flags those
+          // so the agent can offer to extend the voice.
           brand_voice_setup_proposal: !hasBrandVoice
             ? {
                 severity: "proactive_suggestion",
                 user_message:
-                  "Esta empresa no tiene brand voice cargado. Los copies van a usar el default de Followr (output más genérico). Te propongo crear un brand voice prompt antes de armar el plan, derivado de la descripción, tonos y audiencia que ya tiene cargada la empresa. Es UNA sola llamada a create_prompt y mejora la calidad de TODOS los posts del plan.",
+                  "Esta empresa no tiene voz de marca cargada (las instrucciones de estilo de comunicación que la IA usa al generar copies). Sin esto los copies salen con el tono default de Followr, más genérico. Te propongo armar la voz de marca antes del plan, derivada de la descripción, tonos y audiencia que ya tiene cargada la empresa.",
                 suggested_create_prompt_seed: {
-                  name: `${companyResolved.name} brand voice (auto)`,
-                  social_network_type: null,
+                  name: `${companyResolved.name} brand voice`,
                   default: true,
                   prompt_preamble: [
                     `You write social media copy for ${companyResolved.name}.`,
@@ -868,11 +920,12 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
                     .filter(Boolean)
                     .join(" "),
                 },
+                target_networks: connectedNetworks,
                 resolution_options: [
                   {
                     id: "create_brand_voice_first",
                     description:
-                      "Llamar create_prompt(company_id, name=brand_voice, prompt=<suggested_create_prompt_seed.prompt_preamble>, default=true). Una sola llamada. Después continuar con draft_content_plan; el voice se aplica automáticamente.",
+                      "Llamar create_brand_voice_for_company(company_id, prompt=<suggested_create_prompt_seed.prompt_preamble>, name=<seed.name>, default=true). Una sola llamada que crea la voz para cada red conectada de la empresa. Después continuar con draft_content_plan; la voz se aplica automáticamente. NUNCA exponer al usuario el detalle 'creo uno por red porque el campo de red es obligatorio'; decirle simplemente 'te armo la voz de marca para tu empresa'.",
                   },
                   {
                     id: "proceed_with_default_voice",
@@ -882,10 +935,39 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
                 ],
               }
             : null,
+          // SECONDARY PROPOSAL: the company already has at least one brand
+          // voice prompt, but some connected networks still do not have a
+          // default voice. Surfaces a smaller proposal so the agent can
+          // offer to extend the existing voice to the missing networks.
+          // Typical trigger: the user connected a new social network
+          // AFTER the original voice setup.
+          brand_voice_coverage_gap: hasBrandVoice && networksWithoutBrandVoice.length > 0
+            ? {
+                severity: "proactive_suggestion",
+                user_message: `Detecté que ${networksWithoutBrandVoice
+                  .map((n) => displayNetworkName(n))
+                  .join(
+                    ", ",
+                  )} no tiene${networksWithoutBrandVoice.length === 1 ? "" : "n"} voz de marca configurada. Las otras redes conectadas sí. ¿Querés que extienda la voz existente a esa${networksWithoutBrandVoice.length === 1 ? "" : "s"} red${networksWithoutBrandVoice.length === 1 ? "" : "es"} en una llamada?`,
+                networks_without_brand_voice: networksWithoutBrandVoice,
+                resolution_options: [
+                  {
+                    id: "extend_brand_voice_to_missing_networks",
+                    description:
+                      "Llamar create_brand_voice_for_company con la voz existente como base, limitando target_networks a las redes que faltan. Para reusar el prompt actual, leer un existing_brand_voice_prompts del bloque y pasar su .prompt como input.",
+                  },
+                  {
+                    id: "ignore_coverage_gap",
+                    description:
+                      "Seguir sin extender la voz. Las redes nuevas van a usar la voz default de Followr (más genérica) hasta que el usuario decida agregar una específica.",
+                  },
+                ],
+              }
+            : null,
           recommended_video_model_policy:
             "available_video_models is pre-sorted: the FIRST entry is the recommended default for this company. ALWAYS pick the first entry, and ALWAYS use the model_id verbatim from the catalog. Do NOT invent model IDs from memory: Followr's canonical format uses dots for major.minor versions (veo_3.1_fast, veo_3.1, wan_2.2, seedance_1.1_light, seedance_2.0_fast, etc.) and no separator for hailuo (hailuo_02_standard, hailuo_02_premium). Underscored variants like veo_3_1_fast or hailuo_0_2_premium do NOT exist in Followr; the backend rejects them with HTTP 422 'selected model is invalid'. The sort accounts for company ai_preferences.video_model (rank 0 when set, with is_company_default: true) and for plan gating (when followr_plus_enabled is false, wan_2.2 is promoted to rank 0 with is_plan_fallback_default: true and every premium-bucket model is marked blocked_by_plan: true and affordable_at_default_duration: false). On accounts WITHOUT Followr Plus the ONLY accepted video model is wan_2.2; never recommend a premium-bucket model on those accounts. If the user explicitly asks for a premium model and followr_plus_enabled is false, explain the limitation and point them to followr.ai to activate the Followr Plus add-on.",
           recommended_image_model_policy:
-            "available_image_models is pre-sorted: the FIRST entry is the recommended default (company ai_preferences.image_model if set, otherwise nano_banana_2). ALWAYS use the model_id verbatim from the catalog (e.g. flux_pro_1.1 with a dot, not flux_pro_1_1 with an underscore). On accounts WITHOUT followr_plus_enabled the ONLY accepted image models are nano_banana_2 and z_image_turbo; every other model (nano_banana_pro, gpt_image_2, imagen4_*, ideogram_v3, flux_pro_1.1) is premium-bucket and the backend rejects them with HTTP 422 'selected model is invalid'. If the user asks for a premium model on a non-Plus account, surface the limitation and offer nano_banana_2 as the alternative.",
+            "available_image_models is pre-sorted by quality (best → worst). The FIRST entry is the recommended default (company ai_preferences.image_model when set, otherwise Google Nano Banana 2). When passing the value to a tool, ALWAYS use model_id verbatim from the catalog (the backend is strict about format: gpt-image-1-auto uses hyphens, flux_pro_1.1 uses a dot, wan_25_preview has no separator between 2 and 5, recraftv3 is one word). When TALKING TO THE USER, use the human display_name (Google Nano Banana 2, OpenAI GPT Image 2, Google Imagen 4 Fast, etc.) and the quality positioning from recommended_for; never quote the model_id, never quote 'premium bucket' or HTTP error codes.\n\nQUALITY LADDER (Followr team ranking, all model_ids verified against backend on 2026-05-22, best → worst):\n  1. Google Nano Banana 2 (default, balanced, 25 cr)\n  2. OpenAI GPT Image 2 (flagship, 70 cr)\n  3. Google Nano Banana (12 cr, high tier just below GPT Image 2)\n  4. Google Imagen 4 (12 cr)\n  5. Google Imagen 4 Fast (6 cr)\n  6. GPT Image (10 cr, older OpenAI)\n  7. Ideogram V3 (18 cr, use when the image needs legible baked-in text)\n  8. Wan 2.5 Preview (15 cr)\n  9. Fal Flux Pro 1.1 (12 cr, Flux aesthetic)\n  10. Fal Flux.1 Dev (8 cr)\n  11. Seedream V4 (10 cr)\n  12. Recraft v3 - Digital (3 cr, flat illustration style)\n  Z-Image Turbo (2 cr, fallback, lowest quality)\n\nAVAILABLE ON REQUEST (not in default ladder, but still callable): Google Nano Banana Pro (45 cr, marked 'best' in the Followr UI but excluded from the user's explicit quality ranking) and Fal Flux Pro Kontext (12 cr, Kontext capability variant). Surface these only when the user specifically asks for them.\n\nWhen the user is making a hero / launch / brand-critical piece and is on Followr Plus, propose stepping up to OpenAI GPT Image 2 or Google Nano Banana explicitly. Do NOT silently swap to a model with WORSE quality just because the cost is lower (anti-pattern from PostApprove 2026-05-22: suggesting 'Fal Flux Pro 1.1 (12 cr) for the hero' when it actually ranks BELOW Nano Banana 2 in raw quality).\n\nPLAN GATING: on accounts WITHOUT followr_plus_enabled the ONLY accepted image models are Google Nano Banana 2 and Z-Image Turbo; every other entry above is premium and the backend rejects them. If the user explicitly asks for a premium model on a non-Plus account, translate the limitation to plain language (without quoting field names or HTTP codes) and offer Google Nano Banana 2 as the alternative.",
           website_grounding_strategy:
             "brand_context.website_summary is a SHALLOW metadata scrape (title, meta description, og:* tags, top headings). It does NOT contain product image URLs. When the company has a product website AND the plan involves product imagery (fashion, beauty, food, retail, packaging), STRONGLY CONSIDER calling deep_research(company_id) BEFORE draft_content_plan to retrieve real product URLs and image URLs. Use the resulting image URLs as reference_image_url on each ai_generate source so the generated assets resemble the actual brand catalog instead of generic AI imaginings. If you skip this step on a product-heavy brand, mention it explicitly to the user so they can opt in.",
           per_item_preview_strategy:
@@ -1811,15 +1893,31 @@ ITEM-BY-ITEM CONFIRMATION FLOW: when the user asks to advance one item at a time
       // synthesize copy_draft fallbacks when a sub_post lacks one.
       // Also load the BrandContext (parsed BrandVisualIdentity block +
       // asset_id->url lookup) so the AI image resolver can auto-inject
-      // brand grounding (F3). All three in parallel to keep latency flat.
+      // brand grounding (F3).
+      // Also list connected social networks: if the company has any network
+      // connected AND the plan items carry a publish time, we schedule the
+      // PostGroup (draft:false + publish_at + auto_publish:true) so it lands
+      // on the user's calendar. Without networks we keep the legacy draft
+      // behavior. Fetched in parallel to keep latency flat.
       // Tolerant: failures degrade gracefully (no brand grounding when the
       // company has no identity block; no copy_draft fallback when getCompany
-      // fails).
-      const [prefs, companyForCopy, brandContext] = await Promise.all([
+      // fails; no scheduling when listSocialNetworks fails).
+      const [prefs, companyForCopy, brandContext, socialNetworksR] = await Promise.all([
         getAiPreferences(client, plan.company_id),
         client.getCompany(plan.company_id).catch(() => null),
         loadBrandContext(client, plan.company_id),
+        client.listSocialNetworks(plan.company_id).catch(() => [] as unknown[]),
       ]);
+      const hasConnectedNetworks =
+        Array.isArray(socialNetworksR) && socialNetworksR.length > 0;
+      // Timezone fallback chain: explicit plan-level auto_publish_schedule >
+      // company timezone > UTC. Each PlanItem carries publish_at_time_local
+      // as "HH:MM"; we combine with item.date + this timezone to compute UTC.
+      const scheduleTimezone = resolveTimezone(
+        plan.auto_publish_schedule?.timezone,
+        (companyForCopy as (Company & { timezone?: string | null }) | null)?.timezone,
+        "UTC",
+      );
       const copyCtx: CopyResolutionContext = {
         companyName: companyForCopy?.name ?? "the company",
         companyDescription: companyForCopy?.description ?? null,
@@ -1834,14 +1932,18 @@ ITEM-BY-ITEM CONFIRMATION FLOW: when the user asks to advance one item at a time
         hashtagsPolicy: plan.user_answers.hashtags_policy ?? "auto",
       };
 
-      // Compute publish_at UTC per item if auto_publish_schedule is set or
-      // each item carries its own. We pass publish_at_local as YYYY-MM-DDTHH:mm
-      // and let the API treat it as local in the requested timezone. Followr
-      // stores in UTC; we send ISO with the offset computed from the IANA tz.
       const itemResults: Array<Record<string, unknown>> = [];
       const executions = itemsToRun.map(async (item) => {
         try {
-          const result = await executePlanItem(client, plan.company_id, item, prefs, copyCtx, brandContext);
+          const result = await executePlanItem(
+            client,
+            plan.company_id,
+            item,
+            prefs,
+            copyCtx,
+            brandContext,
+            { hasConnectedNetworks, scheduleTimezone },
+          );
           itemResults.push(result);
           return result;
         } catch (e) {
@@ -1904,20 +2006,34 @@ ITEM-BY-ITEM CONFIRMATION FLOW: when the user asks to advance one item at a time
         0,
       );
 
+      // Branch next-actions by whether items were scheduled or left as drafts.
+      // Mixed runs (some scheduled, some draft) describe both states. The
+      // helper checks each result for the `scheduled` flag set by
+      // executePlanItem.
+      const scheduledCount = itemResults.filter((r) => r["scheduled"] === true).length;
+      const draftCount = itemResults.filter(
+        (r) => r["status"] === "created" && r["scheduled"] !== true,
+      ).length;
+      const calendarLine =
+        scheduledCount > 0
+          ? `Revisar los posteos que quedaron calendarizados (${scheduledCount}) en el calendario de Followr; se publican automáticamente en la fecha y hora indicadas.`
+          : null;
+      const draftLine =
+        draftCount > 0
+          ? `Revisar los borradores (${draftCount}) en la vista de drafts de Followr; podés programarlos a mano desde la app o publicarlos directo.`
+          : null;
+      const successLines = [calendarLine, draftLine].filter((l): l is string => l !== null);
       const nextActions =
         overallStatus === "succeeded"
           ? isPartialExecution
             ? [
                 `Quedan ${remainingSlugs.length} items pendientes en el plan: ${remainingSlugs.join(", ")}. Pasalos a execute_content_plan con plan_item_slugs cuando el usuario apruebe avanzar.`,
-                "Revisar los drafts creados en app.followr.ai (cada PostGroup quedó como draft).",
+                ...successLines,
               ]
-            : [
-                "Revisar los drafts en app.followr.ai (cada PostGroup creado quedó como draft).",
-                "Programar los publish times desde la app o llamar publish_post_group_now si querés publicar uno ahora.",
-              ]
+            : successLines
           : overallStatus === "completed_with_partial_failures"
             ? [
-                "Revisar los drafts que se crearon OK en app.followr.ai.",
+                ...successLines,
                 "Mirar el campo error_message de los items que fallaron para entender la causa.",
                 "Para reintentar solo los fallidos: usar update_content_plan para ajustar ese sub_post y volver a llamar execute_content_plan con plan_item_slugs apuntando solo a los slugs fallidos.",
                 ...(remainingSlugs.length > 0
@@ -2327,6 +2443,15 @@ interface BrandContext {
   identity: BrandVisualIdentity | null;
   /** asset_id -> Followr CDN url, for refs lookup. */
   assetIdToUrl: Map<number, string>;
+  /**
+   * Company.palettes hex codes, even when a full BrandVisualIdentity block is
+   * NOT configured. Used as a soft fallback: when identity is null but the
+   * company has palettes saved, the resolver injects a short palette suffix
+   * into the image prompt so generations at least respect the brand colors.
+   * Reduces the "generic AI output" problem on companies that have only
+   * partial brand setup. Empty array when the company has no palettes.
+   */
+  fallbackPalettes: string[];
 }
 
 async function loadBrandContext(
@@ -2334,10 +2459,19 @@ async function loadBrandContext(
   companyId: number,
 ): Promise<BrandContext> {
   let identity: BrandVisualIdentity | null = null;
+  let fallbackPalettes: string[] = [];
   try {
     const company = await client.getCompany(companyId);
     const parsed = parseBrandIdentityFromDescription(company.description ?? null);
     if (parsed.status === "ok") identity = parsed.identity;
+    // Always record the company-level palettes; we use them only when the
+    // full identity block is missing.
+    const rawPalettes = (company as Company & { palettes?: unknown }).palettes;
+    if (Array.isArray(rawPalettes)) {
+      fallbackPalettes = rawPalettes
+        .filter((p): p is string => typeof p === "string" && /^#?[0-9a-f]{3,8}$/i.test(p))
+        .map((p) => (p.startsWith("#") ? p : `#${p}`));
+    }
   } catch {
     // Best-effort: if Company fetch fails, brand context is empty and
     // the resolver falls back to non-branded generation.
@@ -2362,7 +2496,20 @@ async function loadBrandContext(
       // refs (if any).
     }
   }
-  return { identity, assetIdToUrl };
+  return { identity, assetIdToUrl, fallbackPalettes };
+}
+
+/**
+ * Lightweight palette-only suffix used when the company has palettes but no
+ * full BrandVisualIdentity block. Mirrors the palette section of
+ * buildBrandPromptSuffix without the brief / typography / anti-patterns,
+ * since those don't exist outside an identity block. Empty string when the
+ * palette list is empty (caller can concatenate unconditionally).
+ */
+function buildSoftPalettePromptSuffix(palettes: string[]): string {
+  if (palettes.length === 0) return "";
+  const list = palettes.slice(0, 6).join(", ");
+  return `\n\n--- BRAND PALETTE GUIDANCE ---\nUse this brand color palette as the dominant chromatic anchor of the image (apply to accents, backgrounds, surfaces, or focal subjects as visually appropriate): ${list}. Avoid colors that clash with this palette.`;
 }
 
 /**
@@ -2556,9 +2703,18 @@ async function resolveAssetSourceFresh(
     // agent can opt out per-source by setting use_brand_visual_identity:false.
     // Skips silently when the company has no brand identity configured.
     const useBrand = (imgSrc.use_brand_visual_identity ?? true) && brandContext.identity !== null;
+    // Three suffix tiers for brand grounding, in priority order:
+    //   1. Full identity suffix (brief + palette + typography + anti-patterns) when BVI is configured.
+    //   2. Soft palette-only suffix when BVI is missing but the company has palettes saved on its profile.
+    //   3. None when nothing is available.
+    // The agent's per-source use_brand_visual_identity:false opt-out skips
+    // tier 1 only; the palette fallback still applies because palettes are a
+    // weaker, purely chromatic anchor that doesn't constrain composition.
     const brandSuffix = useBrand && brandContext.identity
       ? buildBrandPromptSuffix(brandContext.identity)
-      : "";
+      : brandContext.identity === null && brandContext.fallbackPalettes.length > 0
+        ? buildSoftPalettePromptSuffix(brandContext.fallbackPalettes)
+        : "";
     const brandRefsPicked = useBrand
       ? pickBrandReferenceUrls(brandContext, imgSrc.prompt, 4)
       : { urls: [] as string[], has_typography_ref: false };
@@ -2758,6 +2914,21 @@ async function executePlanItem(
   prefs: AiPreferences,
   copyCtx: CopyResolutionContext,
   brandContext: BrandContext,
+  schedulingCtx: {
+    /**
+     * True when listSocialNetworks returned at least one connection for this
+     * company. We only schedule (publish_at + auto_publish) when the company
+     * can actually publish; otherwise the PostGroup stays as a pure draft so
+     * the user can connect networks later and approve from the UI.
+     */
+    hasConnectedNetworks: boolean;
+    /**
+     * IANA timezone used to interpret item.publish_at_time_local. Resolved by
+     * the caller from plan.auto_publish_schedule.timezone, the Company's own
+     * timezone, or "UTC" as final fallback.
+     */
+    scheduleTimezone: string;
+  },
 ): Promise<Record<string, unknown>> {
   // 1. Build a fingerprint-keyed promise cache so any AI generation
   // (or URL upload) requested by multiple sub_posts is performed exactly
@@ -2891,11 +3062,28 @@ async function executePlanItem(
     };
   }
 
-  // 2. Create PostGroup.
+  // 2. Decide whether to schedule the PostGroup or leave it as a draft.
+  // Rule: only schedule (publish_at + auto_publish) when BOTH the plan item
+  // carries a concrete publish_at_time_local AND the company actually has
+  // at least one social network connected. Without networks the user cannot
+  // publish anyway, so the legacy draft-only behavior is preserved so they
+  // can connect networks later and approve from the Followr UI.
+  const wantSchedule =
+    schedulingCtx.hasConnectedNetworks &&
+    typeof item.publish_at_time_local === "string" &&
+    item.publish_at_time_local.length > 0;
+  const publishAtUtc = wantSchedule
+    ? localDateTimeToUtcIso(item.date, item.publish_at_time_local, schedulingCtx.scheduleTimezone)
+    : null;
+  const scheduled = wantSchedule && publishAtUtc !== null;
   let group;
   try {
     group = await client.createPostGroup(companyId, {
-      draft: true,
+      // Scheduling path: PostGroup is published automatically at publish_at.
+      // Draft path (no scheduling): traditional behavior; the user must
+      // schedule manually from the UI.
+      draft: !scheduled,
+      ...(scheduled ? { publish_at: publishAtUtc, auto_publish: true } : {}),
       title: item.concept_shared.slice(0, 120),
       description: item.concept_shared,
       topic: item.concept_shared.slice(0, 60),
@@ -3046,18 +3234,29 @@ async function executePlanItem(
   // confuse the user into checking the wrong counter. Cf. MEMORY note
   // 'credits != budget'.
   const generationsLabel = creditsConsumed === 1 ? "generación de imagen/video" : "generaciones de imagen/video";
+  // State label adapts to whether the PostGroup was scheduled (it appears on
+  // the user's Followr calendar and auto-publishes at publish_at) or stayed
+  // as a draft (no schedule, sits in the drafts view until the user acts).
+  const stateLabel = scheduled
+    ? `calendarizado para el ${item.date} a las ${item.publish_at_time_local}`
+    : `listo como borrador del ${item.date} ${item.publish_at_time_local}`;
   const userFacingSummary =
     subPostsFailed === 0
-      ? `Posteo "${item.concept_shared}" del ${item.date} ${item.publish_at_time_local} listo como borrador en ${networksCreated.join(", ")}. Costo: ${creditsConsumed} ${generationsLabel} (ai_image_and_video_budget).${reuseLine}`
-      : `Posteo "${item.concept_shared}" del ${item.date} ${item.publish_at_time_local}: creado para ${networksCreated.join(", ") || "ninguna red"}, falló en ${networksFailed.join(", ")}. Costo: ${creditsConsumed} ${generationsLabel} (ai_image_and_video_budget).${reuseLine}`;
+      ? `Posteo "${item.concept_shared}" ${stateLabel} en ${networksCreated.join(", ")}. Costo: ${creditsConsumed} ${generationsLabel}.${reuseLine}`
+      : `Posteo "${item.concept_shared}" ${stateLabel}: creado para ${networksCreated.join(", ") || "ninguna red"}, falló en ${networksFailed.join(", ")}. Costo: ${creditsConsumed} ${generationsLabel}.${reuseLine}`;
 
   return {
     slug: item.slug,
     date: item.date,
     publish_at_time_local: item.publish_at_time_local,
     status: subPostsFailed === 0 ? "created" : "partially_created",
-    // Ready-to-show message. Reproduce or paraphrase this; never paste raw
-    // ids into user prose.
+    // Scheduling outcome. When scheduled is true the PostGroup is on the
+    // user's Followr calendar and will auto-publish at publish_at. When
+    // false it is a pure draft sitting in the drafts view; the user must
+    // schedule manually from the UI. Surface this to the user in plain
+    // language (never the field names) so they know what to expect next.
+    scheduled,
+    publish_at: scheduled ? publishAtUtc : null,
     user_facing_summary: userFacingSummary,
     sub_posts_created: subPostsCreated,
     sub_posts_failed: subPostsFailed,
