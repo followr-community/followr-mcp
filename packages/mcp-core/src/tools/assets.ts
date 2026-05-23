@@ -51,9 +51,10 @@ export async function uploadFromUrl(
     name?: string;
     visibility?: "public" | "private";
     contentTypeOverride?: string;
+    folderId?: number | null;
   },
 ): Promise<Asset> {
-  const { companyId, url, type, name, visibility, contentTypeOverride } = args;
+  const { companyId, url, type, name, visibility, contentTypeOverride, folderId } = args;
   const downloadResp = await fetch(url);
   if (!downloadResp.ok) {
     throw new ToolErrorException(
@@ -83,13 +84,123 @@ export async function uploadFromUrl(
   const buffer = await downloadResp.arrayBuffer();
   const fallbackExt = type === "image" ? "jpg" : "mp4";
   const filename = name ?? filenameFromUrl(url, fallbackExt);
-  const asset = await client.createAsset(companyId, { name: filename, type });
+  const asset = await client.createAsset(companyId, {
+    name: filename,
+    type,
+    ...(folderId !== undefined ? { folder_id: folderId } : {}),
+  });
   const upload = await client.requestAssetUpload(asset.id, type, {
     filename,
     type,
     visibility: visibility ?? "public",
   });
   await client.uploadToBlob(upload.presigned_url, buffer, contentType);
+  return { ...asset, url: upload.url };
+}
+
+/**
+ * Decode an "image_data" input into a binary buffer plus the detected
+ * MIME type. Accepts:
+ *   - data URLs:  data:image/png;base64,iVBORw0K...
+ *   - raw base64: iVBORw0KGgoAAAANSUhEUg...   (extension inferred from magic bytes)
+ *
+ * Used by upload_image_from_data so an MCP client that can pass attached
+ * images as base64 (Claude Desktop with image-capable transports, future
+ * clients that surface chat attachments to tools) can push them straight
+ * into a company library without requiring a public URL.
+ */
+function decodeImageData(input: string): { buffer: Uint8Array; contentType: string; ext: string } {
+  const trimmed = input.trim();
+  const dataUrlMatch = trimmed.match(/^data:([\w./+-]+);base64,(.+)$/u);
+  const base64 = dataUrlMatch ? dataUrlMatch[2]! : trimmed;
+  const declaredMime = dataUrlMatch ? dataUrlMatch[1]! : null;
+
+  // Decode base64. Node 20 has globalThis.atob but the binary string
+  // route loses bytes above 0xFF in some runtimes, so go via Buffer when
+  // available and fall back to atob otherwise.
+  let buffer: Uint8Array;
+  const globalBuffer = (globalThis as { Buffer?: { from(input: string, enc: string): Uint8Array } }).Buffer;
+  if (globalBuffer) {
+    buffer = globalBuffer.from(base64, "base64");
+  } else {
+    const binary = atob(base64);
+    buffer = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) buffer[i] = binary.charCodeAt(i);
+  }
+
+  const sniffed = sniffImageType(buffer);
+  const contentType = declaredMime ?? sniffed?.mime ?? "image/jpeg";
+  const ext = (sniffed?.ext ?? contentType.split("/")[1] ?? "jpg").toLowerCase();
+  return { buffer, contentType, ext };
+}
+
+function sniffImageType(buffer: Uint8Array): { mime: string; ext: string } | null {
+  if (buffer.length < 12) return null;
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    return { mime: "image/jpeg", ext: "jpg" };
+  }
+  if (
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47
+  ) {
+    return { mime: "image/png", ext: "png" };
+  }
+  if (buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46) {
+    return { mime: "image/gif", ext: "gif" };
+  }
+  if (
+    buffer[0] === 0x52 &&
+    buffer[1] === 0x49 &&
+    buffer[2] === 0x46 &&
+    buffer[3] === 0x46 &&
+    buffer[8] === 0x57 &&
+    buffer[9] === 0x45 &&
+    buffer[10] === 0x42 &&
+    buffer[11] === 0x50
+  ) {
+    return { mime: "image/webp", ext: "webp" };
+  }
+  return null;
+}
+
+export async function uploadFromData(
+  client: FollowrClient,
+  args: {
+    companyId: number;
+    imageData: string;
+    name?: string;
+    visibility?: "public" | "private";
+    folderId?: number | null;
+  },
+): Promise<Asset> {
+  const { companyId, imageData, name, visibility, folderId } = args;
+  let decoded: ReturnType<typeof decodeImageData>;
+  try {
+    decoded = decodeImageData(imageData);
+  } catch (err) {
+    throw new ToolErrorException(
+      toolError({
+        reason: "invalid_image_data",
+        user_message:
+          "The image data could not be decoded. Pass either a data URL (data:image/png;base64,...) or a raw base64 string of an image file (jpeg, png, gif, webp).",
+        details: { decode_error: err instanceof Error ? err.message : String(err) },
+      }),
+    );
+  }
+  const filename = name ?? `upload-${Date.now()}.${decoded.ext}`;
+  const asset = await client.createAsset(companyId, {
+    name: filename,
+    type: "image",
+    ...(folderId !== undefined ? { folder_id: folderId } : {}),
+  });
+  const upload = await client.requestAssetUpload(asset.id, "image", {
+    filename,
+    type: "image",
+    visibility: visibility ?? "public",
+  });
+  await client.uploadToBlob(upload.presigned_url, decoded.buffer, decoded.contentType);
   return { ...asset, url: upload.url };
 }
 
@@ -231,6 +342,59 @@ DEDUPE: call list_assets first if duplicates matter; Followr does not auto-dedup
           },
         ],
       };
+    },
+  );
+
+  server.registerTool(
+    "upload_image_from_data",
+    {
+      annotations: MUTATION_OPEN_WORLD,
+      title: "Upload an image to a company library from inline base64 data (no public URL needed)",
+      description: `Upload an image to the company's asset library directly from base64 data, without requiring an intermediate public URL. The same 3-step backend pattern as upload_image_from_url (create asset placeholder, request presigned URL, PUT binary), just fed from inline bytes.
+
+WHEN TO USE: when the user attached an image to the chat that you need to land in the company's library (logo for brand identity setup, product photo for a post, dashboard screenshot for a carousel) AND the host MCP client surfaces that attachment to you as base64 or data URL. Some clients support this directly; others do not (Claude.ai web with stock MCP transports does NOT pass attached binary to tools). When passing is not supported, FALL BACK to one of:
+  1. Ask the user to drop the file into the company's media library in the Followr web app, then continue.
+  2. Ask the user for an existing public URL (Drive shared link, a CDN, etc.) and use upload_image_from_url.
+DO NOT loop searching for alternative tools.
+
+PRECONDITION: company_id required. If multiple companies and the user hasn't named one, call list_companies first and ask by name.
+
+ACCEPTS:
+  - data URLs ("data:image/png;base64,iVBOR..."). MIME is read from the URL.
+  - raw base64 strings ("iVBORw0KGgo..."). MIME is sniffed from magic bytes (jpeg, png, gif, webp).
+
+LIMITS: base64 payloads are large. Prefer image_data only for images < ~2MB raw. Bigger files: use upload_image_from_url against a hosted URL.
+
+RETURNS: an Asset object with id and url. Use the id for create_post's assets_ids and for tagging it into brand identity folders.`,
+      inputSchema: {
+        company_id: z.number().int().positive(),
+        image_data: z
+          .string()
+          .min(64)
+          .describe(
+            "Base64-encoded image bytes. Either a data URL (data:image/png;base64,...) or a raw base64 string. JPEG, PNG, GIF, and WEBP are auto-detected.",
+          ),
+        name: z
+          .string()
+          .optional()
+          .describe(
+            "Optional filename. Defaults to upload-<ts>.<ext> with the extension picked from the detected MIME.",
+          ),
+        visibility: z.enum(["public", "private"]).optional().describe("Default public."),
+      },
+    },
+    async ({ company_id, image_data, name, visibility }) => {
+      try {
+        const asset = await uploadFromData(client, {
+          companyId: company_id,
+          imageData: image_data,
+          ...(name ? { name } : {}),
+          ...(visibility ? { visibility } : {}),
+        });
+        return { content: [{ type: "text", text: JSON.stringify(asset, null, 2) }] };
+      } catch (err) {
+        return toolErrorFromException(err);
+      }
     },
   );
 

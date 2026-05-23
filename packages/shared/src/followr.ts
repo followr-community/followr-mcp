@@ -1162,9 +1162,33 @@ export class FollowrClient {
   // ──────────────────────────────────────────────────────────
 
   /** Step 1: create asset placeholder under company. */
-  async createAsset(companyId: number, body: { name: string; type: "image" | "video" }): Promise<Asset> {
+  async createAsset(
+    companyId: number,
+    body: { name: string; type: "image" | "video"; folder_id?: number | null },
+  ): Promise<Asset> {
     const result = await this.request<ApiSingle<Asset>>("POST", `/api/companies/${companyId}/assets`, { body });
     return result.data;
+  }
+
+  /**
+   * Assign an existing Asset to a Folder (or detach from any folder when
+   * `folderId` is null). Used by brand identity execute to land curated
+   * assets in __brand_templates / __brand_elements / __brand_anti_patterns
+   * AFTER they were already uploaded (when the folder id wasn't known at
+   * create time). For NEW asset uploads where the target folder id is
+   * already resolved, prefer passing `folder_id` directly to `createAsset`
+   * (the Paso-1 POST), which lands the asset in the folder in one round
+   * trip instead of POST + PUT.
+   *
+   * Endpoint pattern: PUT /api/assets/{id} with a partial-merge body. The
+   * Asset shape includes `folder_id`; the merge updates it (or other
+   * future-supported fields) in place. Verified empirically 2026-05-23
+   * via `scripts/verify-folder-assignment.mjs` against company 7.
+   */
+  async assignAssetToFolder(assetId: number, folderId: number | null): Promise<void> {
+    await this.request<unknown>("PUT", `/api/assets/${assetId}`, {
+      body: { folder_id: folderId },
+    });
   }
 
   /**

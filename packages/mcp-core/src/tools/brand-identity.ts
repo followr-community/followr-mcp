@@ -49,7 +49,7 @@ import {
 } from "../lib/brand-identity-state.js";
 import { scrapeBrandSignalsFromWebsite } from "../lib/brand-website-scraper.js";
 import { toolError, toolErrorFromException } from "../lib/tool-error.js";
-import { uploadFromUrl } from "./assets.js";
+import { uploadFromData, uploadFromUrl } from "./assets.js";
 
 // Conventional folder names for the brand identity system. Detection is
 // case-insensitive and accepts both with and without the double-underscore
@@ -191,9 +191,10 @@ OUTPUT shape:
 
 USER FLOW the agent should follow when next_step === "cold_start":
 1. Surface pre_warning_text verbatim, ask for explicit confirmation to proceed.
-2. If user agrees: ask the 4 cold_start_questions one at a time or in 2-3 batches (preview question 3 with the scraped thumbnails inline if your transport supports it).
-3. Collect answers + curation choices.
-4. Call draft_brand_visual_identity with the collected answers (lands in F2 batch 2; not exposed yet, surface a stub state until then).
+2. If low_visual_signal.detected is true, surface low_visual_signal.message_for_user BEFORE asking the 4 cold_start_questions. This is a soft block: invite the user to upload 1-3 product / team / hero images now (logo in high resolution, screenshot of the product in use, team photo, post that performed well). If the user uploads, pick them up to feed into curation later as source=user_upload (image_data when attached to the chat, url when already public). If the user says "avanzá igual" or "no tengo", proceed but warn that the first draft may need a refresh once you can attach real product visuals.
+3. If user agrees: ask the 4 cold_start_questions one at a time or in 2-3 batches (preview question 3 with the scraped thumbnails inline if your transport supports it).
+4. Collect answers + curation choices.
+5. Call draft_brand_visual_identity with the collected answers (lands in F2 batch 2; not exposed yet, surface a stub state until then).
 
 USER FLOW when next_step === "refresh":
 1. Surface the current identity summary + how many posts have been published since last sync.
@@ -326,6 +327,32 @@ USER FLOW when next_step === "all_set":
         const industry = detectIndustryFromDescription(userFacingDescription);
         const questions = buildColdStartQuestions(industry);
 
+        // 8b. Low-visual-signal detection. If the website scrape returned
+        //     basically nothing usable (minimal landing à la Linear / Vercel
+        //     / Stripe, dashboard SPA with a marketing wrapper, etc), the
+        //     draft is going to mis-orient because we are synthesizing from
+        //     only the landing's first viewport. Real failure mode: a
+        //     dark-first SaaS app received a "light canvas first" draft
+        //     because the landing was light and no in-product screenshots
+        //     were available. The agent should explicitly invite the user
+        //     to upload 1-3 product / team / hero assets BEFORE answering
+        //     the 4 cold-start questions.
+        const websiteWasScraped = websiteSignals !== null;
+        const logoCount = websiteSignals?.logo_candidates.length ?? 0;
+        const heroCount = websiteSignals?.hero_candidates.length ?? 0;
+        const galleryCount = websiteSignals?.gallery_candidates.length ?? 0;
+        const paletteCount = websiteSignals?.palette_candidates.length ?? 0;
+        const lowVisualSignal =
+          websiteWasScraped &&
+          (websiteSignals?.fetch_status ?? "no_url") === "ok" &&
+          logoCount <= 1 &&
+          heroCount === 0 &&
+          galleryCount === 0 &&
+          paletteCount <= 3;
+        const lowVisualSignalMessage = lowVisualSignal
+          ? `Tu sitio es muy minimalista visualmente. Pude leer la landing pero no encontré screenshots del producto en uso, fotos del equipo, ni una galería. Si arranco a armar la identidad solo con eso, el primer draft suele salir mal orientado (ej. asume canvas blanco cuando el producto real es dark mode, o subestima el color de marca). Antes de las 4 preguntas, te recomiendo subir 1-3 assets propios: logo en alta, screenshot del producto / dashboard funcionando, foto del equipo o un post anterior que te haya gustado. Si no tenés nada a mano, avanzamos solo con la landing y refinamos después una vez que persistas el bloque base.`
+          : null;
+
         // 9. Assemble response.
         const response = {
           company_id: company.id,
@@ -407,6 +434,14 @@ USER FLOW when next_step === "all_set":
               ? null
               : `Necesitás ${PHASE_1_ESTIMATE_CR} créditos de ai_image_and_video_budget para Phase 1, te quedan ${aiImageVideoRemaining ?? "(no se pudo leer)"}. Podés saltar Phase 1 (el setup persiste igual con folders vacíos) o conseguir más créditos antes de avanzar.`,
           },
+          low_visual_signal: {
+            detected: lowVisualSignal,
+            logo_candidates_count: logoCount,
+            hero_candidates_count: heroCount,
+            gallery_candidates_count: galleryCount,
+            palette_candidates_count: paletteCount,
+            message_for_user: lowVisualSignalMessage,
+          },
           _assistant_guidance: {
             next_step: nextStep,
             pre_warning_text: preWarning,
@@ -419,6 +454,9 @@ USER FLOW when next_step === "all_set":
                   : "Mostrale el resumen del identity existente. No empujes refresh a menos que el usuario lo pida explícitamente.",
             instructions_for_pre_warning:
               "Surface pre_warning_text al usuario VERBATIM (incluyendo el desglose de costos + el aviso del ai_image_styles si aplica). Espera 'sí' / 'dale' / 'avanza' EXPLICITO antes de hacer cualquier mutación.",
+            instructions_for_low_visual_signal: lowVisualSignal
+              ? "BLOQUEANTE BLANDO: antes de avanzar a las 4 preguntas, surfá low_visual_signal.message_for_user al usuario y pedile activamente 1-3 assets propios (logo en alta, screenshot del producto en uso, foto del equipo, post anterior que rindió). Si el usuario los pasa, los recibís ahora y los vas a usar en curation con source=user_upload (image_data si vienen como adjunto del chat, url si ya están públicos en alguna parte). Si el usuario dice 'no tengo' o 'avanzá igual', registralo y seguí con las 4 preguntas armando la identidad solo con la landing, pero advertí que el primer draft puede salir mal orientado y vamos a refinar después."
+              : "El sitio tiene suficientes señales visuales (logos, heros, paletas o galería). No hace falta pedir assets adicionales al usuario antes de las 4 preguntas; podés ofrecerle subir extras como opción, no como bloqueante.",
             instructions_for_questions:
               "Hacé las 4 preguntas conversacionalmente, en español (o el idioma del usuario). Las preguntas 1, 2, 4 son textuales; la 3 requiere mostrar thumbnails. NO inventes ejemplos: usá los provided en cada pregunta. Si el usuario dice 'paso' en pregunta 2 (aspirational), respetá y sigue. Si dice 'no tengo nada para subir' en pregunta 3, sigue con solo lo curado del scrape.",
             persist_target_after_user_approval:
@@ -515,6 +553,13 @@ NEXT STEP: surface preview_markdown to the user verbatim, ask for explicit appro
                   "aspirational_brand_og",
                 ]),
                 url: z.string().url().optional(),
+                image_data: z
+                  .string()
+                  .min(64)
+                  .optional()
+                  .describe(
+                    "Inline base64 image data for user_upload items when the user attached the file to the chat and the MCP client surfaces it to tools as base64 (data URL or raw). Mutually exclusive with url. Picked up by upload_image_from_data internally at execute time. Prefer url when the asset already lives at a public location.",
+                  ),
                 svg_content: z.string().max(200_000).optional(),
                 aspirational_brand_name: z.string().min(1).max(80).optional(),
                 alt: z.string().nullable().optional(),
@@ -733,10 +778,11 @@ NEXT STEP: surface preview_markdown to the user verbatim, ask for explicit appro
                       "Surface preview_markdown verbatim to the user. Wait for explicit approval ('dale', 'ejecuta', 'OK', etc.). On approval, call execute_brand_visual_identity(draft_id, confirm=true). If the user wants changes, call draft_brand_visual_identity again with updated inputs (this draft expires in 24h).",
                     blockers:
                       proposedActions.filter((a) => a.kind === "upload_url_to_folder").length === 0 &&
+                      proposedActions.filter((a) => a.kind === "upload_data_to_folder").length === 0 &&
                       proposedActions.filter((a) => a.kind === "upload_svg_to_folder").length === 0 &&
                       proposedActions.filter((a) => a.kind === "fetch_og_image_then_upload").length === 0
                         ? [
-                            "El draft no tiene ningún asset para subir. El bloque se va a persistir vacío. ¿Confirmás avanzar igual? Probablemente quieras volver a la curación y aprobar al menos algunas imágenes.",
+                            "El draft no tiene ningún asset curado: ni del scrape del sitio, ni de imágenes adjuntas del usuario, ni de marcas aspiracionales. Si ejecutás así, las 3 folders __brand_templates / __brand_elements / __brand_anti_patterns van a quedar VACÍAS. Para evitarlo: (a) volvé a la curación y aprobá al menos 1 logo / hero / aspiracional, (b) pedile al usuario 1-2 imágenes propias (logo en alta, screenshot del producto, post viejo que rindió) y pasalas en curation con source=user_upload + image_data o url, o (c) confirmá explícitamente con el usuario que querés persistir el bloque de identidad sin assets de referencia y que las folders quedarán vacías hasta llenarlas a mano.",
                           ]
                         : [],
                   },
@@ -860,16 +906,39 @@ After success the agent should offer Phase 1 template manufacturing as a follow-
                     | "anti_patterns";
                   const filename = String(action.payload["filename"] ?? "");
                   const tags = (action.payload["tags"] as BrandTag[]) ?? [];
+                  const folderId = resolveFolderId(intent, {
+                    folderIdTemplates,
+                    folderIdElements,
+                    folderIdAntiPatterns,
+                  });
                   const asset = await uploadFromUrl(client, {
                     companyId: draft.company_id,
                     url,
                     type: "image",
                     ...(filename ? { name: filename } : {}),
+                    ...(folderId !== null ? { folderId } : {}),
                   });
-                  await maybeMoveAssetToFolder(client, asset.id, intent, {
+                  uploadedAssets.push({ asset_id: asset.id, folder_intent: intent, tags });
+                  return { action, result: { asset_id: asset.id, folder_intent: intent, tags } };
+                }
+                case "upload_data_to_folder": {
+                  const imageData = String(action.payload["image_data"]);
+                  const intent = String(action.payload["target_intent"]) as
+                    | "templates"
+                    | "elements"
+                    | "anti_patterns";
+                  const filename = String(action.payload["filename"] ?? "");
+                  const tags = (action.payload["tags"] as BrandTag[]) ?? [];
+                  const folderId = resolveFolderId(intent, {
                     folderIdTemplates,
                     folderIdElements,
                     folderIdAntiPatterns,
+                  });
+                  const asset = await uploadFromData(client, {
+                    companyId: draft.company_id,
+                    imageData,
+                    ...(filename ? { name: filename } : {}),
+                    ...(folderId !== null ? { folderId } : {}),
                   });
                   uploadedAssets.push({ asset_id: asset.id, folder_intent: intent, tags });
                   return { action, result: { asset_id: asset.id, folder_intent: intent, tags } };
@@ -882,12 +951,18 @@ After success the agent should offer Phase 1 template manufacturing as a follow-
                     | "anti_patterns";
                   const filename = String(action.payload["filename"]);
                   const tags = (action.payload["tags"] as BrandTag[]) ?? [];
-                  const asset = await uploadSvgInline(client, draft.company_id, svg, filename);
-                  await maybeMoveAssetToFolder(client, asset.id, intent, {
+                  const folderId = resolveFolderId(intent, {
                     folderIdTemplates,
                     folderIdElements,
                     folderIdAntiPatterns,
                   });
+                  const asset = await uploadSvgInline(
+                    client,
+                    draft.company_id,
+                    svg,
+                    filename,
+                    folderId,
+                  );
                   uploadedAssets.push({ asset_id: asset.id, folder_intent: intent, tags });
                   return { action, result: { asset_id: asset.id, folder_intent: intent, tags } };
                 }
@@ -899,16 +974,17 @@ After success the agent should offer Phase 1 template manufacturing as a follow-
                     | "anti_patterns";
                   const filename = String(action.payload["filename"]);
                   const tags = (action.payload["tags"] as BrandTag[]) ?? [];
+                  const folderId = resolveFolderId(intent, {
+                    folderIdTemplates,
+                    folderIdElements,
+                    folderIdAntiPatterns,
+                  });
                   const asset = await uploadFromUrl(client, {
                     companyId: draft.company_id,
                     url: ogUrl,
                     type: "image",
                     name: filename,
-                  });
-                  await maybeMoveAssetToFolder(client, asset.id, intent, {
-                    folderIdTemplates,
-                    folderIdElements,
-                    folderIdAntiPatterns,
+                    ...(folderId !== null ? { folderId } : {}),
                   });
                   uploadedAssets.push({ asset_id: asset.id, folder_intent: intent, tags });
                   return { action, result: { asset_id: asset.id, folder_intent: intent, tags } };
@@ -1005,6 +1081,7 @@ After success the agent should offer Phase 1 template manufacturing as a follow-
           (r) =>
             r.status === "succeeded" &&
             (r.kind === "upload_url_to_folder" ||
+              r.kind === "upload_data_to_folder" ||
               r.kind === "upload_svg_to_folder" ||
               r.kind === "fetch_og_image_then_upload"),
         ).length;
@@ -1191,6 +1268,19 @@ NEXT STEP: after manufacture, call finalize_brand_templates with user's per-asse
           if (url) assetIdToUrl.set(a.id, url);
         }
 
+        // 3b. Lazy folder creation for __brand_templates. The initial
+        //     setup (execute_brand_visual_identity) only creates the
+        //     folders that have curated content; on a low-asset cold start
+        //     __brand_templates may not exist yet. We resolve it (or
+        //     create it on demand + patch the block) here so the AI
+        //     templates we're about to generate end up in the right
+        //     folder instead of loose at the company root.
+        const templatesFolderId = await ensureBrandFolder(
+          client,
+          input.company_id,
+          "templates",
+        );
+
         // 4. Run the generations grouped by concurrency=4.
         type Job = {
           category: TemplateCategory;
@@ -1269,12 +1359,20 @@ NEXT STEP: after manufacture, call finalize_brand_templates with user's per-asse
                   };
                 }
                 // Upload the AI result URL to the asset library so it
-                // becomes a permanent asset the user can reference.
+                // becomes a permanent asset the user can reference. We
+                // pass folder_id directly to land it in __brand_templates
+                // in one round trip (verified 2026-05-23 that the
+                // create-asset POST accepts folder_id in the body). When
+                // templatesFolderId is null (block was missing or the
+                // create folder + patch failed earlier), we still upload
+                // to root and rely on the tag_map for the resolver to
+                // find the asset.
                 const asset = await uploadFromUrl(client, {
                   companyId: input.company_id,
                   url: imageUrl,
                   type: "image",
                   name: `brand-${job.category}-v${job.variation}.jpg`,
+                  ...(templatesFolderId !== null ? { folderId: templatesFolderId } : {}),
                 });
                 return {
                   category: job.category,
@@ -2118,6 +2216,7 @@ type CurationItem = {
     | "user_upload"
     | "aspirational_brand_og";
   url?: string;
+  image_data?: string;
   svg_content?: string;
   aspirational_brand_name?: string;
   alt?: string | null;
@@ -2143,6 +2242,19 @@ function validateCurationItems(items: CurationItem[]): { ok: true } | { ok: fals
         return {
           ok: false,
           message: `curation.items[${i}] (source=aspirational_brand_og) requiere aspirational_brand_name. El agente debe pasar el nombre que el usuario eligió en pregunta 2.`,
+        };
+      }
+    } else if (it.source === "user_upload") {
+      if (!it.url && !it.image_data) {
+        return {
+          ok: false,
+          message: `curation.items[${i}] (source=user_upload) requiere url o image_data. Si el usuario adjuntó el archivo al chat y tu cliente MCP lo expone como base64, pasalo en image_data. Si el asset ya vive en una URL pública (Drive shared link, CDN, asset library de Followr), pasalo en url.`,
+        };
+      }
+      if (it.url && it.image_data) {
+        return {
+          ok: false,
+          message: `curation.items[${i}] (source=user_upload) recibió url Y image_data. Pasá uno solo.`,
         };
       }
     } else {
@@ -2297,28 +2409,70 @@ interface BuildActionsArgs {
   clearAiImageStyles: boolean;
 }
 
+/**
+ * Decide which of the 3 brand folders will receive at least one asset,
+ * so we can skip creating the folders that would land empty. Aspirational
+ * og:images count toward "elements" because that is where they land by
+ * default (they're inspiration references, not the brand's own templates
+ * nor anti-patterns).
+ */
+function computeIntentsWithContent(args: BuildActionsArgs): {
+  templates: boolean;
+  elements: boolean;
+  anti_patterns: boolean;
+} {
+  const intents = { templates: false, elements: false, anti_patterns: false };
+  for (const item of args.curationItems) {
+    if (item.classification === "skip") continue;
+    if (item.source === "aspirational_brand_og") {
+      const ref = args.aspirationalRefs.find((r) => r.name === item.aspirational_brand_name);
+      if (!ref || !ref.fetched_ok || !ref.og_image_url) continue;
+    }
+    if (item.classification === "template") intents.templates = true;
+    else if (item.classification === "anti_pattern") intents.anti_patterns = true;
+    else intents.elements = true;
+  }
+  return intents;
+}
+
 function buildProposedActionsForDraft(args: BuildActionsArgs): ProposedAction[] {
   const out: ProposedAction[] = [];
 
-  // 1. Three folders at order=10.
-  out.push({
-    kind: "create_folder",
-    order: 10,
-    human_description: "Crear folder __brand_templates (composiciones aprobadas).",
-    payload: { name: "__brand_templates", intent: "templates" },
-  });
-  out.push({
-    kind: "create_folder",
-    order: 10,
-    human_description: "Crear folder __brand_elements (logos, iconos, patrones).",
-    payload: { name: "__brand_elements", intent: "elements" },
-  });
-  out.push({
-    kind: "create_folder",
-    order: 10,
-    human_description: "Crear folder __brand_anti_patterns (lo que NO querés ver).",
-    payload: { name: "__brand_anti_patterns", intent: "anti_patterns" },
-  });
+  // 1. Folders at order=10. ONLY create the folders that will receive at
+  //    least one curated asset (counting both curation.items the user
+  //    approved and aspirational og:images that successfully fetched and
+  //    will be tagged as elements). Empty folders are the worst possible
+  //    artifact: the user sees __brand_templates / __brand_elements /
+  //    __brand_anti_patterns sitting empty in Followr after setup and
+  //    legitimately thinks the tool failed. Better to omit the folder
+  //    entirely; a later refresh (propose_brand_template_refresh,
+  //    manufacture_brand_templates) recreates it on demand when actual
+  //    content lands.
+  const intentNeeded = computeIntentsWithContent(args);
+  if (intentNeeded.templates) {
+    out.push({
+      kind: "create_folder",
+      order: 10,
+      human_description: "Crear folder __brand_templates (composiciones aprobadas).",
+      payload: { name: "__brand_templates", intent: "templates" },
+    });
+  }
+  if (intentNeeded.elements) {
+    out.push({
+      kind: "create_folder",
+      order: 10,
+      human_description: "Crear folder __brand_elements (logos, iconos, patrones).",
+      payload: { name: "__brand_elements", intent: "elements" },
+    });
+  }
+  if (intentNeeded.anti_patterns) {
+    out.push({
+      kind: "create_folder",
+      order: 10,
+      human_description: "Crear folder __brand_anti_patterns (lo que NO querés ver).",
+      payload: { name: "__brand_anti_patterns", intent: "anti_patterns" },
+    });
+  }
 
   // 2. One upload per curated item (order=20 for url/svg, order=30 for aspirational og).
   let index = 0;
@@ -2361,6 +2515,14 @@ function buildProposedActionsForDraft(args: BuildActionsArgs): ProposedAction[] 
         order: 30,
         human_description: `Descargar og:image de ${ref.name} (${ref.source_url}) y subir a __brand_${intent}.`,
         payload: { og_image_url: ref.og_image_url, target_intent: intent, filename, tags },
+      });
+    } else if (item.source === "user_upload" && item.image_data) {
+      const filename = item.filename_hint ?? `user-upload-${index}.png`;
+      out.push({
+        kind: "upload_data_to_folder",
+        order: 20,
+        human_description: `Subir imagen adjunta del usuario (${filename}) a __brand_${intent}.`,
+        payload: { image_data: item.image_data, target_intent: intent, filename, tags },
       });
     } else {
       const filename = item.filename_hint ?? `brand-${item.source}-${index}.png`;
@@ -2426,6 +2588,35 @@ function renderDraftPreviewMarkdown(args: {
     }
   }
   lines.push("");
+  lines.push("**Qué va a quedar en cada folder de Followr:**");
+  const uploadActions = args.draft.proposed_actions.filter((a) =>
+    ["upload_url_to_folder", "upload_data_to_folder", "upload_svg_to_folder", "fetch_og_image_then_upload"].includes(
+      a.kind,
+    ),
+  );
+  const folderCounts = { templates: 0, elements: 0, anti_patterns: 0 };
+  for (const a of uploadActions) {
+    const intent = String(a.payload["target_intent"]) as keyof typeof folderCounts;
+    if (intent in folderCounts) folderCounts[intent] += 1;
+  }
+  const folderLabel = (n: number) => (n === 0 ? "0 items (no se va a crear)" : `${n} item${n === 1 ? "" : "s"}`);
+  lines.push(`- __brand_templates: ${folderLabel(folderCounts.templates)}`);
+  lines.push(`- __brand_elements: ${folderLabel(folderCounts.elements)}`);
+  lines.push(`- __brand_anti_patterns: ${folderLabel(folderCounts.anti_patterns)}`);
+  if (folderCounts.templates === 0 && folderCounts.elements === 0 && folderCounts.anti_patterns === 0) {
+    lines.push("");
+    lines.push(
+      "⚠️ Ninguna folder va a recibir contenido en este draft. El bloque de identidad va a quedar persistido en la descripción de la marca, pero la biblioteca queda sin assets curados. Opciones para mejorar antes de ejecutar:",
+    );
+    lines.push("- Subir 1-2 imágenes propias (logo en alta, screenshot del producto, foto del equipo).");
+    lines.push(
+      "- Aprobar al menos 1-2 candidatos del scrape (logos, heros, gallery, svgs) en el paso de curación.",
+    );
+    lines.push(
+      "- Después de ejecutar el setup base, generar templates con AI (Phase 1, ~13 imágenes, costo en créditos a confirmar) para llenar __brand_templates.",
+    );
+  }
+  lines.push("");
   lines.push("**Acciones que voy a ejecutar al confirmar:**");
   for (const a of args.draft.proposed_actions) {
     lines.push(`- ${a.human_description}`);
@@ -2449,17 +2640,25 @@ const FOLLOWR_SVG_MIME = "image/svg+xml";
 
 /**
  * Upload an inline SVG (raw string content) to Followr via the 3-step flow.
- * Mirrors uploadFromUrl but skips the initial HTTP download step.
+ * Mirrors uploadFromUrl but skips the initial HTTP download step. When
+ * folderId is provided, the asset is created directly under that folder
+ * (single round trip, verified 2026-05-23). When omitted or null, the
+ * asset lands at the company root.
  */
 async function uploadSvgInline(
   client: FollowrClient,
   companyId: number,
   svgContent: string,
   filename: string,
+  folderId: number | null = null,
 ): Promise<Asset> {
   const safeFilename = filename.endsWith(".svg") ? filename : `${filename}.svg`;
   const buffer = Buffer.from(svgContent, "utf-8");
-  const asset = await client.createAsset(companyId, { name: safeFilename, type: "image" });
+  const asset = await client.createAsset(companyId, {
+    name: safeFilename,
+    type: "image",
+    ...(folderId !== null ? { folder_id: folderId } : {}),
+  });
   const upload = await client.requestAssetUpload(asset.id, "image", {
     filename: safeFilename,
     type: "image",
@@ -2469,10 +2668,107 @@ async function uploadSvgInline(
   return { ...asset, url: upload.url };
 }
 
+function resolveFolderId(
+  intent: "templates" | "elements" | "anti_patterns",
+  ctx: FolderIdContext,
+): number | null {
+  if (intent === "templates") return ctx.folderIdTemplates;
+  if (intent === "elements") return ctx.folderIdElements;
+  return ctx.folderIdAntiPatterns;
+}
+
 interface FolderIdContext {
   folderIdTemplates: number | null;
   folderIdElements: number | null;
   folderIdAntiPatterns: number | null;
+}
+
+/**
+ * Resolve a brand folder id for the given intent on a company, creating
+ * the folder lazily if it does not exist yet AND patching the identity
+ * block on Company.description so the next read sees the new folder id.
+ *
+ * This is the "lazy folder creation" path that complements the selective
+ * folder creation in execute_brand_visual_identity. The setup tool only
+ * creates the folders that have curated content at execute time;
+ * downstream tools (manufacture_brand_templates, apply_brand_template_refresh,
+ * future refresh tools) call this helper when they need a destination
+ * folder. Without it, those tools would dump generated assets at the
+ * company root forever, and the user would never see a __brand_templates
+ * folder appear in Followr's media library, even after generating dozens
+ * of templates.
+ *
+ * Returns the resolved folder id (existing or freshly created), or null
+ * if both the block read and the create call failed (caller falls back
+ * to leaving the asset unfiled, which is cosmetically wrong but does not
+ * block the user).
+ */
+async function ensureBrandFolder(
+  client: FollowrClient,
+  companyId: number,
+  intent: "templates" | "elements" | "anti_patterns",
+): Promise<number | null> {
+  const folderName =
+    intent === "templates"
+      ? "__brand_templates"
+      : intent === "elements"
+        ? "__brand_elements"
+        : "__brand_anti_patterns";
+
+  try {
+    const company = await client.getCompany(companyId);
+    const parsed = parseBrandIdentityFromDescription(company.description ?? null);
+    if (parsed.status === "ok") {
+      const existing = parsed.identity.folders?.[intent] ?? null;
+      if (existing) return existing;
+    }
+
+    // Block did not have a folder id for this intent. Try to detect an
+    // existing folder by convention first (the user might have created
+    // one manually from Followr UI between sessions).
+    const folders = await client.listFolders(companyId, { pageSize: 100 });
+    const conventional = findFolderByConventionalName(folders, BRAND_FOLDER_NAMES[intent]);
+    if (conventional) {
+      if (parsed.status === "ok") {
+        await patchIdentityFolderId(client, companyId, parsed.identity, intent, conventional.id);
+      }
+      return conventional.id;
+    }
+
+    // Truly missing. Create it.
+    const folder = await client.createFolder(companyId, { name: folderName });
+    if (parsed.status === "ok") {
+      await patchIdentityFolderId(client, companyId, parsed.identity, intent, folder.id);
+    }
+    return folder.id;
+  } catch {
+    return null;
+  }
+}
+
+async function patchIdentityFolderId(
+  client: FollowrClient,
+  companyId: number,
+  identity: BrandVisualIdentity,
+  intent: "templates" | "elements" | "anti_patterns",
+  folderId: number,
+): Promise<void> {
+  try {
+    const updated: BrandVisualIdentity = {
+      ...identity,
+      folders: { ...identity.folders, [intent]: folderId },
+    };
+    const company = await client.getCompany(companyId);
+    const newDescription = appendBrandIdentityToDescription(
+      company.description ?? null,
+      updated,
+    );
+    await client.updateCompany(companyId, { description: newDescription });
+  } catch {
+    // Best-effort. If the patch fails the folder still exists and the
+    // next ensureBrandFolder call will pick it up via the conventional
+    // name detection path.
+  }
 }
 
 async function maybeMoveAssetToFolder(
@@ -2488,15 +2784,20 @@ async function maybeMoveAssetToFolder(
         ? ctx.folderIdElements
         : ctx.folderIdAntiPatterns;
   if (!targetFolder) return;
-  // FollowrClient does not yet expose a move-asset-to-folder method
-  // (followr-mcp v0.5 backlog). Until that lands, assets live at the
-  // company root and the resolver picks them by tag_map (which lives in
-  // Company.description block), not by folder. Folders are organizational
-  // anchors for the user in the Followr UI; lack of folder placement is
-  // a cosmetic v1 limitation. Tracked in TODO_V2.md.
-  void client;
-  void assetId;
-  void targetFolder;
+  // The previous version of this helper was a no-op (left assets at the
+  // company root), so when the user inspected Followr the __brand_*
+  // folders looked empty even after a successful execute. We now PUT the
+  // folder_id explicitly via the verified endpoint (see assets.md,
+  // verified 2026-05-23). Errors are still tolerated because folder
+  // placement is cosmetic (the resolver picks assets by tag_map on
+  // Company.description, not by folder): on the rare API failure the
+  // asset still exists in the library and tagged in the brand identity
+  // block, the user can move it manually from Followr's media UI.
+  try {
+    await client.assignAssetToFolder(assetId, targetFolder);
+  } catch {
+    // best-effort; asset remains at company root.
+  }
 }
 
 function countByIntent(uploaded: Array<{ folder_intent: "templates" | "elements" | "anti_patterns" }>): {

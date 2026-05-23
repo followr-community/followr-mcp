@@ -17,6 +17,7 @@ const MAX_DRAFTS_IN_MEMORY = 64;
 export type ProposedActionKind =
   | "create_folder"
   | "upload_url_to_folder"
+  | "upload_data_to_folder"
   | "upload_svg_to_folder"
   | "fetch_og_image_then_upload"
   | "update_company_description"
