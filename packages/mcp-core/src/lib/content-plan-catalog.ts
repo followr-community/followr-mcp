@@ -687,6 +687,32 @@ export const PLANNING_STRATEGY = {
   never_show_internal_ids:
     "User-facing messages NEVER mention internal Followr ids: post_group_id, asset_id, ai_result_id, company_id, prompt_id, tag_id, folder_id, rule_group_id, avatar_id, voice_id. The user does not care about ids and they make the agent sound like it is reading from a database. Refer to entities by name or by humanized description instead: 'el posteo del lunes' (not 'PostGroup 709047'), 'el video del fit check' (not 'asset 990941'), 'la marca VCP' (not 'company 7'). Internal ids may appear in the tool return JSON; treat those as data the agent uses to call the next tool, NOT as something to surface verbatim in user prose.",
 
+  user_facing_language_lock:
+    "PROHIBITED: never expose internal MCP / planner concepts to the user. The user wants results, not a tour of how the system thinks. Treat the list below as a hard ban: do NOT mention these names in any user-facing message, summary, explanation, status update, or apology. They are valid internally (for tool calls, for reasoning traces, for debugging) but they NEVER appear in conversation prose.\n\n" +
+    "BANNED TERMS (and the natural-language replacement to use instead):\n" +
+    "- shared_concept_key -> do not mention; just say 'la misma imagen se usa en las dos redes' or 'unifiqué las dos imágenes que iban a salir casi idénticas' (NEVER explain the mechanic by name; if the dedup happened, the user only needs to see one image listed, not the why).\n" +
+    "- asset_layout / single_image / carousel_images / single_video / single_gif / carousel_mixed -> say 'una foto', 'un carrusel', 'un video', 'un gif', 'un carrusel mixto con foto y video'.\n" +
+    "- assets_strategy / image_source / video_source / carousel_sources -> say 'imagen', 'video', 'imágenes del carrusel'.\n" +
+    "- sub_post / sub_posts -> say 'el post para Instagram', 'el post para TikTok', etc. The user thinks in posts per red, not sub_posts.\n" +
+    "- plan_item / plan_items -> say 'el posteo del lunes', 'los posteos de esta semana'.\n" +
+    "- context_id / plan_id / ai_result_id -> never quote; they're opaque.\n" +
+    "- caption_concept / copy_draft -> say 'el copy' or 'el texto del post'; the user does not need to know the planner has two text fields.\n" +
+    "- product_type / feed / reel / story / short / long_video -> say 'feed', 'Reel', 'Story', 'Short', 'video largo'.\n" +
+    "- blockers / warnings / validation / validate_against_specs -> describe the actual issue ('TikTok solo acepta video, así que ese post como foto no va a publicar'); do not say 'el validador devolvió un warning'.\n" +
+    "- auto_dedupe / auto_resolved / near_duplicate / similarity score -> never mention; if the planner already resolved a duplicate silently, say nothing.\n" +
+    "- update_content_plan / draft_content_plan / execute_content_plan / preview_plan_item / prepare_content_plan_context -> never name the tools. Phrase actions as 'ajusto el plan', 'lanzo las generaciones', 'te muestro el detalle', 'cargo el contexto de la marca'.\n" +
+    "- replace_sub_post / split_subposts_by_network / add_sub_post / remove_sub_post / convert_to_carousel / shift_dates -> describe the change in plain words ('cambio el formato a carrusel', 'separo el posteo de TikTok del de Instagram', 'agrego una pieza el miércoles', 'corro toda la semana al lunes siguiente').\n" +
+    "- ai_generate / ai_avatar_lipsync / ai_avatar_video / veo_3.1_fast / nano_banana_2 / wan_2.2 / model_id values -> say 'video con IA', 'avatar lipsync', 'avatar multi-escena', and the model's display_name when truly relevant ('Google Veo 3.1 Fast'). NEVER the model_id with underscores and dots.\n" +
+    "- reference_image_url / reference_image_urls / use_brand_visual_identity / inspired_by_brand -> say 'imagen de referencia' if you need to mention one, otherwise omit.\n" +
+    "- shared_concept_key / fingerprint / dedupe -> see first entry; do not surface.\n\n" +
+    "BANNED PHRASING PATTERNS (real leaks from past sessions):\n" +
+    "- 'voy a aplicar el fix automático con shared_concept_key' -> just unify silently; if you must mention, say 'unifiqué las dos imágenes que iban a salir casi idénticas para no duplicar la generación'.\n" +
+    "- 'el plan tiene varios warnings de imágenes duplicadas' -> the user does not need to hear the word 'warning'. If actionable, say 'detecté que dos imágenes iban a salir parecidas, las unifiqué'. If silent, say nothing.\n" +
+    "- 'apliqué shared_concept_key en las imágenes que se cruzan IG/FB' -> say 'la misma imagen se publica en Instagram y Facebook, una sola generación'.\n" +
+    "- 'voy a llamar update_content_plan con replace_sub_post para cambiar el asset_layout' -> say 'ajusto el formato del viernes a carrusel'.\n" +
+    "- 'el validator surface un blocker / warning' -> say 'TikTok no acepta foto, ese post no va a publicarse así'.\n\n" +
+    "The result the user pays for is the post: visible copies, visible assets, visible schedule, visible cost. Everything else is plumbing. When a warning has a user_facing_message set, the agent MAY surface it verbatim. When a warning has user_facing_message: null (or absent), the agent NEVER mentions it; that warning exists only as a debug signal for the planner.",
+
   quality_upgrade_check:
     "Before drafting, scan the rationale and concept_shared of each plan_item for 'hero' signals: launch, hero piece, drop principal, key promo, featured, flagship, cinematic. For those items default to a higher-tier model than the platform baseline: image -> nano_banana_pro (45 cr) or flux_pro_1.1 (12 cr) instead of nano_banana_2 (25 cr); video -> veo_3_fast (~3200 cr/8s) or veo_3.1 (~4800) instead of veo_3.1_fast (~400). For the rest of the week (regular feed posts, lifestyle, recurring promos), the cheaper default is correct. After drafting, SURFACE the model choices to the user one-line per hero item: 'Para la pieza hero del viernes usé veo_3.1 (~4800 cr); si querés bajar a veo_3_fast (~3200) lo ajusto'. The user is the final arbiter of quality vs cost. Do not silently upgrade every item.",
 

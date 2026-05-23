@@ -1452,12 +1452,13 @@ AFTER THIS RETURNS: show the summary table to the user verbatim, list any warnin
           budget_remaining_after_execution:
             v.budget_remaining !== null ? v.budget_remaining - v.totals.total_ai_cost : null,
         },
-        warnings: v.warnings,
+        warnings: filterUserFacingWarnings(v.warnings),
+        _internal_warning_signals: extractInternalOnlyWarnings(v.warnings),
         blockers: v.blockers,
         next_step_instructions:
           v.blockers.length > 0
             ? "There are blockers (listed above). Surface them to the user with the resolution_options for each, then call update_content_plan(plan_id, changes) with the chosen fixes. Do NOT call execute_content_plan until status is ready_for_execution."
-            : "Show summary_for_user to the user (translate display_name fields, never expose ids). List any warnings. Ask for explicit approval ('lo ejecuto?' / 'cambio algo?'). When the user confirms, call execute_content_plan(plan_id, confirm: true). If the user wants to change a specific item, call update_content_plan(plan_id, changes) instead.",
+            : "Show summary_for_user to the user (translate display_name fields, never expose ids). Surface ONLY warnings array (each has a user_facing_message safe to surface verbatim). Do NOT mention _internal_warning_signals; those are debug-only and you must obey USER-FACING LANGUAGE LOCK when speaking to the user. Ask for explicit approval ('lo ejecuto?' / 'cambio algo?'). When the user confirms, call execute_content_plan(plan_id, confirm: true). If the user wants to change a specific item, call update_content_plan(plan_id, changes) internally without naming the tool to the user.",
       };
 
       return { content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }] };
@@ -1682,12 +1683,13 @@ AFTER THIS: same flow as draft. Show the updated table, await explicit approval,
           budget_remaining_after_execution:
             v.budget_remaining !== null ? v.budget_remaining - v.totals.total_ai_cost : null,
         },
-        warnings: v.warnings,
+        warnings: filterUserFacingWarnings(v.warnings),
+        _internal_warning_signals: extractInternalOnlyWarnings(v.warnings),
         blockers: v.blockers,
         next_step_instructions:
           v.blockers.length > 0
-            ? "Plan still has blockers. Surface to the user, then call update_content_plan again."
-            : "Plan is valid. Surface the updated table and ask the user for explicit approval before calling execute_content_plan.",
+            ? "Plan still has blockers. Surface to the user, then iterate. Obey USER-FACING LANGUAGE LOCK: do not name tools or internal fields when explaining changes."
+            : "Plan is valid. Surface the updated table and ask the user for explicit approval before executing. Surface ONLY warnings array (already filtered to user-safe); never mention _internal_warning_signals to the user.",
       };
       return { content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }] };
     },
@@ -4139,8 +4141,8 @@ function buildAssetReuseMatrix(item: PlanItem, networks: NetworkPreview[]): Asse
   const reusedAssets = Array.from(fpToToken.values()).filter((t) => t.startsWith("shared-")).length;
   const summary =
     networks.length <= 1
-      ? `Una sola red, ${uniqueAssets.size} asset${uniqueAssets.size === 1 ? "" : "s"} en total.`
-      : `${uniqueAssets.size} asset${uniqueAssets.size === 1 ? "" : "s"} únicos en ${networks.length} redes. ${reusedAssets} asset${reusedAssets === 1 ? "" : "s"} compartidos cubren ${sharedCells} de ${totalCells} celdas. Si dos celdas tienen tokens distintos pero conceptos casi idénticos, considerá unificarlas con shared_concept_key para evitar duplicar la generación.`;
+      ? `Una sola red, ${uniqueAssets.size} pieza${uniqueAssets.size === 1 ? "" : "s"} en total.`
+      : `${uniqueAssets.size} pieza${uniqueAssets.size === 1 ? "" : "s"} única${uniqueAssets.size === 1 ? "" : "s"} para ${networks.length} redes. ${reusedAssets} se reusa${reusedAssets === 1 ? "" : "n"} entre redes (una sola generación, varios destinos), cubriendo ${sharedCells} de ${totalCells} apariciones.`;
   void item; // referenced for future per-item label hints
   return { networks: networkNames, rows, human_summary: summary };
 }
@@ -4319,6 +4321,45 @@ interface ValidationResult {
   budget_remaining: number | null;
 }
 
+/**
+ * Split the validation warnings into two arrays based on the
+ * user_facing_message field set when the warning was emitted:
+ *
+ * - A warning with a NON-null user_facing_message is safe to surface to the
+ *   user. The message is written in natural language, obeys the
+ *   USER-FACING LANGUAGE LOCK (no internal MCP terms, no tool names, no
+ *   field names), and the agent MAY parrot it verbatim.
+ *
+ * - A warning with user_facing_message: null (or missing) is internal only.
+ *   The planner emits it as a signal for the agent to silently react to
+ *   (e.g. apply a dedup hint on a subsequent update_content_plan call),
+ *   but the agent NEVER mentions it in conversation. These end up in
+ *   _internal_warning_signals on the response, gated by the catalog rule
+ *   user_facing_language_lock.
+ *
+ * This split fixes the leak pattern from the 2026-05-23 PostApprove share
+ * where the agent parroted "voy a aplicar el fix automático con
+ * shared_concept_key" because the warning's detail field was the only
+ * available text and it mentioned internal terms verbatim.
+ */
+function filterUserFacingWarnings(
+  warnings: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+  return warnings.filter((w) => {
+    const msg = w["user_facing_message"];
+    return typeof msg === "string" && msg.length > 0;
+  });
+}
+
+function extractInternalOnlyWarnings(
+  warnings: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+  return warnings.filter((w) => {
+    const msg = w["user_facing_message"];
+    return msg === null || msg === undefined;
+  });
+}
+
 async function runValidation(args: {
   plan_items: PlanItem[];
   time_window: { start: string; end: string };
@@ -4356,7 +4397,7 @@ async function runValidation(args: {
       warnings.push({
         issue: "date_out_of_window",
         item: item.slug,
-        detail: `Item date ${item.date} is outside the requested window ${time_window.start}..${time_window.end}.`,
+        user_facing_message: `El posteo está agendado para el ${item.date}, fuera de la ventana ${time_window.start} a ${time_window.end} que pediste. Verificá si querías esa fecha o muevo el posteo.`,
       });
     }
 
@@ -4373,7 +4414,7 @@ async function runValidation(args: {
           item: item.slug,
           sub_post_index: i,
           network: sp.social_network,
-          detail: `${sp.social_network} is not connected to this company. Ask the user to connect it in Followr settings or remove it from the plan.`,
+          user_facing_message: `${displayNetworkName(sp.social_network)} no está conectada a esta marca. Hasta que la conectes en Followr, el posteo va a quedar como draft y no se publica solo.`,
         });
       }
 
@@ -4429,13 +4470,27 @@ async function runValidation(args: {
           item.rationale + " " + sp.caption_concept,
         )
       ) {
-        warnings.push({
-          issue: "rationale_suggests_carousel_but_layout_is_single",
-          item: item.slug,
-          sub_post_index: i,
-          detail:
-            "El rationale o caption sugieren múltiples items pero el asset_layout es single_image. Considerá cambiar a carousel_images.",
-        });
+        // Suppress the warning when the image prompt itself describes a
+        // composition that legitimately conveys multiple items in ONE frame
+        // (split-screen, diptych, side-by-side, "mitad ... mitad ..."). The
+        // share session at PostApprove had Claude ignoring this warning by
+        // hand because the before/after lived inside a split-screen image.
+        // Catch those cases here so the warning only fires for genuinely
+        // mismatched layouts.
+        const imgSrc = sp.assets_strategy.image_source;
+        const promptForSplit =
+          imgSrc && imgSrc.type === "ai_generate" ? imgSrc.prompt : "";
+        const splitInFramePattern =
+          /(split[- ]?screen|side[- ]?by[- ]?side|diptych|two halves|two\s+halves|mitad\s+.+\s+mitad|split\s+composition|half\s*\/\s*half|left half.*right half|izquierda.*derecha)/i;
+        if (!splitInFramePattern.test(promptForSplit)) {
+          warnings.push({
+            issue: "rationale_suggests_carousel_but_layout_is_single",
+            item: item.slug,
+            sub_post_index: i,
+            user_facing_message:
+              "El concepto del post sugiere varios items o un antes/después, pero está planeado como una sola foto. Si la idea es mostrar más de una cosa, conviene un carrusel.",
+          });
+        }
       }
 
       // Detect AI video sources whose prompt or sub_post concept implies
@@ -4455,23 +4510,26 @@ async function runValidation(args: {
             item: item.slug,
             sub_post_index: i,
             network: sp.social_network,
-            detail:
-              "El video AI promete mostrar varios productos/colores/variantes en un solo clip, pero generate_ai_video_clip acepta UNA sola reference_image_url. Si el video se ejecuta así, el modelo inventa los items que no tiene como referencia (alucinación). Reemplazá por carousel_images (una imagen por color/producto) o por avatar_video multi-escena donde cada escena lleva su referencia.",
+            user_facing_message:
+              "El video con IA promete mostrar varios productos o variantes en un solo clip, pero la IA solo puede usar una imagen de referencia. Si lo ejecutamos así, el modelo se inventa los productos que no ve y el video sale distinto al catálogo. Conviene cambiarlo a un carrusel con una imagen por producto, o a un avatar con una escena por variante.",
             resolution_options: [
               {
                 id: "convert_to_carousel",
-                description:
-                  "Llamar update_content_plan con replace_sub_post: cambiar product_type=feed + asset_layout=carousel_images + carousel_sources con una imagen por color/variante (más fiel al catálogo y más barato). No aplica a TikTok/Reels que sólo aceptan video.",
+                description: "Switch this sub_post to product_type=feed + asset_layout=carousel_images with one ai_generate image per variant. Does NOT apply on TikTok/Reels which only accept video.",
+                user_facing_description:
+                  "Cambio el formato a un carrusel con una imagen por producto. No funciona en TikTok ni Reels (que solo aceptan video).",
               },
               {
                 id: "switch_to_avatar_video",
-                description:
-                  "Usar generate_avatar_video con una escena por variante; cada escena puede llevar su propia reference_image_url vía scene_reference_images. Mantiene formato video pero sin alucinar productos.",
+                description: "Switch video_source to ai_avatar_video with one scene per variant; each scene carries its own reference_image_url via scene_reference_images.",
+                user_facing_description:
+                  "Cambio el video a un avatar con una escena por variante. Cada escena puede mostrar fielmente su producto.",
               },
               {
                 id: "narrow_video_concept",
-                description:
-                  "Re-escribir el prompt del video para mostrar UNA sola prenda/color/producto (close-up, try-on, transición sobre la misma) con reference_image_url específica. Restringir el caption_concept para que no prometa lo que el video no muestra.",
+                description: "Rewrite the video prompt to show ONE single product / variant with a specific reference_image_url, and tighten caption_concept so it does not promise what the video does not show.",
+                user_facing_description:
+                  "Reduzco el video a mostrar un solo producto en cámara (close-up o transición sobre el mismo) y ajusto el copy para que no prometa más de lo que se ve.",
               },
             ],
           });
@@ -4546,21 +4604,16 @@ async function runValidation(args: {
           network_a: A.network,
           network_b: B.network,
           similarity: sim,
-          detail: `Dos AssetSourceAiImage en este plan_item tienen prompts ${percent}% idénticos (${displayNetworkName(A.network)} slot #${A.slot_within_sub_post + 1} vs ${displayNetworkName(B.network)} slot #${B.slot_within_sub_post + 1}). El modelo va a renderear outputs casi indistinguibles y vas a quemar una generación por cada uno sin diferenciación real. Si el concepto es el mismo, unificá con shared_concept_key en ambas refs (ej "cover", "step-01") para colapsar a una sola generación. Si la diferenciación es por formato, usá aspect_ratio (estructural) en lugar de adjetivos en el prompt (decorativo).`,
-          resolution_options: [
-            {
-              id: "merge_with_shared_concept_key",
-              description: `Llamar update_content_plan para setear shared_concept_key en ambas AssetSourceAiImage refs (ej "cover", "step-01"). El resolver garantiza UNA generación y reusa el asset entre redes.`,
-            },
-            {
-              id: "differentiate_by_aspect_ratio",
-              description: `Si la diferenciación es por formato (LinkedIn 16:9 vs IG 1:1), setear aspect_ratio explícito en cada AssetSourceAiImage y dejar el prompt limpio (sin frases como "generous negative space" que no cambian el output del modelo).`,
-            },
-            {
-              id: "acknowledge_and_proceed",
-              description: `Confirmar explícitamente con el usuario que querés dos generaciones distintas pese a la similitud. Útil cuando hay un motivo creativo real (ej. cover con copy distinto por idioma).`,
-            },
-          ],
+          // SILENT TO USER. The agent uses this internally to decide whether
+          // to apply a dedup hint when calling update_content_plan, but
+          // never mentions it in conversation. The leak from the
+          // 2026-05-23 PostApprove share ("voy a aplicar el fix automático
+          // con shared_concept_key") came from this warning's prose detail
+          // being parroted by the agent. user_facing_message: null tells
+          // the agent that this signal is for planning only, not for
+          // user-visible explanation.
+          user_facing_message: null,
+          internal_only_detail: `Dos imágenes AI en este plan_item tienen prompts ${percent}% idénticos (${displayNetworkName(A.network)} slot #${A.slot_within_sub_post + 1} vs ${displayNetworkName(B.network)} slot #${B.slot_within_sub_post + 1}). Internal: agent should unify them silently (dedup hint on both refs) without surfacing the mechanic to the user.`,
         });
       }
     }
@@ -4619,8 +4672,8 @@ async function runValidation(args: {
           issue: "youtube_long_video_proposed",
           item: item.slug,
           sub_post_index: i,
-          detail:
-            "El plan incluye un sub_post YouTube long_video. Por política, long_video no se propone por defecto. Confirmá con el usuario que pidió contenido long-form para YouTube esta semana antes de avanzar (ver PLANNING_STRATEGY.youtube_feed_policy).",
+          user_facing_message:
+            "El plan incluye un video largo de YouTube. Por defecto no proponemos ese formato porque suele requerir contenido pre-grabado. Confirmame que pediste contenido long-form para esta semana antes de avanzar.",
         });
       }
     }
@@ -4664,23 +4717,28 @@ async function runValidation(args: {
           posts_count: itemsWithNetwork.length,
           reel_count: 0,
           reel_friendly_candidates: candidateSlugs,
-          detail: `El plan tiene ${itemsWithNetwork.length} posts para ${network} y cero reels. Reels llevan la mayor parte del alcance orgánico en ${network} desde 2024. Un calendario balanceado típicamente incluye 1-2 reels por semana (ver format_mix_per_network).`,
-          suggestion:
+          user_facing_message: `El plan tiene ${itemsWithNetwork.length} posts para ${displayNetworkName(network)} y ningún Reel. Los Reels llevan la mayor parte del alcance orgánico ahí desde 2024; conviene tener al menos uno por semana.`,
+          internal_only_suggestion:
             candidateSlugs.length > 0
-              ? `Los conceptos más reel-friendly del plan son: ${candidateSlugs.join(", ")}. Sugerí al usuario convertir uno (o el que tenga más movimiento) a reel. Si TikTok ya tiene video, el mismo asset 9:16 se cross-postea como Reel sin costo extra de generación.`
-              : "Ningún concept del plan tiene keywords obvias de reel (try-on, transition, BTS, etc.). Proponé al usuario agregar UN concept reel-friendly para la semana (ver reel_concept_seeds en format_mix_per_network) o reformular uno existente con foco en movimiento.",
+              ? `Convert one of these reel-friendly items to a reel: ${candidateSlugs.join(", ")}. If TikTok is already in the plan_item, reuse its 9:16 asset (cross-post, no extra generation).`
+              : "No reel-friendly concepts detected. Either reframe an existing item with movement or add a new reel-friendly concept (try-on, transition, BTS, before/after, time-lapse).",
           resolution_options: [
             {
               id: "convert_to_reel",
-              description: `Llamar update_content_plan con replace_sub_post: cambiar uno de los sub_posts ${network} a product_type='reel' + asset_layout='single_video' + assets_strategy.video_source. Si TikTok ya está en el plan_item, reusá el mismo asset (cross-post sin costo).`,
+              description: `Swap one of the ${network} sub_posts to product_type=reel + asset_layout=single_video + video_source. If TikTok is in the same plan_item, reuse its 9:16 asset (cross-post, free).`,
+              user_facing_description: `Cambio uno de los posts de ${displayNetworkName(network)} a Reel. Si TikTok ya está en ese día, reuso el mismo video (no se duplica el costo).`,
             },
             {
               id: "add_new_reel_item",
-              description: "Llamar update_content_plan con add_item: agregar un nuevo plan_item con sub_post de tipo reel basado en uno de los reel_concept_seeds (try-on, transition, BTS, before/after, time-lapse).",
+              description: "Add a fresh plan_item with a reel sub_post seeded from a reel-friendly concept (try-on, transition, BTS, before/after, time-lapse).",
+              user_facing_description:
+                "Agrego un Reel nuevo a la semana, con un concepto pensado para video (transición, antes/después, behind-the-scenes, etc.).",
             },
             {
               id: "keep_as_is",
-              description: "Descartar el warning si el usuario explícitamente quiere semana sólo de statics o si la marca tiene argumento (audiencia muy mayor en FB, política interna, etc.).",
+              description: "Dismiss this warning when the user explicitly wants a static-only week.",
+              user_facing_description:
+                "Dejo la semana sin Reels, si esa es la decisión.",
             },
           ],
         });
@@ -4776,8 +4834,8 @@ async function runValidation(args: {
     if (!hasVoicePromptLive) {
       warnings.push({
         issue: "brand_voice_missing",
-        detail:
-          "use_brand_voice is true but this company has no brand voice prompt loaded. Copies will fall back to Followr default voice. Offer the user to create one with create_prompt BEFORE executing.",
+        user_facing_message:
+          "Esta marca no tiene voz de marca configurada todavía. Los copies van a salir con el tono default, más genérico. Si querés, antes de ejecutar te la armo en una llamada.",
       });
     }
   }
