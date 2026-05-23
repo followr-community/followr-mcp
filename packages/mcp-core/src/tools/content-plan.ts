@@ -747,6 +747,304 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
         cached_industry_id: cachedIndustry ? cachedIndustry.industry_id : null,
       });
 
+      // 6b. Build clarifying_questions_v2: structured questions ready to be
+      // mapped 1:1 to a host AskUserQuestion call. Two phases:
+      //   - phase_1_foundational: brand voice / brand visual identity / avatar
+      //     setup. These BLOCK the plan. They are asked alone in a single
+      //     AskUserQuestion turn (never mixed with phase_2). Without these,
+      //     downstream copies and visuals come out generic, which is the
+      //     failure mode the user is paying us to avoid.
+      //   - phase_2_plan_scope: window, frequency, theme, promo. Standard plan
+      //     intent questions; asked after phase_1 is resolved (or skipped when
+      //     empty).
+      // pre_resolved_decisions: defaults that the agent must NOT ask. e.g.
+      // language matches the brand language; networks_intent defaults to all
+      // connected networks.
+      const hasMandatoryPhase1 = !hasBrandVoice || !hasBvi || needsAvatarProposal;
+
+      const phase1Questions: Array<Record<string, unknown>> = [];
+
+      if (!hasBrandVoice) {
+        phase1Questions.push({
+          id: "brand_voice_setup",
+          phase: "foundational",
+          blocks_plan_until_resolved: true,
+          rationale_for_agent:
+            "Company has no brand voice prompt loaded. Without it, every generated copy uses the platform default tone and the user notices immediately. Ask this BEFORE phase_2 scope questions; never bury it as a side-note.",
+          ask_user_question_payload: {
+            question:
+              "Esta empresa todavía no tiene voz de marca cargada. Sin ella los copies salen con el tono default de Followr, más genéricos. ¿La armamos antes del plan?",
+            header: "Voz de marca",
+            options: [
+              {
+                label: "Sí, armarla ahora",
+                description:
+                  "Una sola llamada, deriva del brief de la empresa. Se aplica al plan automáticamente.",
+              },
+              {
+                label: "Avanzar sin voz",
+                description:
+                  "Los copies van a usar el tono default, más genérico. Se puede agregar después.",
+              },
+            ],
+          },
+          option_actions: [
+            {
+              option_index: 0,
+              next_action: "call_setup_tool",
+              setup_tool: "create_brand_voice_for_company",
+              setup_args_template: {
+                company_id,
+                name: `${companyResolved.name} brand voice`,
+                default: true,
+                prompt_preamble_from: "brand_voice_setup_proposal.suggested_create_prompt_seed.prompt_preamble",
+              },
+            },
+            { option_index: 1, next_action: "proceed_to_next_phase_or_draft" },
+          ],
+        });
+      }
+
+      if (!hasBvi) {
+        phase1Questions.push({
+          id: "brand_visual_identity_setup",
+          phase: "foundational",
+          blocks_plan_until_resolved: true,
+          rationale_for_agent:
+            "Company has no BrandVisualIdentity. Without it, AI-generated images come out generic (no curated templates, no palette grounding). Cost of setup: ~300 credits and ~4 questions to the user. Ask this BEFORE phase_2 scope questions.",
+          ask_user_question_payload: {
+            question:
+              "Esta empresa no tiene identidad visual cargada. ¿La armamos antes del plan? Sin esto las imágenes generadas salen más genéricas.",
+            header: "Identidad visual",
+            options: [
+              {
+                label: "Sí, armarla ahora",
+                description:
+                  "4 preguntas + 12 templates AI auto-generados (aprox 300 créditos). Después el plan se beneficia.",
+              },
+              {
+                label: "Avanzar sin identidad",
+                description:
+                  "Imágenes más genéricas. OK para test rápido o calendario operativo.",
+              },
+            ],
+          },
+          option_actions: [
+            {
+              option_index: 0,
+              next_action: "call_setup_tool",
+              setup_tool: "assess_brand_visual_identity",
+              setup_args_template: { company_id },
+            },
+            { option_index: 1, next_action: "proceed_to_next_phase_or_draft" },
+          ],
+        });
+      }
+
+      if (needsAvatarProposal && recommendedVideoStrategy) {
+        phase1Questions.push({
+          id: "avatar_setup",
+          phase: "foundational",
+          blocks_plan_until_resolved: true,
+          rationale_for_agent: `Industry profile (${recommendedVideoStrategy.display_name}) defaults to avatar videos for B2B trust signal, and company has zero avatars loaded. Without an avatar the videos fall back to AI clips (no human face / voice), which underperforms for this kind of brand. Ask BEFORE phase_2.`,
+          ask_user_question_payload: {
+            question: `Por el tipo de marca (${recommendedVideoStrategy.display_name}), los videos rinden mejor con un avatar (persona virtual hablando a cámara) que con animaciones genéricas. No tenés ninguno cargado. ¿Creamos uno antes del plan?`,
+            header: "Avatar",
+            options: [
+              {
+                label: "Sí, crear avatar",
+                description:
+                  "Genero un avatar para esta marca. Después los videos del plan lo van a usar por default.",
+              },
+              {
+                label: "Avanzar sin avatar",
+                description:
+                  "Los videos del plan salen como AI clips puros (sin persona ni voz). OK para test rápido.",
+              },
+            ],
+          },
+          option_actions: [
+            {
+              option_index: 0,
+              next_action: "call_setup_tool",
+              setup_tool: "create_avatar_full_flow",
+              setup_args_template: { company_id },
+            },
+            { option_index: 1, next_action: "proceed_to_next_phase_or_draft" },
+          ],
+        });
+      }
+
+      const phase2Questions: Array<Record<string, unknown>> = [
+        {
+          id: "time_window",
+          phase: "scope",
+          blocks_plan_until_resolved: true,
+          rationale_for_agent:
+            "Defines the window the plan covers. Ask in a SINGLE tap question; convert option_id to concrete YYYY-MM-DD start/end when calling draft_content_plan.",
+          ask_user_question_payload: {
+            question: "¿Qué ventana de días querés para el plan?",
+            header: "Ventana",
+            options: [
+              {
+                label: "Esta semana",
+                description: "De lunes a domingo de la semana en curso.",
+              },
+              {
+                label: "Próximos 7 días",
+                description: "Desde mañana, durante 7 días corridos.",
+              },
+              {
+                label: "Próximas 2 semanas",
+                description: "Desde mañana, durante 14 días corridos.",
+              },
+            ],
+          },
+          option_actions: [
+            { option_index: 0, next_action: "use_value", value: "this_week" },
+            { option_index: 1, next_action: "use_value", value: "next_7_days" },
+            { option_index: 2, next_action: "use_value", value: "next_14_days" },
+          ],
+        },
+        {
+          id: "posts_per_day",
+          phase: "scope",
+          blocks_plan_until_resolved: true,
+          rationale_for_agent:
+            "Cadence: how many PostGroups per day. Each PostGroup can fan out to multiple networks via sub_posts.",
+          ask_user_question_payload: {
+            question: "¿Cuántos posts por día?",
+            header: "Frecuencia",
+            options: [
+              { label: "1 por día", description: "Cadencia más sostenible." },
+              { label: "2 por día", description: "Más volumen, requiere más copies y assets." },
+              { label: "3 por día", description: "Alta intensidad, recomendado solo para promo o launch." },
+            ],
+          },
+          option_actions: [
+            { option_index: 0, next_action: "use_value", value: 1 },
+            { option_index: 1, next_action: "use_value", value: 2 },
+            { option_index: 2, next_action: "use_value", value: 3 },
+          ],
+        },
+        {
+          id: "theme",
+          phase: "scope",
+          blocks_plan_until_resolved: true,
+          rationale_for_agent:
+            "Editorial axis the agent uses when picking concept_shared per plan_item.",
+          ask_user_question_payload: {
+            question: "¿Qué eje temático priorizamos?",
+            header: "Eje",
+            options: [
+              {
+                label: "Mix balanceado",
+                description: "Producto / lifestyle / cultura distribuidos en la semana.",
+              },
+              { label: "Foco producto", description: "Mayormente features / catálogo." },
+              { label: "Foco lifestyle", description: "Cultura, behind-the-scenes, comunidad." },
+              { label: "Foco promo / lanzamiento", description: "Drive a una acción comercial concreta." },
+            ],
+          },
+          option_actions: [
+            { option_index: 0, next_action: "use_value", value: "mix" },
+            { option_index: 1, next_action: "use_value", value: "product" },
+            { option_index: 2, next_action: "use_value", value: "lifestyle" },
+            { option_index: 3, next_action: "use_value", value: "promo" },
+          ],
+        },
+        {
+          id: "promo_context",
+          phase: "scope",
+          blocks_plan_until_resolved: true,
+          rationale_for_agent:
+            "Surfaces an active sale or launch the plan should ride. If yes, the agent asks a follow-up freeform for the details; if no, proceed.",
+          ask_user_question_payload: {
+            question: "¿Hay alguna promo o lanzamiento activo en esta ventana?",
+            header: "Promo",
+            options: [
+              { label: "No hay promo", description: "Plan editorial estándar." },
+              {
+                label: "Sí, hay promo activa",
+                description: "Voy a pedirte el detalle (qué es, fechas, CTA).",
+              },
+            ],
+          },
+          option_actions: [
+            { option_index: 0, next_action: "use_value", value: { active: false } },
+            {
+              option_index: 1,
+              next_action: "ask_follow_up_freeform",
+              follow_up_question:
+                "Contame en una línea qué promo o lanzamiento es, las fechas y la acción que querés que tome el usuario.",
+            },
+          ],
+        },
+      ];
+
+      const preResolvedDecisions: Record<string, unknown> = {};
+      const brandLanguage = companyResolved.language;
+      if (brandLanguage) {
+        preResolvedDecisions["language"] = {
+          value: brandLanguage,
+          confidence: "high",
+          reason_es: `La marca está cargada en ${brandLanguage}. Los copies salen en ese idioma por default, salvo que el usuario pida explícitamente otro. NO preguntar.`,
+        };
+      }
+      if (connectedNetworks.length > 0) {
+        preResolvedDecisions["networks_intent"] = {
+          value: connectedNetworks,
+          confidence: "high",
+          reason_es: `Default: usar todas las redes conectadas (${connectedNetworks.join(", ")}). Preguntar SOLO si el usuario quiere recortar; nunca preguntar como decisión obligatoria.`,
+        };
+      }
+      if (me?.timezone) {
+        preResolvedDecisions["timezone"] = {
+          value: me.timezone,
+          confidence: "high",
+          reason_es: `Zona horaria del usuario. Aplicar a publish_at_time_local. NO preguntar.`,
+        };
+      }
+
+      const tikTokOrYouTubeConnected =
+        connectedNetworks.includes("tiktok") || connectedNetworks.includes("youtube");
+
+      const clarifyingFlowInstructions = [
+        "EXECUTION ORDER (read carefully):",
+        "1. If next_step starts with 'call_deep_research_first', call deep_research(company_id) BEFORE anything else; then re-call prepare_content_plan_context to get a refreshed context.",
+        "2. If phase_1_foundational has questions, ask THOSE in a SINGLE AskUserQuestion call this turn. NEVER mix phase_1 with phase_2 in the same turn. The phase_1 questions are blockers: the user picking 'avanzar sin' is acceptable, but you cannot skip the question itself.",
+        "3. For each phase_1 question the user picks 'call_setup_tool' on, invoke option_actions[i].setup_tool with the suggested args (resolve the *_from references against the matching proposal block in this same _assistant_guidance). After every setup tool completes, re-call prepare_content_plan_context to refresh state, then continue.",
+        "4. When phase_1 is empty OR fully resolved, ask phase_2_plan_scope in ONE AskUserQuestion call. There are 4 questions; AskUserQuestion supports up to 4, so submit them together.",
+        "5. Treat pre_resolved_decisions as already decided. NEVER ask the user about these (language, networks_intent, timezone). Apply them as defaults when building plan_items[].",
+        "6. After phase_2 answers come in, IMMEDIATELY call draft_content_plan with the structured plan_items[] you build. DO NOT propose the plan to the user in prose first. The summary_for_user that draft_content_plan returns is what you show the user, not your own table.",
+        "7. ask_user_question_payload on each question is shaped to match the host's AskUserQuestion tool: copy question, header and options verbatim. Use option_actions to interpret what the user picked.",
+        "8. If multiSelect is needed (e.g. user picks two themes at once), AskUserQuestion supports it but the default here is single-select. Keep single-select unless the user signals otherwise.",
+      ].join("\n");
+
+      const videoOnlyNetworksStrategy = tikTokOrYouTubeConnected
+        ? {
+            networks: connectedNetworks.filter((n) => n === "tiktok" || n === "youtube"),
+            rule:
+              "TikTok and YouTube only accept video assets. For every plan_item where the concept is prose-heavy (explainer, security, behind-the-scenes, manifesto), do NOT silently drop these networks. Either: (a) flip the asset_layout to single_video using a talking-head avatar script (when an avatar is available) or a short text-on-motion AI clip (when no avatar), keeping the same concept; or (b) explicitly drop the network for that plan_item and surface the trade-off to the user. Default recommendation: flip when an avatar exists, drop when no avatar AND the concept is too prose-heavy for an 8s AI clip.",
+            decision_table: [
+              {
+                concept_kind: "product_showcase / launch / promo / lifestyle",
+                recommendation: "flip to single_video (AI clip with product reference); covers IG/FB/TikTok/YT with one generation",
+              },
+              {
+                concept_kind: "explainer / security / manifesto / long-form prose",
+                recommendation:
+                  "flip to single_video as avatar talking-head script when avatar available; drop TikTok/YT when no avatar and concept cannot be compressed to 8s motion",
+              },
+              {
+                concept_kind: "carousel-native (step-by-step, comparison, listicle)",
+                recommendation:
+                  "TikTok and YouTube do NOT accept carousel. Either flip the same listicle into a text-on-motion AI clip with quick cuts, OR drop those networks for that specific plan_item",
+              },
+            ],
+          }
+        : null;
+
       // 7. Build response.
       const response: Record<string, unknown> = {
         context_id: ctx.context_id,
@@ -1127,9 +1425,34 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
             "Then, based on (a) the user's target period and intent and (b) each autolist's inferred theme + temporal relevance + health, recommend actions per autolist: feed / pause / activate / delete / merge / leave_alone. ALWAYS surface autolists that are out-of-season for the target period (e.g. 'Navidad' when planning June) AND skip them from the default plan, BUT mention them so the user knows you noticed. NEVER propose alimentar an autolist whose theme doesn't fit the period.\n" +
             "Tools available for action: create_autolist (new with optional inline tag creation), update_rule_group (rename, toggle active, swap tags via REPLACE semantics on tags_ids), create_rule / delete_rule (edit slots; remember the UI deletes-and-recreates instead of PUT), delete_rule_group (destructive, cascade to rules), create_tag / find_or_create_tag / delete_tag for tag housekeeping. Backend CONSTRAINT: a tag may belong to at most ONE active rule group at a time; preflight by inspecting publishing_rule_groups overlap_with_other_autolists before activating.\n" +
             "USER-FACING FLOW: max 1 question before proposing a concrete plan. Show the autolist status snapshot, your recommended actions, and a default proposal (e.g. 'Feed Lifestile with 12 posts over 4 weeks, pause out-of-season Navidad, leave Promo alone'). Confirm verbatim before any destructive or active-toggle action.",
-          next_step: cachedIndustry
-            ? "ask_user_clarifying_question_then_draft"
-            : "call_deep_research_then_ask_clarifying_then_draft",
+          // CANONICAL clarification surface (added 2026-05-23). Replaces the
+          // pair (required_user_clarifications + user_clarification_template_es)
+          // which is kept below for backwards compatibility but should not be
+          // used by new agent versions. The block below is ready to be mapped
+          // 1:1 onto a host AskUserQuestion call. Two phases, with the
+          // foundational phase being a hard pause: brand voice, BVI and avatar
+          // setup gate the plan when the company lacks them.
+          clarifying_questions_v2: {
+            phase_1_foundational: phase1Questions,
+            phase_2_plan_scope: phase2Questions,
+            pre_resolved_decisions: preResolvedDecisions,
+            flow_instructions: clarifyingFlowInstructions,
+          },
+          // Hint about how to handle TikTok / YouTube when the plan includes
+          // them. Without this, the agent silently drops these networks for
+          // prose-heavy concepts (real failure mode seen 2026-05-23, see
+          // PostApprove plan). Surfaces when at least one of those is
+          // connected; null otherwise.
+          video_only_networks_strategy: videoOnlyNetworksStrategy,
+          next_step: !cachedIndustry
+            ? "call_deep_research_first_then_recheck"
+            : hasMandatoryPhase1
+              ? "ask_phase_1_foundational_only_this_turn"
+              : "ask_phase_2_plan_scope_then_draft_directly",
+          // DEPRECATED (2026-05-23): kept for backwards compatibility with
+          // agents that read the old fields. New agents should consume
+          // clarifying_questions_v2 above. These two will be removed in a
+          // future version.
           required_user_clarifications: [
             "time_window (start and end dates, default: the week starting next Monday)",
             "posts_per_day (default: 1)",
@@ -1357,7 +1680,9 @@ THIS TOOL DOES NOT GENERATE OR UPLOAD ANYTHING. It is pure validation + persiste
 
 MUTATION but IDEMPOTENT for the same input: re-calling with the same context_id and the same plan_items array returns a new plan_id pointing to the same content. No external side effects in Followr.
 
-AFTER THIS RETURNS: show the summary table to the user verbatim, list any warnings, and ask for explicit approval. ONLY THEN call execute_content_plan(plan_id, confirm: true). If the user wants changes, call update_content_plan(plan_id, changes) instead.`,
+DO NOT PROPOSE THE PLAN IN PROSE BEFORE CALLING THIS TOOL. After the user answers the clarifying questions (clarifying_questions_v2.phase_2_plan_scope), build plan_items[] internally and call this tool DIRECTLY. The summary_for_user it returns is what you show the user, never your own prose table or "te propongo este plan: lun X, mar Y, ...". Surfacing a prose plan before validation creates two failure modes: (1) the user approves something the validator will then reject (carousel exceeding network limit, network duplicate slot, budget exhaustion); (2) the user fatigues during an extra confirmation turn and the conversation dies before draft is called. Real failure mode observed 2026-05-23 (PostApprove session, share id 5e1b6ec4): the agent built a 7-day prose table, the user never replied, draft_content_plan was never called.
+
+AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.estimated_total_credits_cost) and remaining budget (totals.budget_remaining_after_execution) in natural language, list any warnings (warnings[].user_facing_message), and ask for explicit approval. ONLY THEN call execute_content_plan(plan_id, confirm: true). If the user wants changes, call update_content_plan(plan_id, changes) instead.`,
       inputSchema: {
         context_id: z.string().min(1),
         time_window: z.object({
@@ -1495,7 +1820,7 @@ AFTER THIS RETURNS: show the summary table to the user verbatim, list any warnin
         next_step_instructions:
           v.blockers.length > 0
             ? "There are blockers (listed above). Surface them to the user with the resolution_options for each, then call update_content_plan(plan_id, changes) with the chosen fixes. Do NOT call execute_content_plan until status is ready_for_execution."
-            : "Show summary_for_user to the user (translate display_name fields, never expose ids). Surface ONLY warnings array (each has a user_facing_message safe to surface verbatim). Do NOT mention _internal_warning_signals; those are debug-only and you must obey USER-FACING LANGUAGE LOCK when speaking to the user. Ask for explicit approval ('lo ejecuto?' / 'cambio algo?'). When the user confirms, call execute_content_plan(plan_id, confirm: true). If the user wants to change a specific item, call update_content_plan(plan_id, changes) internally without naming the tool to the user.",
+            : "Show summary_for_user to the user (translate display_name fields, never expose ids) AND tell them the cost in natural language: read totals.estimated_total_credits_cost and totals.budget_remaining_after_execution and say something like 'el plan consume aprox N créditos de imagen y video, te quedarían M después de ejecutarlo'. NEVER omit the cost just because summary_for_user does not include it; the user is paying for these credits and needs to know upfront. Surface ONLY warnings array (each has a user_facing_message safe to surface verbatim). Do NOT mention _internal_warning_signals; those are debug-only and you must obey USER-FACING LANGUAGE LOCK when speaking to the user. Ask for explicit approval ('lo ejecuto?' / 'cambio algo?'). When the user confirms, call execute_content_plan(plan_id, confirm: true). If the user wants to change a specific item, call update_content_plan(plan_id, changes) internally without naming the tool to the user. DO NOT propose your own prose version of the plan; summary_for_user is the canonical view.",
       };
 
       return { content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }] };
@@ -1733,7 +2058,7 @@ AFTER THIS: same flow as draft. Show the updated table, await explicit approval,
         next_step_instructions:
           v.blockers.length > 0
             ? "Plan still has blockers. Surface to the user, then iterate. Obey USER-FACING LANGUAGE LOCK: do not name tools or internal fields when explaining changes."
-            : "Plan is valid. Surface the updated table and ask the user for explicit approval before executing. Surface ONLY warnings array (already filtered to user-safe); never mention _internal_warning_signals to the user.",
+            : "Plan is valid. Surface summary_for_user verbatim AND mention the updated cost in natural language using totals.estimated_total_credits_cost and totals.budget_remaining_after_execution. Ask the user for explicit approval before executing. Surface ONLY warnings array (already filtered to user-safe); never mention _internal_warning_signals to the user. DO NOT replace summary_for_user with your own prose table.",
       };
       return { content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }] };
     },
