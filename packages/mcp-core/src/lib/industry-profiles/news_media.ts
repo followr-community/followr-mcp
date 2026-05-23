@@ -78,4 +78,10 @@ export const NEWS_MEDIA_PROFILE: IndustryProfile = {
     promo: 0.2,
     lifestyle: 0.2,
   },
+  video_strategy: {
+    default_video_kind: "ai_avatar_video",
+    rationale_short:
+      "Opinión, breakdowns y deep dives suenan mejor con un narrador. El avatar entra para columnas, análisis editorial y resúmenes con voz. El AI clip queda para B-roll tipo footage o infografías en movimiento.",
+    flip_concepts: ["broll_footage", "infographic_motion", "data_visualization"],
+  },
 };

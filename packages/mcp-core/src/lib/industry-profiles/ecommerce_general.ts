@@ -73,4 +73,10 @@ export const ECOMMERCE_GENERAL_PROFILE: IndustryProfile = {
     promo: 0.7,
     lifestyle: 0.5,
   },
+  video_strategy: {
+    default_video_kind: "ai_clip",
+    rationale_short:
+      "El producto en uso (unboxing, demo, primer plano de detalle, motion del item) cuenta la historia. El avatar entra para how-to, comparativas con narración o FAQ.",
+    flip_concepts: ["how_to_use", "faq", "comparison_narration", "brand_pov"],
+  },
 };

@@ -75,4 +75,10 @@ export const SERVICE_B2B_PROFILE: IndustryProfile = {
     promo: 0.1,
     lifestyle: 0.2,
   },
+  video_strategy: {
+    default_video_kind: "ai_avatar_video",
+    rationale_short:
+      "Servicios profesionales se compran a una persona, no a un brochure. El avatar transmite seniority y confianza para case studies, opiniones, walkthroughs y explainers. El AI clip puro solo cuando lo central es un dato visual o un diagrama en movimiento.",
+    flip_concepts: ["data_in_motion", "process_diagram", "before_after_metric"],
+  },
 };

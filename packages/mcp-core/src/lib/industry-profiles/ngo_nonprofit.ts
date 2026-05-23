@@ -74,4 +74,10 @@ export const NGO_NONPROFIT_PROFILE: IndustryProfile = {
     promo: 0.5,
     lifestyle: 0.5,
   },
+  video_strategy: {
+    default_video_kind: "ai_avatar_video",
+    rationale_short:
+      "Misión y causa se transmiten con voz humana. El avatar entra para historias de beneficiarios, explicar la misión o pedir donaciones. El AI clip queda para footage de impacto en movimiento o reveals de locación.",
+    flip_concepts: ["impact_footage", "location_reveal", "scene_b_roll"],
+  },
 };

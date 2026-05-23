@@ -104,6 +104,47 @@ export interface FormatBias {
 }
 
 /**
+ * The two video-generation paths the agent can default to when planning a
+ * video sub_post. Excludes upload paths (those are user-driven, not industry
+ * driven) and excludes avatar_lipsync (single-scene variant; the multi-scene
+ * generate_avatar_video is the documented default for avatar work).
+ *
+ * - ai_clip: cinematic / motion / lifestyle clip from a text prompt
+ *   (generate_ai_video_clip). No human face, no speech. Some models in the
+ *   catalog generate native audio (Veo 3 family); the rest are silent.
+ * - ai_avatar_video: multi-scene avatar reel with burned subtitles and
+ *   synthetic voice of the script (generate_avatar_video). A human-shaped
+ *   avatar speaks across one or more scenes.
+ */
+export type VideoKind = "ai_clip" | "ai_avatar_video";
+
+/**
+ * Industry default for video kind. Encodes the prose chart in
+ * instructions.ts (section "INDUSTRY GUIDANCE") as structured data so the
+ * planning code can read it without parsing prose, and so the LLM cannot
+ * silently skip the rule. Read by prepare_content_plan_context to derive
+ * a recommended_video_strategy block exposed to the agent.
+ *
+ * - default_video_kind: which kind the planner should pick when no concept
+ *   override applies.
+ * - rationale_short: human-language one-liner the agent surfaces to the
+ *   user when proposing avatar setup or explaining the choice. NO mentions
+ *   of internal MCP terms (avatar_id, asset_layout, sub_post, etc.).
+ * - flip_concepts: shortlist of plan-item concept tags that flip the
+ *   choice to the other VideoKind. For a default of ai_avatar_video,
+ *   these concepts use ai_clip instead, and vice versa. Empty array means
+ *   the default holds for every concept this industry would post about.
+ * - is_ambiguous: true only for generic_business; signals the agent must
+ *   pick per concept rather than industry, and should ask the user.
+ */
+export interface VideoStrategy {
+  default_video_kind: VideoKind;
+  rationale_short: string;
+  flip_concepts: string[];
+  is_ambiguous?: boolean;
+}
+
+/**
  * Keyword set with weighted matches. The classifier sums:
  *   3 * count(strong matches) + 1 * count(weak matches) - 2 * count(negative matches)
  * across the home page text and meta. Highest-scoring profile wins, as
@@ -137,4 +178,5 @@ export interface IndustryProfile {
   };
   content_pillars_suggested: ContentPillar[];
   format_bias: FormatBias;
+  video_strategy: VideoStrategy;
 }

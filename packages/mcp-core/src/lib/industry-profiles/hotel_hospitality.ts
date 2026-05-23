@@ -80,4 +80,10 @@ export const HOTEL_HOSPITALITY_PROFILE: IndustryProfile = {
     promo: 0.5,
     lifestyle: 0.7,
   },
+  video_strategy: {
+    default_video_kind: "ai_clip",
+    rationale_short:
+      "El lugar físico (habitación, vista, amenity) vende solo, la cámara lo muestra y alcanza. El avatar entra para narrar un tour, contar el barrio o dar una bienvenida del host.",
+    flip_concepts: ["tour_narration", "neighborhood_overview", "host_welcome"],
+  },
 };

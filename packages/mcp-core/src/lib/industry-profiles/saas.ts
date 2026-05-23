@@ -74,4 +74,10 @@ export const SAAS_PROFILE: IndustryProfile = {
     promo: 0.3,
     lifestyle: 0.2,
   },
+  video_strategy: {
+    default_video_kind: "ai_avatar_video",
+    rationale_short:
+      "B2B cierra con voz humana. El producto SaaS es abstracto y necesita un narrador para explicar value prop, workflow, use case o por qué se construyó. El AI clip puro solo entra para data-in-motion, demos de UI o feature reveals donde el movimiento es el mensaje.",
+    flip_concepts: ["data_in_motion", "ui_flow_demo", "feature_reveal_visual"],
+  },
 };

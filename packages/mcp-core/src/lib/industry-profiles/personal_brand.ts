@@ -65,4 +65,10 @@ export const PERSONAL_BRAND_PROFILE: IndustryProfile = {
     promo: 0.3,
     lifestyle: 0.6,
   },
+  video_strategy: {
+    default_video_kind: "ai_avatar_video",
+    rationale_short:
+      "La marca personal ES la cara y la voz. El avatar es el default por definición. El AI clip puro solo entra para hooks o aesthetic shots ocasionales sin narración.",
+    flip_concepts: ["hook_aesthetic", "broll_atmosphere"],
+  },
 };

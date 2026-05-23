@@ -79,4 +79,10 @@ export const RESTAURANT_PROFILE: IndustryProfile = {
     promo: 0.6,
     lifestyle: 0.7,
   },
+  video_strategy: {
+    default_video_kind: "ai_clip",
+    rationale_short:
+      "El plato en cámara (plating, ingrediente al close-up, pour shot, time-lapse de prep) es la pieza fuerte. El avatar entra cuando habla el chef o el dueño contando un plato, el menú semanal o la historia detrás de la receta.",
+    flip_concepts: ["chef_explainer", "menu_story", "recipe_story", "owner_pov"],
+  },
 };

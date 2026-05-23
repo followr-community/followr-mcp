@@ -64,4 +64,10 @@ export const EDUCATION_PROFILE: IndustryProfile = {
     promo: 0.5,
     lifestyle: 0.4,
   },
+  video_strategy: {
+    default_video_kind: "ai_avatar_video",
+    rationale_short:
+      "La educación se compra al instructor y al método. El avatar entra para presentar al docente, anticipar un programa, mostrar un fragmento de clase o narrar un éxito de alumno. El AI clip queda para tours del campus o aulas.",
+    flip_concepts: ["campus_tour", "facility_tour", "classroom_environment"],
+  },
 };

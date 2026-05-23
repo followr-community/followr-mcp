@@ -80,4 +80,10 @@ export const LOCAL_BUSINESS_PROFILE: IndustryProfile = {
     promo: 0.6,
     lifestyle: 0.5,
   },
+  video_strategy: {
+    default_video_kind: "ai_avatar_video",
+    rationale_short:
+      "El negocio local se compra a la persona detrás del mostrador. El avatar entra para que el dueño se presente, explique un servicio o narre una review. El AI clip queda para mostrar el local, el producto o un before/after.",
+    flip_concepts: ["premises_tour", "product_showcase", "before_after"],
+  },
 };

@@ -74,4 +74,10 @@ export const CREATIVE_AGENCY_PROFILE: IndustryProfile = {
     promo: 0.2,
     lifestyle: 0.4,
   },
+  video_strategy: {
+    default_video_kind: "ai_clip",
+    rationale_short:
+      "El trabajo visual de la agencia (portfolio, proceso, before/after) habla más fuerte que un narrador. El avatar entra para opinión, walkthrough de un case o cómo encaramos un proyecto.",
+    flip_concepts: ["opinion_piece", "case_study_walkthrough", "process_explainer"],
+  },
 };

@@ -65,4 +65,10 @@ export const REAL_ESTATE_PROFILE: IndustryProfile = {
     promo: 0.3,
     lifestyle: 0.5,
   },
+  video_strategy: {
+    default_video_kind: "ai_clip",
+    rationale_short:
+      "La propiedad (espacios, vista, amenity) vende sola en cámara. El avatar entra para narrar el recorrido, contar el barrio o presentar al agente.",
+    flip_concepts: ["tour_narration", "neighborhood_overview", "agent_intro"],
+  },
 };

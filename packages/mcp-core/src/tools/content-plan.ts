@@ -52,6 +52,11 @@ import {
   suggestedTagsForConcept,
 } from "../lib/brand-identity.js";
 import { resolveDriver } from "../lib/driver-resolver.js";
+import {
+  type IndustryId,
+  type VideoStrategy,
+  getProfile,
+} from "../lib/industry-profiles/index.js";
 import { normalizePreferences } from "../lib/normalize-preferences.js";
 import { getAiPreferences } from "../lib/preferences.js";
 import { localDateTimeToUtcIso, resolveTimezone } from "../lib/timezone.js";
@@ -650,9 +655,60 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
       const description = companyResolved.description ?? "";
       const cacheRe = /\[industry:([a-z_]+)@(\d{4}-\d{2}-\d{2})\]/i;
       const cacheMatch = cacheRe.exec(description);
-      const cachedIndustry = cacheMatch
-        ? { industry_id: cacheMatch[1], cached_at: cacheMatch[2] }
-        : null;
+      const cachedIndustry =
+        cacheMatch && cacheMatch[1] && cacheMatch[2]
+          ? { industry_id: cacheMatch[1], cached_at: cacheMatch[2] }
+          : null;
+
+      // Derive recommended_video_strategy from the cached industry profile.
+      // When the agent knows the industry, the profile.video_strategy block
+      // says whether avatar or AI clip is the default for THIS kind of
+      // business (source-of-truth lives in src/lib/industry-profiles/<id>.ts).
+      // When industry is unknown, we leave this null and rely on the
+      // deep_research blocker raised in draft_content_plan to force the
+      // classification before the plan is built.
+      const KNOWN_INDUSTRY_IDS = new Set<IndustryId>([
+        "ecommerce_fashion", "ecommerce_general", "saas", "restaurant",
+        "service_b2b", "education", "real_estate", "healthcare",
+        "creative_agency", "local_business", "personal_brand", "news_media",
+        "hotel_hospitality", "fitness_wellness", "events_organizer",
+        "ngo_nonprofit", "generic_business",
+      ]);
+      let recommendedVideoStrategy:
+        | {
+            industry_id: IndustryId;
+            display_name: string;
+            default_video_kind: VideoStrategy["default_video_kind"];
+            rationale_short: string;
+            flip_concepts: string[];
+            is_ambiguous: boolean;
+          }
+        | null = null;
+      if (cachedIndustry && KNOWN_INDUSTRY_IDS.has(cachedIndustry.industry_id as IndustryId)) {
+        const profile = getProfile(cachedIndustry.industry_id as IndustryId);
+        recommendedVideoStrategy = {
+          industry_id: profile.id,
+          display_name: profile.display_name,
+          default_video_kind: profile.video_strategy.default_video_kind,
+          rationale_short: profile.video_strategy.rationale_short,
+          flip_concepts: profile.video_strategy.flip_concepts,
+          is_ambiguous: profile.video_strategy.is_ambiguous === true,
+        };
+      }
+
+      // Avatar inventory snapshot. When the recommended_video_strategy says
+      // avatar is the default for this industry AND the company has zero
+      // avatars loaded, the planner cannot fulfill that recommendation. We
+      // surface an avatar_setup_proposal at the same severity level as
+      // brand_voice_setup_proposal and brand_visual_identity_setup_proposal:
+      // clarification_required_before_draft. This is the analog to those
+      // proposals (you should not start drafting until the gap is decided).
+      const availableAvatarsCount = avatars.length;
+      const needsAvatarProposal =
+        recommendedVideoStrategy !== null &&
+        recommendedVideoStrategy.default_video_kind === "ai_avatar_video" &&
+        recommendedVideoStrategy.is_ambiguous === false &&
+        availableAvatarsCount === 0;
 
       // 6. Persist the context snapshot for later validation by
       // draft_content_plan.
@@ -660,6 +716,7 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
         company_id,
         networks_connected: connectedNetworks,
         brand_has_voice_prompt: hasBrandVoice,
+        cached_industry_id: cachedIndustry ? cachedIndustry.industry_id : null,
       });
 
       // 7. Build response.
@@ -863,7 +920,9 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
           // off to the user. See Rule 8b for the decision framework.
           brand_visual_identity_setup_proposal: !hasBvi
             ? {
-                severity: "proactive_suggestion",
+                severity: "clarification_required_before_draft",
+                assistant_action_required:
+                  "Antes de armar cualquier plan o generar un solo asset, preguntar al usuario verbatim: '¿Querés que primero te configure la identidad visual de la marca? Sin esto las imágenes van a salir más genéricas.' NO empezar a draftear hasta tener respuesta del usuario.",
                 user_message:
                   "Esta empresa no tiene identidad visual cargada. Las imágenes que generemos en este plan van a ser genéricas (sin templates curados ni paleta extendida ni anti-patrones). Te propongo cargarla antes en una llamada: lleva 4 preguntas más cerca de 12 templates AI auto-generados (aproximadamente 300 créditos de imagen y video). Para test rápidos o calendarios operativos podemos seguir sin esto y mencionar el trade-off.",
                 bvi_state: parsedBvi.status,
@@ -895,7 +954,9 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
           // so the agent can offer to extend the voice.
           brand_voice_setup_proposal: !hasBrandVoice
             ? {
-                severity: "proactive_suggestion",
+                severity: "clarification_required_before_draft",
+                assistant_action_required:
+                  "Antes de armar cualquier plan o generar un solo copy, preguntar al usuario verbatim: '¿Querés que primero te configure la voz de la marca? Sin esto los copies salen con el tono default, más genérico.' NO empezar a draftear hasta tener respuesta del usuario.",
                 user_message:
                   "Esta empresa no tiene voz de marca cargada (las instrucciones de estilo de comunicación que la IA usa al generar copies). Sin esto los copies salen con el tono default de Followr, más genérico. Te propongo armar la voz de marca antes del plan, derivada de la descripción, tonos y audiencia que ya tiene cargada la empresa.",
                 suggested_create_prompt_seed: {
@@ -964,6 +1025,59 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
                 ],
               }
             : null,
+          // EARLY PROPOSAL: the industry default video kind is avatar but
+          // the company has zero avatars loaded. Without this proposal the
+          // agent silently defaults to AI clip generation, which for
+          // industries like SaaS / service_b2b / personal_brand /
+          // healthcare / education / fitness_wellness / news_media /
+          // local_business / ngo_nonprofit underperforms vs an avatar
+          // because the audience needs a human voice/face. Surfaces at the
+          // same severity as voice and BVI setup proposals: agent must ask
+          // before drafting. The recommended_video_strategy block below
+          // exposes which industry triggered this and the rationale.
+          avatar_setup_proposal: needsAvatarProposal && recommendedVideoStrategy
+            ? {
+                severity: "clarification_required_before_draft",
+                assistant_action_required:
+                  "Antes de armar el plan o generar cualquier video, preguntar al usuario verbatim algo como: 'Por el tipo de marca, los videos rinden mucho mejor con un avatar (una persona virtual hablando a cámara) que con animaciones genéricas. No tenés ninguno cargado. ¿Querés que cree uno antes del plan?' NO empezar a draftear hasta tener respuesta del usuario.",
+                user_message: `Por el tipo de marca (${recommendedVideoStrategy.display_name}), los videos rinden mejor con un avatar (persona virtual hablando a cámara) que con animaciones genéricas. ${recommendedVideoStrategy.rationale_short} No tenés ningún avatar cargado todavía. Te propongo crear uno antes del plan.`,
+                industry_id: recommendedVideoStrategy.industry_id,
+                default_video_kind: recommendedVideoStrategy.default_video_kind,
+                resolution_options: [
+                  {
+                    id: "create_avatar_first",
+                    description:
+                      "Llamar create_avatar_full_flow con uno de sus 3 modos (text-to-image, reference photo of a real person, o use_image_directly_url para una foto ya enmarcada). Después continuar con draft_content_plan; los videos van a usar avatar_video por default cuando el concepto no esté en la lista de flip_concepts del profile.",
+                  },
+                  {
+                    id: "proceed_with_ai_clip_anyway",
+                    description:
+                      "Seguir sin avatar. Los videos van a generarse como AI clips puros (animación cinematográfica, sin persona ni voz). Aceptable para tests rápidos o cuando el usuario explícitamente quiere ese estilo. Mencionar el trade-off al usuario antes de avanzar.",
+                  },
+                ],
+              }
+            : null,
+          // INFORMATIONAL: the recommendation derived from the cached
+          // industry profile. Always non-null when cached_industry is set
+          // and the id matches a known profile. The agent reads
+          // default_video_kind when planning video sub_posts, and reads
+          // flip_concepts to decide when to use the OTHER kind for a
+          // specific plan_item (e.g. SaaS defaults to avatar_video but
+          // flips to ai_clip for a feature_reveal_visual concept).
+          recommended_video_strategy: recommendedVideoStrategy
+            ? {
+                ...recommendedVideoStrategy,
+                available_avatars_count: availableAvatarsCount,
+                policy_summary:
+                  recommendedVideoStrategy.default_video_kind === "ai_avatar_video"
+                    ? `Default para esta industria: video con avatar. AI clip puro solo si el concepto del plan_item está entre [${recommendedVideoStrategy.flip_concepts.join(", ")}].`
+                    : `Default para esta industria: AI clip. Video con avatar solo si el concepto del plan_item está entre [${recommendedVideoStrategy.flip_concepts.join(", ")}].`,
+              }
+            : {
+                status: "industry_not_classified_yet",
+                policy_summary:
+                  "No hay industry cacheada en Company.description. Antes de armar un plan llamar a deep_research(company_id) para detectarla; sin la industry, el sistema no puede recomendar avatar vs AI clip por default.",
+              },
           recommended_video_model_policy:
             "available_video_models is pre-sorted: the FIRST entry is the recommended default for this company. ALWAYS pick the first entry, and ALWAYS use the model_id verbatim from the catalog. Do NOT invent model IDs from memory: Followr's canonical format uses dots for major.minor versions (veo_3.1_fast, veo_3.1, wan_2.2, seedance_1.1_light, seedance_2.0_fast, etc.) and no separator for hailuo (hailuo_02_standard, hailuo_02_premium). Underscored variants like veo_3_1_fast or hailuo_0_2_premium do NOT exist in Followr; the backend rejects them with HTTP 422 'selected model is invalid'. The sort accounts for company ai_preferences.video_model (rank 0 when set, with is_company_default: true) and for plan gating (when followr_plus_enabled is false, wan_2.2 is promoted to rank 0 with is_plan_fallback_default: true and every premium-bucket model is marked blocked_by_plan: true and affordable_at_default_duration: false). On accounts WITHOUT Followr Plus the ONLY accepted video model is wan_2.2; never recommend a premium-bucket model on those accounts. If the user explicitly asks for a premium model and followr_plus_enabled is false, explain the limitation and point them to followr.ai to activate the Followr Plus add-on.",
           recommended_image_model_policy:
@@ -1266,6 +1380,31 @@ AFTER THIS RETURNS: show the summary table to the user verbatim, list any warnin
             {
               tool: "prepare_content_plan_context",
               rationale: "Re-load context with current budget and network state.",
+            },
+          ],
+          blocking: true,
+        });
+      }
+
+      // 1b. Industry classification gate. Without a cached_industry on the
+      // Company, the planner cannot dispatch on the recommended_video_strategy
+      // (which lives per-industry in src/lib/industry-profiles/<id>.ts) and
+      // ends up defaulting to AI clip for SaaS / personal_brand / healthcare /
+      // and the other avatar-first industries even when an avatar would
+      // outperform. This blocker forces the agent to run deep_research first
+      // and cache the classification on Company.description, then retry.
+      // Plan is NOT persisted; the agent receives a soft error with a single
+      // resolution path.
+      if (!ctx.cached_industry_id) {
+        return toolError({
+          reason: "industry_classification_required",
+          user_message:
+            "Antes de armar el plan necesito clasificar la industria de la empresa: la recomendación de tipo de video (avatar vs animación) depende de eso. Voy a investigar el sitio (toma 30 segundos a 2 minutos) y después vuelvo con el plan.",
+          suggested_actions: [
+            {
+              tool: "deep_research",
+              rationale:
+                "Detect the company's industry, retrieve products / menu / properties / etc. (per profile), and persist the [industry:<id>@<date>] marker on Company.description so subsequent prepare_content_plan_context calls return cached_industry. After deep_research succeeds, re-call prepare_content_plan_context (to refresh the recommended_video_strategy + avatar_setup_proposal blocks) and then retry draft_content_plan.",
             },
           ],
           blocking: true,

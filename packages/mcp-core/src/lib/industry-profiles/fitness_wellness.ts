@@ -74,4 +74,10 @@ export const FITNESS_WELLNESS_PROFILE: IndustryProfile = {
     promo: 0.5,
     lifestyle: 0.7,
   },
+  video_strategy: {
+    default_video_kind: "ai_avatar_video",
+    rationale_short:
+      "El entrenador es el ancla. El avatar entra para intros del coach, motivación o explicar una clase. El AI clip queda para mostrar transformaciones, ejercicios filmados o el ambiente del studio.",
+    flip_concepts: ["transformation_showcase", "workout_demo", "class_environment"],
+  },
 };

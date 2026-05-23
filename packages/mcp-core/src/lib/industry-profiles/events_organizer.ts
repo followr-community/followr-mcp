@@ -80,4 +80,10 @@ export const EVENTS_ORGANIZER_PROFILE: IndustryProfile = {
     promo: 0.7,
     lifestyle: 0.5,
   },
+  video_strategy: {
+    default_video_kind: "ai_clip",
+    rationale_short:
+      "Ediciones pasadas, reveals del venue y countdowns funcionan con motion puro. El avatar entra para anunciar speakers o que el host hable directo a cámara.",
+    flip_concepts: ["speaker_reveal", "host_announcement"],
+  },
 };

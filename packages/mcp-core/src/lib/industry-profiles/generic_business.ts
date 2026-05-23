@@ -90,4 +90,11 @@ export const GENERIC_BUSINESS_PROFILE: IndustryProfile = {
     promo: 0.4,
     lifestyle: 0.4,
   },
+  video_strategy: {
+    default_video_kind: "ai_avatar_video",
+    rationale_short:
+      "Industria no clasificada. Sin señales claras, conviene preguntarle al usuario: avatar para conceptos messaging-driven (alguien explica algo), AI clip cuando el concepto es puramente visual.",
+    flip_concepts: ["visual_only_concept", "atmosphere_b_roll"],
+    is_ambiguous: true,
+  },
 };

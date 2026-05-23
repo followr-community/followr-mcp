@@ -73,4 +73,10 @@ export const HEALTHCARE_PROFILE: IndustryProfile = {
     promo: 0.2,
     lifestyle: 0.3,
   },
+  video_strategy: {
+    default_video_kind: "ai_avatar_video",
+    rationale_short:
+      "Confianza médica se transmite con voz humana. El avatar entra para presentar al especialista, explicar un servicio o dar un tip de salud. El AI clip queda para tours de la clínica o el equipamiento. Mantener tono conservador en cualquier claim.",
+    flip_concepts: ["clinic_tour", "equipment_tour", "facility_walkthrough"],
+  },
 };

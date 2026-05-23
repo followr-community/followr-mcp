@@ -81,4 +81,10 @@ export const ECOMMERCE_FASHION_PROFILE: IndustryProfile = {
     promo: 0.6,
     lifestyle: 0.8,
   },
+  video_strategy: {
+    default_video_kind: "ai_clip",
+    rationale_short:
+      "El producto en movimiento (try-on, drop, textura, variaciones de color) vende solo. El avatar entra cuando hace falta una persona explicando guías de talles, how-to-style, FAQ o POV de la marca.",
+    flip_concepts: ["size_guide", "how_to_style", "faq", "brand_pov"],
+  },
 };

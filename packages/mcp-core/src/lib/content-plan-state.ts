@@ -265,6 +265,12 @@ export interface ContextSnapshot {
   // be re-served by us; the agent keeps it in conversation context.
   networks_connected: SocialNetwork[];
   brand_has_voice_prompt: boolean;
+  // Industry id parsed from Company.description at bootstrap time. null when
+  // the company has never been classified via deep_research. draft_content_plan
+  // emits an industry_classification_required blocker when this is null so the
+  // industry-aware policies (recommended_video_strategy, format biases) have a
+  // valid value to dispatch on.
+  cached_industry_id: string | null;
 }
 
 // ── Memory store ────────────────────────────────────────────────────────────
