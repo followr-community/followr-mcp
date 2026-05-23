@@ -1411,10 +1411,19 @@ AFTER THIS RETURNS: show the summary table to the user verbatim, list any warnin
         });
       }
 
-      // 2. Run the validation pipeline (extracted helper so update_content_plan
+      // 2. Auto-resolve near-duplicate AI image prompts silently. The
+      // resolver collapses any two ai_generate refs that share a
+      // shared_concept_key to ONE generation, so the user pays for one
+      // image even when the same concept appears across multiple
+      // sub_posts. Done before validation so the (now-silent)
+      // near_duplicate warning never fires.
+      const planItemsArr = input.plan_items as PlanItem[];
+      autoApplyImageDedupHints(planItemsArr);
+
+      // 3. Run the validation pipeline (extracted helper so update_content_plan
       // can re-use it).
       const v = await runValidation({
-        plan_items: input.plan_items as PlanItem[],
+        plan_items: planItemsArr,
         time_window: input.time_window,
         ctx,
         client,
@@ -1428,7 +1437,7 @@ AFTER THIS RETURNS: show the summary table to the user verbatim, list any warnin
         company_id: ctx.company_id,
         time_window: input.time_window,
         user_answers: input.user_answers ?? {},
-        plan_items: input.plan_items as PlanItem[],
+        plan_items: planItemsArr,
         use_brand_voice: input.use_brand_voice ?? true,
         ...(input.auto_publish_schedule ? { auto_publish_schedule: input.auto_publish_schedule } : {}),
       });
@@ -1650,6 +1659,13 @@ AFTER THIS: same flow as draft. Show the updated table, await explicit approval,
           ? { auto_publish_schedule: working.auto_publish_schedule }
           : {}),
       };
+      // Auto-resolve any near-duplicate AI image prompts the user may have
+      // re-introduced via this update_content_plan call. Same silent
+      // dedupe behaviour as the draft_content_plan path: collapse pairs to
+      // a single generation via shared_concept_key without surfacing the
+      // mechanic to the user.
+      autoApplyImageDedupHints(updatedPlan.plan_items as PlanItem[]);
+
       // Persist by mutating the entry in the state map. We can do this safely
       // because createPlan / getPlan operate on the same map and we own the
       // session lifecycle.
@@ -2436,6 +2452,72 @@ function normalizedPromptSimilarity(a: string, b: string): number {
  * indistinguishable covers.
  */
 const PROMPT_DUPLICATE_SIMILARITY_THRESHOLD = 0.85;
+
+/**
+ * Pre-validation pass: detect AI-image prompt pairs that are >=85% similar
+ * within the same plan_item AND share the same aspect_ratio, and unify them
+ * by assigning the SAME shared_concept_key on both refs. The resolver then
+ * collapses them into one generation, the user gets one image (reused across
+ * networks), and the agent never has to mention the mechanic.
+ *
+ * Mutates the plan_items array in place. Returns the count of pairs unified
+ * so callers can log it internally (never surfaced to the user).
+ *
+ * This is the auto-resolution counterpart to the silent near_duplicate
+ * warning. Together they cover the 2026-05-23 PostApprove share complaint
+ * that the user should not have had to read about "shared_concept_key" at
+ * all: the planner detects the duplication, fixes it silently, and the
+ * preview just shows one shared asset across networks.
+ */
+function autoApplyImageDedupHints(plan_items: PlanItem[]): number {
+  let unifiedPairs = 0;
+  let autoKeyCounter = 0;
+  for (const item of plan_items) {
+    interface DedupRef {
+      sp_index: number;
+      slot: number;
+      src: AssetSourceAiImage;
+    }
+    const refs: DedupRef[] = [];
+    for (let i = 0; i < item.sub_posts.length; i++) {
+      const sp = item.sub_posts[i] as SubPost;
+      const collectFromImage = (src: NonNullable<AssetsStrategy["image_source"]>, slot: number) => {
+        if (src.type !== "ai_generate") return;
+        refs.push({ sp_index: i, slot, src: src as AssetSourceAiImage });
+      };
+      if (sp.assets_strategy.image_source) collectFromImage(sp.assets_strategy.image_source, 0);
+      if (sp.assets_strategy.carousel_sources) {
+        sp.assets_strategy.carousel_sources.forEach((s, idx) => collectFromImage(s, idx));
+      }
+    }
+    for (let a = 0; a < refs.length; a++) {
+      for (let b = a + 1; b < refs.length; b++) {
+        const A = refs[a]!;
+        const B = refs[b]!;
+        // Skip if one or both already declare a shared_concept_key. The
+        // explicit caller intent wins; auto-apply never overrides it.
+        if (A.src.shared_concept_key || B.src.shared_concept_key) continue;
+        // Require matching aspect_ratio. Different aspects produce different
+        // outputs even from identical prompts; unifying them would lose the
+        // intentional structural differentiation.
+        const aspA = A.src.aspect_ratio ?? null;
+        const aspB = B.src.aspect_ratio ?? null;
+        if (aspA !== aspB) continue;
+        const sim = normalizedPromptSimilarity(A.src.prompt, B.src.prompt);
+        if (sim < PROMPT_DUPLICATE_SIMILARITY_THRESHOLD) continue;
+        // Assign the same auto key to both refs. The slug-derived prefix
+        // keeps multiple unrelated unifications inside the same plan_item
+        // distinguishable in debug logs (never surfaced to the user).
+        autoKeyCounter += 1;
+        const autoKey = `auto-${item.slug}-${autoKeyCounter}`;
+        A.src.shared_concept_key = autoKey;
+        B.src.shared_concept_key = autoKey;
+        unifiedPairs += 1;
+      }
+    }
+  }
+  return unifiedPairs;
+}
 
 /**
  * Anti-placeholder hardening for AI image prompts. Models like nano_banana_2,
