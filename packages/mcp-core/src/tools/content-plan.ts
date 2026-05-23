@@ -121,6 +121,24 @@ function sanitizeCompany(company: Company) {
 // Resolve a "company hint" (name fragment or numeric id) to an actual
 // company_id. The caller passes one of these in prepare_content_plan_context
 // to anchor the rest of the work.
+//
+// Name matching is tolerant by design. The 2026-05-23 PostApprove share
+// triggered a wasted round-trip because the user typed "Post Approve" (with
+// a space) while the brand is named "PostApprove" (no space) on Followr; the
+// includes() check missed the match and the agent had to call list_companies
+// and retry. We now compare AFTER stripping case, whitespace AND accents on
+// both sides. We also prefer exact-after-normalization matches over partial
+// includes so picking up "VCP" doesn't accidentally return "VCP Reviews 2025"
+// when both exist.
+function normalizeCompanyName(s: string): string {
+  return s
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "") // strip combining accents
+    .replace(/\s+/g, "")
+    .replace(/[^a-z0-9]/g, ""); // drop punctuation so "AT&T" matches "atandt" too
+}
+
 async function resolveCompany(
   client: FollowrClient,
   hint: string | number,
@@ -131,20 +149,30 @@ async function resolveCompany(
     const company = await client.getCompany(asNum);
     return { company };
   }
-  // Name path: search.
-  const search = String(hint).toLowerCase().trim();
-  const candidates: Company[] = [];
+  const rawSearch = String(hint).trim();
+  const normalizedSearch = normalizeCompanyName(rawSearch);
+  if (!normalizedSearch) {
+    throw new Error(`Empty company hint. Call list_companies to see what's available.`);
+  }
+  // Two-bucket collection: exact (after normalization) wins over partial.
+  const exactMatches: Company[] = [];
+  const partialMatches: Company[] = [];
   // Page through companies (Followr enforces page_size=30 server-side).
   for (let page = 1; page <= 10; page++) {
     const batch = await client.listCompanies({ pageSize: 30, pageNumber: page });
     if (batch.length === 0) break;
     for (const c of batch) {
-      if ((c.name ?? "").toLowerCase().includes(search)) {
-        candidates.push(c);
+      const normalizedName = normalizeCompanyName(c.name ?? "");
+      if (!normalizedName) continue;
+      if (normalizedName === normalizedSearch) {
+        exactMatches.push(c);
+      } else if (normalizedName.includes(normalizedSearch)) {
+        partialMatches.push(c);
       }
     }
     if (batch.length < 30) break;
   }
+  const candidates = exactMatches.length > 0 ? exactMatches : partialMatches;
   if (candidates.length === 0) {
     throw new Error(`No company matches "${hint}". Call list_companies to see what's available.`);
   }
