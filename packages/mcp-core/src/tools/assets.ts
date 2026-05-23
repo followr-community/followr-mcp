@@ -5,6 +5,7 @@ import { z } from "zod";
 
 import type { RegisterOptions } from "../index.js";
 import { DESTRUCTIVE, MUTATION_OPEN_WORLD, READ_ONLY } from "../lib/annotations.js";
+import { syncBrandIdentityAfterDelete } from "../lib/brand-identity.js";
 import { toolError, ToolErrorException, toolErrorFromException } from "../lib/tool-error.js";
 
 /**
@@ -595,15 +596,43 @@ CRITICAL: Confirm with the user verbatim (by asset name and company name, not id
 
 SCOPE: removes the asset from the library and breaks references from Posts that included it via assets_ids. Drafts referencing the deleted asset will fail to publish with a missing-asset error. If the asset is referenced by ALREADY PUBLISHED posts, the public posts on social networks are unaffected (those have their own copies on the platforms).
 
-USE CASES: cleanup after a verification run, removing assets uploaded by mistake, freeing storage quota.`,
+USE CASES: cleanup after a verification run, removing assets uploaded by mistake, freeing storage quota.
+
+BRAND IDENTITY SIDE EFFECT: if you pass company_id and the asset is referenced in the company's Brand Visual Identity block (either tagged in asset_tag_map or listed in aspirational_refs_asset_ids), this tool also updates the block in-place: removes the asset_tag_map entry, decrements the relevant *_count, and prunes from aspirational_refs_asset_ids. Without company_id the brand block is left untouched; the next assess_brand_visual_identity call will reconcile lazily.`,
       inputSchema: {
         asset_id: z.number().int().positive(),
+        company_id: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe(
+            "When provided, the tool will sync the company's Brand Visual Identity block after deleting the asset (drop asset_tag_map entry, decrement counts, prune aspirational refs). Pass this when the asset might be brand-tagged; safe to pass always.",
+          ),
       },
     },
-    async ({ asset_id }) => {
+    async ({ asset_id, company_id }) => {
       try {
         await client.deleteAsset(asset_id);
-        return { content: [{ type: "text", text: `Deleted asset ${asset_id}.` }] };
+        let brandSync: Awaited<ReturnType<typeof syncBrandIdentityAfterDelete>> | null = null;
+        if (company_id !== undefined) {
+          brandSync = await syncBrandIdentityAfterDelete(client, company_id, {
+            assetId: asset_id,
+          });
+        }
+        const lines = [`Deleted asset ${asset_id}.`];
+        if (brandSync !== null) {
+          if (brandSync.detail.kind === "asset_removed") {
+            lines.push(
+              `Brand identity sync: removed asset_tag_map entry${brandSync.detail.from_count ? ` + decremented ${brandSync.detail.from_count}_count` : " (no count decrement, asset had no tags)"}; persisted=${brandSync.persisted}.`,
+            );
+          } else if (brandSync.detail.kind === "not_affected") {
+            lines.push(`Brand identity sync: asset not referenced in block, no change.`);
+          } else if (brandSync.detail.kind === "no_brand_identity") {
+            lines.push(`Brand identity sync: company has no brand identity block, skipped.`);
+          }
+        }
+        return { content: [{ type: "text", text: lines.join(" ") }] };
       } catch (err) {
         return toolErrorFromException(err);
       }

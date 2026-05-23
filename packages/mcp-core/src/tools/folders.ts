@@ -4,6 +4,7 @@ import { z } from "zod";
 
 import type { RegisterOptions } from "../index.js";
 import { DESTRUCTIVE, MUTATION, READ_ONLY } from "../lib/annotations.js";
+import { syncBrandIdentityAfterDelete } from "../lib/brand-identity.js";
 import { toolErrorFromException } from "../lib/tool-error.js";
 
 const HEX_COLOR = /^#[0-9a-fA-F]{6}$/;
@@ -144,15 +145,43 @@ BEFORE: when changing parent, consider calling get_folder on the new parent firs
 
 CRITICAL: Confirm with the user verbatim before calling. State the folder name (not id) and the fact that this is permanent.
 
-NESTED CONTENT: server-side behavior with nested folders or assets inside is not enforced from the MCP. Use list_folders with parent_id, and list_assets with folder filter (if available), to surface what would be affected. Clear contents first if the user wants nothing lost.`,
+NESTED CONTENT: server-side behavior with nested folders or assets inside is not enforced from the MCP. Use list_folders with parent_id, and list_assets with folder filter (if available), to surface what would be affected. Clear contents first if the user wants nothing lost.
+
+BRAND IDENTITY SIDE EFFECT: if you pass company_id and the folder is one of the brand identity folders (templates, elements, anti_patterns), this tool also updates the block: sets that folder slot to null and zeros the corresponding count. asset_tag_map entries for orphaned assets are cleaned up lazily on next assess_brand_visual_identity.`,
       inputSchema: {
         folder_id: z.number().int().positive(),
+        company_id: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe(
+            "When provided, the tool will sync the company's Brand Visual Identity block after deleting the folder (null the folder slot + zero count if applicable). Pass this when the folder might be a brand folder; safe to pass always.",
+          ),
       },
     },
-    async ({ folder_id }) => {
+    async ({ folder_id, company_id }) => {
       try {
         await client.deleteFolder(folder_id);
-        return { content: [{ type: "text", text: `Deleted folder ${folder_id}.` }] };
+        let brandSync: Awaited<ReturnType<typeof syncBrandIdentityAfterDelete>> | null = null;
+        if (company_id !== undefined) {
+          brandSync = await syncBrandIdentityAfterDelete(client, company_id, {
+            folderId: folder_id,
+          });
+        }
+        const lines = [`Deleted folder ${folder_id}.`];
+        if (brandSync !== null) {
+          if (brandSync.detail.kind === "folder_cleared") {
+            lines.push(
+              `Brand identity sync: nulled folders.${brandSync.detail.intent} + zeroed ${brandSync.detail.intent}_count; persisted=${brandSync.persisted}.`,
+            );
+          } else if (brandSync.detail.kind === "not_affected") {
+            lines.push(`Brand identity sync: folder not a brand folder, no change.`);
+          } else if (brandSync.detail.kind === "no_brand_identity") {
+            lines.push(`Brand identity sync: company has no brand identity block, skipped.`);
+          }
+        }
+        return { content: [{ type: "text", text: lines.join(" ") }] };
       } catch (err) {
         return toolErrorFromException(err);
       }

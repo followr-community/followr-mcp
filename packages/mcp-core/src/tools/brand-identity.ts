@@ -30,13 +30,18 @@ import type { RegisterOptions } from "../index.js";
 import { MUTATION, MUTATION_IDEMPOTENT, READ_ONLY } from "../lib/annotations.js";
 import {
   BRAND_TAGS,
+  type BrandFolderIntent,
+  type BrandIdentityDrift,
+  type BrandSetupStatus,
   type BrandTag,
   type BrandVisualIdentity,
   appendBrandIdentityToDescription,
   autoClassifyAsset,
   buildBrandVisualIdentity,
+  computeSetupStatus,
   hasBrandIdentityMarker,
   parseBrandIdentityFromDescription,
+  reconcileBrandIdentityState,
   stripBrandIdentityFromDescription,
   tagAssetInIdentity,
 } from "../lib/brand-identity.js";
@@ -268,14 +273,64 @@ USER FLOW when next_step === "all_set":
           postsR.status === "fulfilled" ? postsR.value : ([] as PostGroup[]);
         const budgets = budgetsR.status === "fulfilled" ? budgetsR.value : null;
 
-        // 4. Detect existing brand folders by conventional names.
+        // 4. Reconcile the persisted brand identity against live folder /
+        //    asset state when configured. This corrects drift from manual UI
+        //    edits, failed uploads during execute, or external folder
+        //    deletions. Persists the corrected JSON via updateCompany if
+        //    drift is detected. Skipped on skip_library_scan because that
+        //    mode is for fast cold-start probes where drift correction is
+        //    not urgent.
+        let reconciledIdentity: BrandVisualIdentity | null =
+          parsed.status === "ok" ? parsed.identity : null;
+        let drift: BrandIdentityDrift | null = null;
+        let driftPersisted = false;
+        if (parsed.status === "ok" && !skip_library_scan) {
+          try {
+            const result = await reconcileBrandIdentityState(
+              client,
+              company_id,
+              company.description ?? null,
+              parsed.identity,
+            );
+            reconciledIdentity = result.reconciled;
+            drift = result.drift;
+            driftPersisted = result.persisted;
+          } catch {
+            // Tolerant: if reconcile throws, fall back to the parsed
+            // identity so the assess still returns a useful response.
+          }
+        }
+
+        // 5. Detect existing brand folders. Prefer the folder ids stored
+        //    in the (reconciled) identity block, since those are
+        //    authoritative once setup has run. Fall back to conventional
+        //    name lookup for cold-start companies and for the legacy case
+        //    where someone renamed a folder in the UI.
+        const resolveDetectedFolder = (intent: BrandFolderIntent): Folder | null => {
+          const storedId = reconciledIdentity?.folders[intent] ?? null;
+          if (storedId !== null) {
+            const byId = folders.find((f) => f.id === storedId);
+            if (byId) return byId;
+          }
+          return findFolderByConventionalName(folders, BRAND_FOLDER_NAMES[intent]);
+        };
         const detectedFolders = {
-          templates: findFolderByConventionalName(folders, BRAND_FOLDER_NAMES.templates),
-          elements: findFolderByConventionalName(folders, BRAND_FOLDER_NAMES.elements),
-          anti_patterns: findFolderByConventionalName(folders, BRAND_FOLDER_NAMES.anti_patterns),
+          templates: resolveDetectedFolder("templates"),
+          elements: resolveDetectedFolder("elements"),
+          anti_patterns: resolveDetectedFolder("anti_patterns"),
         };
 
-        // 5. Compute next_step.
+        // 6. Derive setup status from the reconciled identity. "broken"
+        //    means setup completed but no visual assets landed (e.g.
+        //    folders created, uploads failed) and downstream tools cannot
+        //    rely on the brand block for generation grounding.
+        const setupStatus: BrandSetupStatus | null =
+          reconciledIdentity !== null ? computeSetupStatus(reconciledIdentity) : null;
+
+        // 7. Compute next_step. Broken setups route to "refresh" with an
+        //    explicit repair flag so the agent surfaces "your setup is
+        //    empty, let's redo the uploads" copy rather than the standard
+        //    refresh-by-staleness copy.
         const hasBlock = hasBrandIdentityMarker(company.description ?? null);
         const blockStatus: "configured" | "missing" | "corrupted" =
           parsed.status === "ok"
@@ -285,21 +340,69 @@ USER FLOW when next_step === "all_set":
               : "missing";
 
         let nextStep: "cold_start" | "refresh" | "all_set";
+        let repairNeeded = false;
         if (blockStatus === "missing") nextStep = "cold_start";
         else if (blockStatus === "corrupted") nextStep = "cold_start";
-        else {
-          // Configured. Decide refresh vs all_set based on staleness.
-          const daysSince = parsed.status === "ok"
-            ? daysBetween(parsed.identity.last_brand_sync_at, new Date().toISOString())
+        else if (setupStatus === "broken") {
+          nextStep = "refresh";
+          repairNeeded = true;
+        } else {
+          const daysSince = reconciledIdentity
+            ? daysBetween(reconciledIdentity.last_brand_sync_at, new Date().toISOString())
             : 0;
           const publishedCount = await countPublishedSafe(client, company_id);
           const postsDelta =
-            publishedCount -
-            (parsed.status === "ok" ? parsed.identity.posts_count_at_last_sync : 0);
+            publishedCount - (reconciledIdentity?.posts_count_at_last_sync ?? 0);
           nextStep =
             (daysSince >= 30 && postsDelta >= 10) || postsDelta >= 20
               ? "refresh"
               : "all_set";
+        }
+
+        // 7b. Manufacture recommendation: surfaced when elements have
+        //     changed materially since the last manufacture, so the AI
+        //     synthetic templates can be regenerated to incorporate them.
+        //     Strictly a hint, never blocks the response. Suppressed if
+        //     manufacture has never run (the user has not opted into AI
+        //     templates yet, so re-running manufacture is not a "refresh"
+        //     concept for them).
+        let manufactureRecommended: {
+          recommended: boolean;
+          reason: string;
+          last_manufacture_at: string | null;
+          elements_drift_signal: number;
+        } | null = null;
+        if (reconciledIdentity !== null) {
+          const driftAddedToElements =
+            drift?.elements_count_change !== undefined
+              ? Math.max(
+                  0,
+                  drift.elements_count_change.after - drift.elements_count_change.before,
+                )
+              : 0;
+          const lastManufactureAt = reconciledIdentity.last_manufacture_at;
+          if (
+            lastManufactureAt !== null &&
+            driftAddedToElements >= 3 &&
+            reconciledIdentity.elements_count > 0
+          ) {
+            manufactureRecommended = {
+              recommended: true,
+              reason: `Detecté ${driftAddedToElements} element${driftAddedToElements === 1 ? "" : "s"} nuevo${driftAddedToElements === 1 ? "" : "s"} desde el último manufacture (${lastManufactureAt}). Los templates AI sintetizados de entonces no los incorporan. Re-invocar manufacture_brand_templates regeneraría usando los elements actuales (~${PHASE_1_ESTIMATE_CR} créditos).`,
+              last_manufacture_at: lastManufactureAt,
+              elements_drift_signal: driftAddedToElements,
+            };
+          } else {
+            manufactureRecommended = {
+              recommended: false,
+              reason:
+                lastManufactureAt === null
+                  ? "Manufacture nunca corrió en esta company. Los templates actuales (si los hay) son uploads directos, no AI synthesis."
+                  : `Sin cambios materiales en elements desde el último manufacture (${lastManufactureAt}).`,
+              last_manufacture_at: lastManufactureAt,
+              elements_drift_signal: driftAddedToElements,
+            };
+          }
         }
 
         // 6. Build budget signal.
@@ -362,19 +465,35 @@ USER FLOW when next_step === "all_set":
             corruption_detail:
               parsed.status === "corrupted" ? parsed.error : null,
             existing_identity:
-              parsed.status === "ok"
+              reconciledIdentity !== null
                 ? {
-                    synthesized_at: parsed.identity.synthesized_at,
-                    last_brand_sync_at: parsed.identity.last_brand_sync_at,
-                    brief_text: parsed.identity.brief_text,
-                    templates_count: parsed.identity.templates_count,
-                    elements_count: parsed.identity.elements_count,
-                    anti_patterns_count: parsed.identity.anti_patterns_count,
-                    aspirational_brands: parsed.identity.aspirational_brands,
-                    palette_extended: parsed.identity.palette_extended,
-                    typography_style_text: parsed.identity.typography_style_text,
+                    synthesized_at: reconciledIdentity.synthesized_at,
+                    last_brand_sync_at: reconciledIdentity.last_brand_sync_at,
+                    last_manufacture_at: reconciledIdentity.last_manufacture_at,
+                    brief_text: reconciledIdentity.brief_text,
+                    templates_count: reconciledIdentity.templates_count,
+                    elements_count: reconciledIdentity.elements_count,
+                    anti_patterns_count: reconciledIdentity.anti_patterns_count,
+                    aspirational_brands: reconciledIdentity.aspirational_brands,
+                    palette_extended: reconciledIdentity.palette_extended,
+                    typography_style_text: reconciledIdentity.typography_style_text,
+                    setup_status: setupStatus,
                   }
                 : null,
+            drift_repaired:
+              drift !== null
+                ? {
+                    persisted: driftPersisted,
+                    templates_count_change: drift.templates_count_change ?? null,
+                    elements_count_change: drift.elements_count_change ?? null,
+                    anti_patterns_count_change:
+                      drift.anti_patterns_count_change ?? null,
+                    folder_lost: drift.folder_lost ?? [],
+                    added_asset_ids: drift.added_asset_ids,
+                    removed_asset_ids: drift.removed_asset_ids,
+                  }
+                : null,
+            manufacture_recommended: manufactureRecommended,
             detected_brand_folders: {
               templates: detectedFolders.templates
                 ? { id: detectedFolders.templates.id, name: detectedFolders.templates.name }
@@ -444,14 +563,17 @@ USER FLOW when next_step === "all_set":
           },
           _assistant_guidance: {
             next_step: nextStep,
+            repair_needed: repairNeeded,
             pre_warning_text: preWarning,
             cold_start_questions: questions,
             recommended_curation_strategy:
               nextStep === "cold_start"
                 ? "Después de las preguntas 1, 2 y 4 (textuales), presentale al usuario los thumbnails de website_signals para curación de pregunta 3. Mostrale: logo_candidates (top 3), hero_candidates (top 5), gallery_candidates (top 10), inline_svg_icons (top 8), favicon. Por cada uno, ofrecele clasificar como [ELEMENTO / TEMPLATE / ANTI-PATTERN / SKIP]. Auto-clasificación sugerida en cada candidato: logos -> ELEMENTO, heroes -> TEMPLATE, gallery -> ELEMENTO o TEMPLATE según concepto, SVGs -> ELEMENTO. El usuario solo corrige las que disienten. NO subas nada todavía: la curación viaja al draft_brand_visual_identity en el próximo turno."
-                : nextStep === "refresh"
-                  ? "Mostrale al usuario el resumen del identity existente (existing_identity) + cuántos posts publicó desde el último sync. Preguntale: (a) refresh de templates pulling top performers de los últimos 90 días, (b) re-scrape del website, (c) full re-setup (cold start de nuevo). Las 3 opciones son tools distintos (lands en F5)."
-                  : "Mostrale el resumen del identity existente. No empujes refresh a menos que el usuario lo pida explícitamente.",
+                : repairNeeded
+                  ? "BROKEN SETUP detectado: existing_identity.setup_status === 'broken' (los 3 counts están en 0). Las folders existen pero quedaron vacías, típicamente porque execute_brand_visual_identity creó los folders pero los uploads fallaron, o porque alguien borró todos los assets manualmente. Surface al usuario: 'Tu Brand Identity tiene el brief cargado pero las 3 folders están vacías. ¿Re-corrémos el setup completo (cold start de nuevo) o intentás subir los assets manualmente y volvemos a chequear?' NO ejecutes nada sin confirmación explícita."
+                  : nextStep === "refresh"
+                    ? "Mostrale al usuario el resumen del identity existente (existing_identity) + cuántos posts publicó desde el último sync. Preguntale: (a) refresh de templates pulling top performers de los últimos 90 días, (b) re-scrape del website, (c) full re-setup (cold start de nuevo). Las 3 opciones son tools distintos (lands en F5)."
+                    : "Mostrale el resumen del identity existente. No empujes refresh a menos que el usuario lo pida explícitamente. Si manufacture_recommended.recommended es true, mencionale el hint pero NO ejecutes manufacture sin aprobación explícita de costo.",
             instructions_for_pre_warning:
               "Surface pre_warning_text al usuario VERBATIM (incluyendo el desglose de costos + el aviso del ai_image_styles si aplica). Espera 'sí' / 'dale' / 'avanza' EXPLICITO antes de hacer cualquier mutación.",
             instructions_for_low_visual_signal: lowVisualSignal
@@ -991,10 +1113,24 @@ After success the agent should offer Phase 1 template manufacturing as a follow-
                 }
                 case "update_company_description": {
                   // Build final identity with folder ids and counts from
-                  // what actually succeeded, then persist.
+                  // what actually succeeded, then persist. When all three
+                  // counts end up at zero (every upload failed silently)
+                  // prepend a [SETUP PARTIAL ...] marker to brief_text so
+                  // future readers can tell the brief is aspirational
+                  // rather than backed by real assets. The reconcile pass
+                  // in assess will also surface setup_status: "broken" and
+                  // route next_step to "refresh" with repair_needed.
                   const counts = countByIntent(uploadedAssets);
+                  const allUploadsFailed =
+                    counts.templates === 0 &&
+                    counts.elements === 0 &&
+                    counts.anti_patterns === 0;
+                  const briefText = allUploadsFailed
+                    ? `[SETUP PARTIAL: folders created ${new Date().toISOString().slice(0, 10)} but every upload failed. Brief is aspirational; no visual assets are backing it. Re-run setup or upload assets manually to recover.]\n\n${draft.proposed_identity.brief_text}`
+                    : draft.proposed_identity.brief_text;
                   let finalIdentity: BrandVisualIdentity = {
                     ...draft.proposed_identity,
+                    brief_text: briefText,
                     folders: {
                       templates: folderIdTemplates,
                       elements: folderIdElements,
@@ -1020,7 +1156,13 @@ After success the agent should offer Phase 1 template manufacturing as a follow-
                     finalIdentity,
                   );
                   await client.updateCompany(draft.company_id, { description: newDescription });
-                  return { action, result: { persisted_identity: finalIdentity } };
+                  return {
+                    action,
+                    result: {
+                      persisted_identity: finalIdentity,
+                      setup_partial: allUploadsFailed,
+                    },
+                  };
                 }
                 case "clear_ai_image_styles": {
                   await client.updateCompany(draft.company_id, { ai_image_styles: [] });
@@ -1089,8 +1231,12 @@ After success the agent should offer Phase 1 template manufacturing as a follow-
 
         const userFacingSummary =
           failedActions.length === 0
-            ? `Brand Visual Identity persistida con éxito. Folders creados: __brand_templates (${folderIdTemplates ?? "-"}), __brand_elements (${folderIdElements ?? "-"}), __brand_anti_patterns (${folderIdAntiPatterns ?? "-"}). ${succeededUploads} asset${succeededUploads === 1 ? "" : "s"} subido${succeededUploads === 1 ? "" : "s"}. El bloque BRAND_VISUAL_IDENTITY queda en Company.description. ¿Querés avanzar con Phase 1 (manufactura de ${PHASE_1_TEMPLATE_COUNT} templates AI con costo ~${PHASE_1_ESTIMATE_CR} créditos)?`
-            : `Brand Visual Identity persistida parcialmente. ${succeededUploads} asset${succeededUploads === 1 ? "" : "s"} OK, ${failedActions.length} acción${failedActions.length === 1 ? "" : "es"} falló${failedActions.length === 1 ? "" : "ron"}. Revisá el action_report para detalles. Podés reintentar con update_brand_visual_identity (no disponible todavía en esta versión) o seguir adelante.`;
+            ? succeededUploads === 0
+              ? `Brand Visual Identity persistida con folders creados pero CERO assets subidos. __brand_templates (${folderIdTemplates ?? "-"}), __brand_elements (${folderIdElements ?? "-"}), __brand_anti_patterns (${folderIdAntiPatterns ?? "-"}) quedan vacíos. El brief se persistió como aspirational (marcado [SETUP PARTIAL]). Antes de avanzar a Phase 1 conviene subir manualmente al menos 1 logo + 1 hero, o re-correr setup con curación que incluya assets. assess va a devolver next_step: refresh con repair_needed.`
+              : `Brand Visual Identity persistida con éxito. Folders creados: __brand_templates (${folderIdTemplates ?? "-"}), __brand_elements (${folderIdElements ?? "-"}), __brand_anti_patterns (${folderIdAntiPatterns ?? "-"}). ${succeededUploads} asset${succeededUploads === 1 ? "" : "s"} subido${succeededUploads === 1 ? "" : "s"}. El bloque BRAND_VISUAL_IDENTITY queda en Company.description. ¿Querés avanzar con Phase 1 (manufactura de ${PHASE_1_TEMPLATE_COUNT} templates AI con costo ~${PHASE_1_ESTIMATE_CR} créditos)?`
+            : succeededUploads === 0
+              ? `Brand Visual Identity persistida pero TODOS los uploads fallaron (${failedActions.length} fallos). Folders creados quedan vacíos y el brief queda marcado [SETUP PARTIAL]. Revisá action_report para diagnosticar y reintentá el setup. assess va a devolver next_step: refresh con repair_needed.`
+              : `Brand Visual Identity persistida parcialmente. ${succeededUploads} asset${succeededUploads === 1 ? "" : "s"} OK, ${failedActions.length} acción${failedActions.length === 1 ? "" : "es"} falló${failedActions.length === 1 ? "" : "ron"}. Revisá el action_report para detalles. Podés reintentar con update_brand_visual_identity (no disponible todavía en esta versión) o seguir adelante.`;
 
         return {
           content: [
@@ -1419,7 +1565,9 @@ NEXT STEP: after manufacture, call finalize_brand_templates with user's per-asse
         // 5. Update the BrandVisualIdentity block to register the new
         //    asset_ids with their tags. We persist eagerly here so the
         //    block is consistent even if the user closes the session
-        //    before calling finalize.
+        //    before calling finalize. Also stamp last_manufacture_at so
+        //    assess can surface a manufacture_recommended hint when
+        //    elements drift significantly after this run.
         let updatedIdentity: BrandVisualIdentity = identity;
         for (const r of allResults) {
           if (r.status === "succeeded" && r.asset_id !== null) {
@@ -1429,6 +1577,15 @@ NEXT STEP: after manufacture, call finalize_brand_templates with user's per-asse
               templates_count: updatedIdentity.templates_count + 1,
             };
           }
+        }
+        const anySucceeded = allResults.some(
+          (r) => r.status === "succeeded" && r.asset_id !== null,
+        );
+        if (anySucceeded) {
+          updatedIdentity = {
+            ...updatedIdentity,
+            last_manufacture_at: new Date().toISOString(),
+          };
         }
         const currentDescription =
           (await client.getCompany(input.company_id)).description ?? null;
@@ -2056,16 +2213,22 @@ async function pullBestPerformingPosts(
 }
 
 async function countPublishedSafe(client: FollowrClient, companyId: number): Promise<number> {
+  // Pull a single page with pageSize 200 and return its length. This caps
+  // the count at 200, which is sufficient for the refresh heuristic
+  // (postsDelta thresholds are 10 / 20). For companies with > 200 published
+  // posts the count saturates at 200; that still flips the threshold
+  // correctly. Earlier implementation returned MAX_SAFE_INTEGER when any
+  // post existed, which made every active company route to "refresh" and
+  // every inactive company never refresh — heuristic was effectively a
+  // disguised boolean. A future iteration can paginate exactly when
+  // listCompanyPostGroups exposes meta.total.
   try {
-    const r = await client.listCompanyPostGroups(companyId, {
-      pageSize: 1,
+    const page = await client.listCompanyPostGroups(companyId, {
+      pageSize: 200,
       draft: false,
       status: "published",
     });
-    // We only need a rough count; meta.total would be ideal but the lightweight
-    // option here is to fall back to the length of the first page (cheap).
-    // For an exact count, a separate endpoint would be needed.
-    return r.length >= 1 ? Number.MAX_SAFE_INTEGER : 0;
+    return page.length;
   } catch {
     return 0;
   }

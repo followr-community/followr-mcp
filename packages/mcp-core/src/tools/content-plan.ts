@@ -47,8 +47,8 @@ import {
   BRAND_TAGS,
   type BrandTag,
   type BrandVisualIdentity,
-  lookupAssetsByTag,
   parseBrandIdentityFromDescription,
+  pickBrandReferenceAssetIds,
   suggestedTagsForConcept,
 } from "../lib/brand-identity.js";
 import { resolveDriver } from "../lib/driver-resolver.js";
@@ -3029,6 +3029,10 @@ interface BrandContext {
    * partial brand setup. Empty array when the company has no palettes.
    */
   fallbackPalettes: string[];
+  /** FollowrClient passed through so the picker can do live folder reads. */
+  client: FollowrClient;
+  /** Company id, passed through so the picker can scope listAssets. */
+  companyId: number;
 }
 
 async function loadBrandContext(
@@ -3073,7 +3077,7 @@ async function loadBrandContext(
       // refs (if any).
     }
   }
-  return { identity, assetIdToUrl, fallbackPalettes };
+  return { identity, assetIdToUrl, fallbackPalettes, client, companyId };
 }
 
 /**
@@ -3142,18 +3146,27 @@ interface PickedBrandRefs {
  * is the practical max for nano_banana_2 (~5); see TODO_V2.md item for
  * revisiting per-model.
  */
-function pickBrandReferenceUrls(
+async function pickBrandReferenceUrls(
   ctx: BrandContext,
   promptText: string,
   maxRefs: number,
-): PickedBrandRefs {
+): Promise<PickedBrandRefs> {
   if (!ctx.identity) return { urls: [], has_typography_ref: false };
   const out: string[] = [];
   const seen = new Set<string>();
   let typographyAdded = false;
-  const addByTag = (tag: BrandTag, limit: number): number => {
+  // Live-read picker: pickBrandReferenceAssetIds hits listAssets per tag,
+  // so manual uploads / deletions made via the Followr UI between
+  // loadBrandContext and now are picked up immediately. The JSON map is
+  // metadata only; the folder is the source of truth.
+  const addByTag = async (tag: BrandTag, limit: number): Promise<number> => {
     let added = 0;
-    const ids = lookupAssetsByTag(ctx.identity!, tag);
+    const ids = await pickBrandReferenceAssetIds(
+      ctx.client,
+      ctx.companyId,
+      ctx.identity!,
+      tag,
+    );
     for (const id of ids) {
       if (added >= limit) break;
       const url = ctx.assetIdToUrl.get(id);
@@ -3167,30 +3180,36 @@ function pickBrandReferenceUrls(
     return added;
   };
   // 1. Always logo first.
-  addByTag(BRAND_TAGS.LOGO, 1);
+  await addByTag(BRAND_TAGS.LOGO, 1);
 
   // 2. Concept-matched tags. Compute remaining budget BEFORE reserving
   // 1 slot for the typography ref (so the typography slot doesn't eat
-  // into a concept-relevant slot when both apply).
+  // into a concept-relevant slot when both apply). Live-check typography
+  // ref availability once instead of inside the loop.
   const suggestedTags = suggestedTagsForConcept(promptText);
-  // Reserve one slot for typography ref (if available); the rest goes to concepts.
-  const typoBudget = lookupAssetsByTag(ctx.identity, BRAND_TAGS.TYPOGRAPHY_REFERENCE).length > 0 ? 1 : 0;
+  const typographyAssets = await pickBrandReferenceAssetIds(
+    ctx.client,
+    ctx.companyId,
+    ctx.identity,
+    BRAND_TAGS.TYPOGRAPHY_REFERENCE,
+  );
+  const typoBudget = typographyAssets.length > 0 ? 1 : 0;
   const conceptBudget = Math.max(0, maxRefs - out.length - typoBudget);
   let conceptSpent = 0;
   for (const tag of suggestedTags) {
     if (conceptSpent >= conceptBudget) break;
-    conceptSpent += addByTag(tag, conceptBudget - conceptSpent);
+    conceptSpent += await addByTag(tag, conceptBudget - conceptSpent);
   }
 
   // 3. Typography ref (F6) at the end, leaving its slot reserved.
   if (typoBudget > 0 && out.length < maxRefs) {
-    addByTag(BRAND_TAGS.TYPOGRAPHY_REFERENCE, 1);
+    await addByTag(BRAND_TAGS.TYPOGRAPHY_REFERENCE, 1);
   }
 
   // 4. Pad with HERO if still under 3 refs.
-  if (out.length < 3) addByTag(BRAND_TAGS.HERO, maxRefs - out.length);
+  if (out.length < 3) await addByTag(BRAND_TAGS.HERO, maxRefs - out.length);
   // 5. Final pad with ASPIRATIONAL for cold-start brands.
-  if (out.length < 2) addByTag(BRAND_TAGS.ASPIRATIONAL, maxRefs - out.length);
+  if (out.length < 2) await addByTag(BRAND_TAGS.ASPIRATIONAL, maxRefs - out.length);
 
   return {
     urls: out.slice(0, maxRefs),
@@ -3293,7 +3312,7 @@ async function resolveAssetSourceFresh(
         ? buildSoftPalettePromptSuffix(brandContext.fallbackPalettes)
         : "";
     const brandRefsPicked = useBrand
-      ? pickBrandReferenceUrls(brandContext, imgSrc.prompt, 4)
+      ? await pickBrandReferenceUrls(brandContext, imgSrc.prompt, 4)
       : { urls: [] as string[], has_typography_ref: false };
 
     // Merge caller-provided refs (legacy single + new plural) with brand

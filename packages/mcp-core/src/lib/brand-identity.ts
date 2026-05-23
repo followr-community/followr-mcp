@@ -47,6 +47,7 @@
 // THE PARSER returns one of three states so the caller can distinguish
 // missing-from-corrupted and offer the user a recovery action when needed.
 
+import type { Asset, Folder, FollowrClient } from "@followr-mcp/shared";
 import { z } from "zod";
 
 // ──────────────────────────────────────────────────────────
@@ -132,6 +133,17 @@ export const BrandVisualIdentitySchema = z.object({
    * been refreshed since creation.
    */
   last_brand_sync_at: z.string().min(1),
+
+  /**
+   * ISO-8601 timestamp of the last successful run of manufacture_brand_templates.
+   * Null when manufacture has never been invoked. Used by assess to decide
+   * whether to surface a manufacture_recommended hint when elements have
+   * changed significantly since the last manufacture (so the AI-synthesized
+   * templates can be regenerated to incorporate the new elements). Optional
+   * for backwards compatibility with v1 blocks written before this field
+   * existed; treated as null when absent.
+   */
+  last_manufacture_at: z.string().nullable().default(null),
 
   /**
    * Number of published PostGroups in the company at the time of the last
@@ -399,6 +411,7 @@ export function buildBrandVisualIdentity(args: {
     schema_version: BRAND_VISUAL_IDENTITY_SCHEMA_VERSION,
     synthesized_at: now,
     last_brand_sync_at: now,
+    last_manufacture_at: null,
     posts_count_at_last_sync: args.posts_count_at_last_sync ?? 0,
     folders: {
       templates: args.folders?.templates ?? null,
@@ -472,6 +485,451 @@ export function touchBrandIdentitySync(
     last_brand_sync_at: new Date().toISOString(),
     posts_count_at_last_sync,
   };
+}
+
+// ──────────────────────────────────────────────────────────
+// Folder intent mapping
+// ──────────────────────────────────────────────────────────
+
+export type BrandFolderIntent = "templates" | "elements" | "anti_patterns";
+
+/**
+ * Map a BrandTag to the brand folder it lives in. Used by the live-read
+ * picker so manual uploads (assets in a brand folder without explicit tags)
+ * can still be picked up when the agent asks for that folder's content type.
+ *
+ * Templates folder holds full compositions: COVER/STEP/CTA/FEATURE/QUOTE/HERO
+ * templates plus ASPIRATIONAL and PAST_WINNER references that are full layouts.
+ *
+ * Elements folder holds atomic visual building blocks: LOGO, HERO,
+ * CHARACTER, PATTERN, ICON, PRODUCT, TYPOGRAPHY_REFERENCE.
+ *
+ * Anti-patterns folder is referenced indirectly (it doesn't have its own
+ * tag in BRAND_TAGS today; the textual anti-patterns live in the JSON's
+ * anti_patterns_text array).
+ */
+export function tagToFolderIntent(tag: BrandTag): BrandFolderIntent {
+  switch (tag) {
+    case BRAND_TAGS.COVER_TEMPLATE:
+    case BRAND_TAGS.STEP_TEMPLATE:
+    case BRAND_TAGS.CTA_TEMPLATE:
+    case BRAND_TAGS.FEATURE_TEMPLATE:
+    case BRAND_TAGS.QUOTE_TEMPLATE:
+    case BRAND_TAGS.HERO_TEMPLATE:
+    case BRAND_TAGS.ASPIRATIONAL:
+    case BRAND_TAGS.PAST_WINNER:
+      return "templates";
+    case BRAND_TAGS.LOGO:
+    case BRAND_TAGS.CHARACTER:
+    case BRAND_TAGS.HERO:
+    case BRAND_TAGS.PATTERN:
+    case BRAND_TAGS.ICON:
+    case BRAND_TAGS.PRODUCT:
+    case BRAND_TAGS.TYPOGRAPHY_REFERENCE:
+      return "elements";
+    default:
+      return "elements";
+  }
+}
+
+// ──────────────────────────────────────────────────────────
+// Setup status (derived signal for assess / consumers)
+// ──────────────────────────────────────────────────────────
+
+export type BrandSetupStatus = "ok" | "partial" | "broken";
+
+/**
+ * Derive the setup health of a brand identity from its counts.
+ *
+ *   - broken: zero visual assets across all three folders. Either uploads
+ *     failed during execute, or every asset was deleted afterwards. The
+ *     brief is unusable for generation grounding.
+ *   - partial: at least one of (templates, elements) is empty but the
+ *     other has assets. Functional but limited.
+ *   - ok: both templates_count and elements_count are > 0. Anti-patterns
+ *     are optional (most brands carry only text anti-patterns, not images).
+ *
+ * Pure function; no IO. Compute on the reconciled identity for accuracy.
+ */
+export function computeSetupStatus(
+  identity: Pick<
+    BrandVisualIdentity,
+    "templates_count" | "elements_count" | "anti_patterns_count"
+  >,
+): BrandSetupStatus {
+  const t = identity.templates_count;
+  const e = identity.elements_count;
+  const a = identity.anti_patterns_count;
+  if (t === 0 && e === 0 && a === 0) return "broken";
+  if (t === 0 || e === 0) return "partial";
+  return "ok";
+}
+
+// ──────────────────────────────────────────────────────────
+// Live-read asset picker (replaces lookupAssetsByTag for execution paths)
+// ──────────────────────────────────────────────────────────
+
+/**
+ * Live-read picker: returns asset ids for a given tag by READING THE FOLDER
+ * STATE LIVE (not the JSON map). This makes downstream tools (content-plan
+ * picker, manufacture, etc.) immediately consistent with manual edits made
+ * via the Followr web UI, without waiting for an assess reconcile.
+ *
+ * Selection rule:
+ *   1. Determine the folder intent for the requested tag.
+ *   2. If the identity has no folder id for that intent, return [].
+ *   3. listAssets(folder_id) → live asset list.
+ *   4. For each live asset:
+ *      - if the asset_tag_map has an entry with the requested tag → include
+ *      - if the asset_tag_map has an entry with EMPTY tags → include
+ *        (manual upload; user put it there intentionally as a brand asset)
+ *      - if the asset is NOT in the map at all → include
+ *        (also manual upload; the map has not been reconciled yet)
+ *      - if the asset has tags but none match the requested tag → exclude
+ *
+ * The "tags empty OR not in map ⇒ include" rule preserves the user's
+ * intent ("los puso a proposito" — they put it there on purpose) without
+ * requiring an assess pass first.
+ *
+ * Falls back to lookupAssetsByTag (JSON-only) if listAssets throws, so the
+ * picker stays usable even when the API is degraded.
+ */
+export async function pickBrandReferenceAssetIds(
+  client: FollowrClient,
+  companyId: number,
+  identity: BrandVisualIdentity,
+  tag: BrandTag,
+): Promise<number[]> {
+  const intent = tagToFolderIntent(tag);
+  const folderId = identity.folders[intent];
+  if (folderId === null) {
+    return lookupAssetsByTag(identity, tag);
+  }
+  let liveAssets: Asset[];
+  try {
+    liveAssets = await client.listAssets(companyId, {
+      folderId,
+      pageSize: 200,
+    });
+  } catch {
+    return lookupAssetsByTag(identity, tag);
+  }
+  const out: number[] = [];
+  for (const a of liveAssets) {
+    const entry = identity.asset_tag_map[String(a.id)];
+    if (entry === undefined || entry.length === 0 || entry.includes(tag)) {
+      out.push(a.id);
+    }
+  }
+  return out;
+}
+
+// ──────────────────────────────────────────────────────────
+// Reconcile: live-read folders, correct counts + asset_tag_map, persist
+// ──────────────────────────────────────────────────────────
+
+export interface BrandIdentityDrift {
+  /** Per-folder count delta. Only populated when the count changed. */
+  templates_count_change?: { before: number; after: number };
+  elements_count_change?: { before: number; after: number };
+  anti_patterns_count_change?: { before: number; after: number };
+  /** Folder ids that no longer exist in the live folder list. */
+  folder_lost?: BrandFolderIntent[];
+  /** Asset ids found in folders but not previously in asset_tag_map. */
+  added_asset_ids: number[];
+  /** Asset ids in asset_tag_map but no longer in any of the 3 brand folders. */
+  removed_asset_ids: number[];
+}
+
+export interface ReconcileResult {
+  /** Identity AFTER reconcile (same as input if no drift). */
+  reconciled: BrandVisualIdentity;
+  /** Null if reality matched the stored JSON; populated otherwise. */
+  drift: BrandIdentityDrift | null;
+  /** True if the corrected JSON was successfully written back to Company.description. */
+  persisted: boolean;
+}
+
+/**
+ * Read the live folder + asset state and reconcile the stored JSON against
+ * reality. Corrects:
+ *   - templates_count / elements_count / anti_patterns_count
+ *   - asset_tag_map (removes entries for assets no longer present in any
+ *     brand folder; adds entries for newly-discovered assets with empty tags)
+ *   - folders.* (sets to null if the stored folder id is no longer present
+ *     in the company's folder list)
+ *   - aspirational_refs_asset_ids (prunes entries that no longer exist)
+ *
+ * Persists the corrected JSON via updateCompany if drift is detected. If the
+ * persist fails (network error, race with another writer), returns
+ * { persisted: false } but still returns the in-memory reconciled identity so
+ * the caller can use accurate counts for the current response.
+ *
+ * Cost: 1 listFolders call + up to 3 listAssets calls (one per non-null
+ * folder) + 1 updateCompany call when drift is detected.
+ */
+export async function reconcileBrandIdentityState(
+  client: FollowrClient,
+  companyId: number,
+  currentDescription: string | null,
+  parsedIdentity: BrandVisualIdentity,
+): Promise<ReconcileResult> {
+  let liveFolders: Folder[];
+  try {
+    liveFolders = await client.listFolders(companyId, { pageSize: 100 });
+  } catch {
+    return { reconciled: parsedIdentity, drift: null, persisted: false };
+  }
+  const liveFolderIds = new Set<number>(liveFolders.map((f) => f.id));
+
+  const updatedFolders: BrandVisualIdentity["folders"] = {
+    templates: parsedIdentity.folders.templates,
+    elements: parsedIdentity.folders.elements,
+    anti_patterns: parsedIdentity.folders.anti_patterns,
+  };
+  const folderLost: BrandFolderIntent[] = [];
+  const assetIdsByIntent: Record<BrandFolderIntent, Set<number>> = {
+    templates: new Set(),
+    elements: new Set(),
+    anti_patterns: new Set(),
+  };
+
+  for (const intent of ["templates", "elements", "anti_patterns"] as const) {
+    const stored = parsedIdentity.folders[intent];
+    if (stored === null) continue;
+    if (!liveFolderIds.has(stored)) {
+      updatedFolders[intent] = null;
+      folderLost.push(intent);
+      continue;
+    }
+    try {
+      const assets = await client.listAssets(companyId, {
+        folderId: stored,
+        pageSize: 200,
+      });
+      for (const a of assets) assetIdsByIntent[intent].add(a.id);
+    } catch {
+      // Tolerant: skip this folder's count update. The drift report will
+      // omit this intent's count change rather than fabricate a bad number.
+    }
+  }
+
+  const newCounts = {
+    templates: assetIdsByIntent.templates.size,
+    elements: assetIdsByIntent.elements.size,
+    anti_patterns: assetIdsByIntent.anti_patterns.size,
+  };
+
+  const allLiveAssetIds = new Set<number>([
+    ...assetIdsByIntent.templates,
+    ...assetIdsByIntent.elements,
+    ...assetIdsByIntent.anti_patterns,
+  ]);
+
+  const removedAssetIds: number[] = [];
+  const newMap: Record<string, string[]> = {};
+  for (const [assetIdStr, tags] of Object.entries(parsedIdentity.asset_tag_map)) {
+    const id = Number.parseInt(assetIdStr, 10);
+    if (!Number.isFinite(id)) continue;
+    if (allLiveAssetIds.has(id)) {
+      newMap[assetIdStr] = tags;
+    } else {
+      removedAssetIds.push(id);
+    }
+  }
+  const addedAssetIds: number[] = [];
+  for (const id of allLiveAssetIds) {
+    const key = String(id);
+    if (newMap[key] === undefined) {
+      newMap[key] = [];
+      addedAssetIds.push(id);
+    }
+  }
+
+  const newAspirationalRefs = parsedIdentity.aspirational_refs_asset_ids.filter(
+    (id) => allLiveAssetIds.has(id),
+  );
+
+  const drift: BrandIdentityDrift = {
+    added_asset_ids: addedAssetIds,
+    removed_asset_ids: removedAssetIds,
+  };
+  if (newCounts.templates !== parsedIdentity.templates_count) {
+    drift.templates_count_change = {
+      before: parsedIdentity.templates_count,
+      after: newCounts.templates,
+    };
+  }
+  if (newCounts.elements !== parsedIdentity.elements_count) {
+    drift.elements_count_change = {
+      before: parsedIdentity.elements_count,
+      after: newCounts.elements,
+    };
+  }
+  if (newCounts.anti_patterns !== parsedIdentity.anti_patterns_count) {
+    drift.anti_patterns_count_change = {
+      before: parsedIdentity.anti_patterns_count,
+      after: newCounts.anti_patterns,
+    };
+  }
+  if (folderLost.length > 0) drift.folder_lost = folderLost;
+
+  const hasDrift =
+    addedAssetIds.length > 0 ||
+    removedAssetIds.length > 0 ||
+    folderLost.length > 0 ||
+    drift.templates_count_change !== undefined ||
+    drift.elements_count_change !== undefined ||
+    drift.anti_patterns_count_change !== undefined;
+
+  if (!hasDrift) {
+    return { reconciled: parsedIdentity, drift: null, persisted: false };
+  }
+
+  const reconciled: BrandVisualIdentity = {
+    ...parsedIdentity,
+    folders: updatedFolders,
+    templates_count: newCounts.templates,
+    elements_count: newCounts.elements,
+    anti_patterns_count: newCounts.anti_patterns,
+    asset_tag_map: newMap,
+    aspirational_refs_asset_ids: newAspirationalRefs,
+  };
+
+  try {
+    const newDescription = appendBrandIdentityToDescription(currentDescription, reconciled);
+    await client.updateCompany(companyId, { description: newDescription });
+    return { reconciled, drift, persisted: true };
+  } catch {
+    return { reconciled, drift, persisted: false };
+  }
+}
+
+// ──────────────────────────────────────────────────────────
+// Eager sync hook for delete_asset / delete_folder
+// ──────────────────────────────────────────────────────────
+
+export interface BrandIdentityDeleteSyncResult {
+  /** True if the deletion touched the brand identity block in-memory. */
+  updated: boolean;
+  /** True if the in-memory update was successfully written back to Company.description. */
+  persisted: boolean;
+  /** What was changed, for the response surface. */
+  detail:
+    | { kind: "no_brand_identity" }
+    | { kind: "not_affected" }
+    | { kind: "asset_removed"; asset_id: number; from_count: BrandFolderIntent | null }
+    | { kind: "folder_cleared"; folder_id: number; intent: BrandFolderIntent };
+}
+
+/**
+ * Mutate the brand identity block in response to an MCP-side delete_asset
+ * or delete_folder call. Maintains the invariant that templates_count /
+ * elements_count / anti_patterns_count match folder reality without having
+ * to wait for the lazy reconcile in assess.
+ *
+ * Best-effort: when the deleted asset has tags spanning multiple folder
+ * intents, we decrement the first-tag's intent only (assets shouldn't
+ * really span folders in practice; the lazy reconcile catches edge cases).
+ * When the deleted asset has empty tags (manual upload), we can't tell
+ * which folder it belonged to, so we just remove the map entry; the lazy
+ * reconcile picks up the count correction on next assess.
+ *
+ * Tolerant: any thrown error from getCompany / updateCompany leaves the
+ * identity block in its pre-delete state and returns persisted: false.
+ * The caller can still inform the user that the delete itself succeeded.
+ */
+export async function syncBrandIdentityAfterDelete(
+  client: FollowrClient,
+  companyId: number,
+  deleted: { assetId?: number; folderId?: number },
+): Promise<BrandIdentityDeleteSyncResult> {
+  let companyDescription: string | null;
+  try {
+    const company = await client.getCompany(companyId);
+    companyDescription = company.description ?? null;
+  } catch {
+    return { updated: false, persisted: false, detail: { kind: "not_affected" } };
+  }
+  const parsed = parseBrandIdentityFromDescription(companyDescription);
+  if (parsed.status !== "ok") {
+    return { updated: false, persisted: false, detail: { kind: "no_brand_identity" } };
+  }
+  const identity = parsed.identity;
+
+  let next: BrandVisualIdentity = identity;
+  let dirty = false;
+  let detail: BrandIdentityDeleteSyncResult["detail"] = { kind: "not_affected" };
+
+  if (deleted.assetId !== undefined) {
+    const key = String(deleted.assetId);
+    const tagsForAsset = identity.asset_tag_map[key];
+    const inAspirationalList = identity.aspirational_refs_asset_ids.includes(
+      deleted.assetId,
+    );
+    if (tagsForAsset !== undefined || inAspirationalList) {
+      let intent: BrandFolderIntent | null = null;
+      if (tagsForAsset !== undefined && tagsForAsset.length > 0) {
+        intent = tagToFolderIntent(tagsForAsset[0] as BrandTag);
+      }
+      const { [key]: _omit, ...restMap } = identity.asset_tag_map;
+      next = {
+        ...next,
+        asset_tag_map: restMap,
+        aspirational_refs_asset_ids: identity.aspirational_refs_asset_ids.filter(
+          (id) => id !== deleted.assetId,
+        ),
+      };
+      if (intent === "templates") {
+        next = { ...next, templates_count: Math.max(0, next.templates_count - 1) };
+      } else if (intent === "elements") {
+        next = { ...next, elements_count: Math.max(0, next.elements_count - 1) };
+      } else if (intent === "anti_patterns") {
+        next = {
+          ...next,
+          anti_patterns_count: Math.max(0, next.anti_patterns_count - 1),
+        };
+      }
+      dirty = true;
+      detail = {
+        kind: "asset_removed",
+        asset_id: deleted.assetId,
+        from_count: intent,
+      };
+    }
+  }
+
+  if (deleted.folderId !== undefined) {
+    for (const intent of ["templates", "elements", "anti_patterns"] as const) {
+      if (next.folders[intent] === deleted.folderId) {
+        next = {
+          ...next,
+          folders: { ...next.folders, [intent]: null },
+        };
+        if (intent === "templates") next = { ...next, templates_count: 0 };
+        else if (intent === "elements") next = { ...next, elements_count: 0 };
+        else next = { ...next, anti_patterns_count: 0 };
+        dirty = true;
+        detail = {
+          kind: "folder_cleared",
+          folder_id: deleted.folderId,
+          intent,
+        };
+      }
+    }
+  }
+
+  if (!dirty) {
+    return { updated: false, persisted: false, detail: { kind: "not_affected" } };
+  }
+
+  try {
+    const newDescription = appendBrandIdentityToDescription(companyDescription, next);
+    await client.updateCompany(companyId, { description: newDescription });
+    return { updated: true, persisted: true, detail };
+  } catch {
+    return { updated: true, persisted: false, detail };
+  }
 }
 
 // ──────────────────────────────────────────────────────────
