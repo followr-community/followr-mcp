@@ -3693,6 +3693,36 @@ interface AssetPreview {
   duration_seconds?: number;
   cost_credits: number;
   reference_image_url?: string;
+  /**
+   * Human-readable label of what kind of video the user is actually getting.
+   * Distinct from `kind`, which is the internal storage discriminator.
+   *
+   * - "ai_clip_with_audio": AI-generated cinematic clip with native audio
+   *   from the model itself (Google Veo 3 family). No human in frame.
+   * - "ai_clip_silent": AI-generated cinematic clip with no audio at all
+   *   (Wan, Seedance, Hailuo). The user has to add music or sound design
+   *   in a video editor afterwards.
+   * - "avatar_lipsync": single-scene talking head with a virtual person
+   *   speaking the user's script, synthetic voice.
+   * - "avatar_multi_scene_video": multi-scene avatar reel with burned-in
+   *   subtitles, synthetic voice, one or more scenes concatenated.
+   *
+   * Set only on video-kind assets. Other kinds leave it undefined.
+   */
+  video_kind_user_facing?:
+    | "ai_clip_with_audio"
+    | "ai_clip_silent"
+    | "avatar_lipsync"
+    | "avatar_multi_scene_video";
+  /**
+   * Plain-language audio status for video assets, surfaced in the preview
+   * so the user is not surprised by a silent Reel. Mirrors the model's
+   * audio_capability in user-friendly prose. Undefined on non-video assets.
+   */
+  audio_status?:
+    | "with_native_audio"
+    | "silent_video"
+    | "synthetic_voice";
 }
 
 interface NetworkPreview {
@@ -3837,12 +3867,17 @@ function describeAssetSource(
     const modelId = "model" in src ? src.model : undefined;
     const m = modelId ? VIDEO_MODELS.find((x) => x.model_id === modelId) : undefined;
     const dur = "duration_seconds" in src ? (src.duration_seconds ?? m?.default_duration_seconds ?? 8) : 8;
+    const audioCap = m?.audio_capability ?? "silent_only";
     const desc: AssetPreview = {
       kind: "ai_video",
       description: describeAiImage(src.prompt),
       model: modelId,
       duration_seconds: dur,
       cost_credits: m ? m.cost_per_second * dur : 400 * dur,
+      video_kind_user_facing:
+        audioCap === "with_native_audio" ? "ai_clip_with_audio" : "ai_clip_silent",
+      audio_status:
+        audioCap === "with_native_audio" ? "with_native_audio" : "silent_video",
     };
     if ("reference_image_url" in src && src.reference_image_url) {
       desc.reference_image_url = src.reference_image_url;
@@ -3854,6 +3889,8 @@ function describeAssetSource(
       kind: "avatar_lipsync",
       description: `Avatar lipsync (avatar #${src.avatar_id}). Script: "${describeAiImage(src.script)}"`,
       cost_credits: 25 * 12,
+      video_kind_user_facing: "avatar_lipsync",
+      audio_status: "synthetic_voice",
     };
   }
   if (src.type === "ai_avatar_video") {
@@ -3861,6 +3898,8 @@ function describeAssetSource(
       kind: "avatar_video",
       description: `Avatar video con ${src.scripts.length} escena(s) (avatar #${src.avatar_id})${src.generate_backgrounds ? ", con backgrounds generados" : ""}.`,
       cost_credits: 25 * 10 * src.scripts.length + (src.generate_backgrounds ? 60 * src.scripts.length : 0),
+      video_kind_user_facing: "avatar_multi_scene_video",
+      audio_status: "synthetic_voice",
     };
   }
   return { kind: "ai_image", description: "(asset desconocido)", cost_credits: 0 };
@@ -4249,22 +4288,36 @@ function renderMarkdown(args: {
 
 function describeAssetKind(a: AssetPreview): string {
   switch (a.kind) {
-    case "ai_image":
-      return `Imagen AI (${a.model ?? "nano_banana_2"}, ${a.cost_credits} cr)`;
+    case "ai_image": {
+      const model = IMAGE_MODELS.find((m) => m.model_id === a.model);
+      const name = model?.display_name ?? "imagen con IA";
+      return `Imagen generada con IA (${name}, ${a.cost_credits} cr)`;
+    }
     case "url_image":
-      return "Imagen desde URL externa";
+      return "Foto del sitio (sin generar nada)";
     case "library_image":
-      return "Imagen de la biblioteca";
-    case "ai_video":
-      return `Video AI (${a.model ?? "?"}, ${a.duration_seconds ?? "?"}s, ${a.cost_credits} cr)`;
+      return "Foto que ya está cargada en la biblioteca";
+    case "ai_video": {
+      const model = a.model ? VIDEO_MODELS.find((m) => m.model_id === a.model) : undefined;
+      const name = model?.display_name ?? "video con IA";
+      const dur = a.duration_seconds ?? 8;
+      // The audio status changes how the user will perceive the asset, so
+      // it deserves to be in the label itself (not buried in a sub-field).
+      // Stays in plain language, no model_ids, no internal flags.
+      const audioLabel =
+        a.audio_status === "with_native_audio"
+          ? "con audio nativo"
+          : "sin sonido, lo agregás vos después en un editor";
+      return `Video generado con IA (${name}, ${dur}s, ${audioLabel}, ${a.cost_credits} cr)`;
+    }
     case "url_video":
-      return "Video desde URL externa";
+      return "Video del sitio (sin generar nada)";
     case "library_video":
-      return "Video de la biblioteca";
+      return "Video que ya está cargado en la biblioteca";
     case "avatar_lipsync":
-      return `Avatar lipsync (${a.cost_credits} cr)`;
+      return `Avatar virtual hablando a cámara (voz sintética del script, ${a.cost_credits} cr)`;
     case "avatar_video":
-      return `Avatar video multi-escena (${a.cost_credits} cr)`;
+      return `Avatar virtual narrando varias escenas (voz sintética + subtítulos quemados, ${a.cost_credits} cr)`;
   }
 }
 
@@ -4272,21 +4325,22 @@ function displayAssetStrategy(strategy: AssetsStrategy, layout: AssetLayout): st
   if (layout === "single_image" && strategy.image_source) {
     if (strategy.image_source.type === "url") return "Foto del sitio";
     if (strategy.image_source.type === "asset_id") return "Foto ya subida";
-    if (strategy.image_source.type === "ai_generate") return "Imagen AI";
+    if (strategy.image_source.type === "ai_generate") return "Imagen con IA";
   }
   if (layout === "carousel_images" && strategy.carousel_sources) {
     return `${strategy.carousel_sources.length} imágenes (carrusel)`;
   }
   if ((layout === "single_video" || layout === "single_gif") && strategy.video_source) {
     const vs = strategy.video_source;
-    if (vs.type === "url") return "Video ya disponible";
+    if (vs.type === "url") return "Video del sitio";
     if (vs.type === "asset_id") return "Video ya subido";
     if (vs.type === "ai_generate") {
       const model = VIDEO_MODELS.find((m) => m.model_id === vs.model);
-      return model ? `Video AI (${model.display_name})` : "Video AI";
+      const audioBit = model?.audio_capability === "with_native_audio" ? " con audio" : " sin audio";
+      return model ? `Video con IA (${model.display_name}${audioBit})` : "Video con IA";
     }
-    if (vs.type === "ai_avatar_lipsync") return "Avatar lipsync";
-    if (vs.type === "ai_avatar_video") return `Avatar video (${vs.scripts.length} escenas)`;
+    if (vs.type === "ai_avatar_lipsync") return "Avatar habla a cámara";
+    if (vs.type === "ai_avatar_video") return `Avatar narra ${vs.scripts.length} escena${vs.scripts.length === 1 ? "" : "s"}`;
   }
   return "-";
 }

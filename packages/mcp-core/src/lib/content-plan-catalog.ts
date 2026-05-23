@@ -217,6 +217,16 @@ export interface VideoModelInfo {
   // ImageModelInfo. Documented in
   // docs/followr-api/_credits-experiment-2026-05-20/_conclusions.md.
   bucket: "regular" | "premium";
+  // Whether the model outputs a video with a native audio track.
+  // - "with_native_audio": Google Veo 3 family generates dialogue, ambient SFX
+  //   and incidental music as part of the output mp4. The audio comes from
+  //   the model itself; no separate audio generation or muxing is involved.
+  // - "silent_only": the model returns a muted clip. There is NO Followr tool
+  //   today that can mux an external audio track onto an AI-generated clip,
+  //   so when a sub_post uses one of these models the user has to add audio
+  //   manually in a video editor after publishing. The preview surfaces this
+  //   to the user so they don't get a silent Reel as a surprise.
+  audio_capability: "with_native_audio" | "silent_only";
 }
 
 const VIDEO_MODEL_RECOMMENDED_DURATION = 8;
@@ -245,6 +255,7 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
     recommended: true,
     recommended_rank: 0,
     bucket: "premium",
+    audio_capability: "with_native_audio",
   },
   {
     model_id: "veo_3_fast",
@@ -257,6 +268,7 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
     recommended: true,
     recommended_rank: 1,
     bucket: "premium",
+    audio_capability: "with_native_audio",
   },
   {
     model_id: "veo_3.1",
@@ -269,6 +281,7 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
     recommended: true,
     recommended_rank: 2,
     bucket: "premium",
+    audio_capability: "with_native_audio",
   },
   {
     model_id: "veo_3",
@@ -281,6 +294,7 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
     recommended: true,
     recommended_rank: 3,
     bucket: "premium",
+    audio_capability: "with_native_audio",
   },
   {
     // UI display label is just "Wan 2" (no version suffix) despite the
@@ -294,6 +308,7 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
     recommended_for: "default for accounts without followr_plus_enabled; only regular-bucket video model available on every plan",
     recommended: false,
     bucket: "regular",
+    audio_capability: "silent_only",
   },
   {
     model_id: "seedance_1.1_light",
@@ -305,6 +320,7 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
     recommended_for: "available on request when user wants cheaper than the platform default; requires Followr Plus",
     recommended: false,
     bucket: "premium",
+    audio_capability: "silent_only",
   },
   {
     model_id: "seedance_1.1_pro",
@@ -316,6 +332,7 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
     recommended_for: "available on request; requires Followr Plus",
     recommended: false,
     bucket: "premium",
+    audio_capability: "silent_only",
   },
   {
     model_id: "seedance_2.0_fast",
@@ -327,6 +344,7 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
     recommended_for: "available on request; requires Followr Plus",
     recommended: false,
     bucket: "premium",
+    audio_capability: "silent_only",
   },
   {
     model_id: "seedance_2.0",
@@ -338,6 +356,7 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
     recommended_for: "available on request; requires Followr Plus",
     recommended: false,
     bucket: "premium",
+    audio_capability: "silent_only",
   },
   {
     // UI label is "Hailuo 0.2 Standard" (with a dot in the version). The
@@ -351,6 +370,7 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
     recommended_for: "available on request; requires Followr Plus",
     recommended: false,
     bucket: "premium",
+    audio_capability: "silent_only",
   },
   {
     model_id: "hailuo_02_premium",
@@ -362,6 +382,7 @@ export const VIDEO_MODELS: VideoModelInfo[] = [
     recommended_for: "available on request; requires Followr Plus",
     recommended: false,
     bucket: "premium",
+    audio_capability: "silent_only",
   },
 ];
 
