@@ -19,9 +19,13 @@
 //   - The MCP server is stateless. We do NOT call an LLM from this tool.
 //     When the heuristic classifier is ambiguous, we surface candidates
 //     plus signals_for_classification and let the LLM client decide.
-//   - We do NOT mutate Company.description directly. When caching the
-//     detected industry would help future calls, we surface a
-//     cache_suggestion that the agent can apply via update_company.
+//   - We DO persist the detected industry on Company.description (only
+//     the [industry:<id>@<date>] marker) before returning successfully.
+//     This unblocks prepare_content_plan_context / draft_content_plan
+//     which read cached_industry from that marker; before this change
+//     the agent had to call update_company itself, but no generic
+//     update_company tool is exposed, so the cache never got written
+//     and downstream planning tools blocked on a null cache forever.
 //   - Extraction is per-profile declarative: IndustryProfile.extractors
 //     tells us what fields to fetch and how. The actual extraction logic
 //     lives in lib/extractors and is industry-agnostic.
@@ -175,6 +179,22 @@ function containsWord(haystack: string, needle: string): boolean {
 
 const CACHE_SUFFIX_RE = /\[industry:([a-z_]+)@(\d{4}-\d{2}-\d{2})\]/i;
 const CACHE_TTL_DAYS = 30;
+
+/**
+ * Append (or replace) the `[industry:<id>@<date>]` marker on a company
+ * description. Used by deep_research to persist the cache itself instead
+ * of asking the agent to call update_company (the agent has no exposed
+ * update_company tool, so leaving this to the agent created a structural
+ * dead-end where downstream planning tools blocked on a missing cache the
+ * agent could not write).
+ */
+function applyCacheSuffixToDescription(currentDescription: string | null, suffix: string): string {
+  const desc = currentDescription ?? "";
+  if (CACHE_SUFFIX_RE.test(desc)) {
+    return desc.replace(CACHE_SUFFIX_RE, suffix);
+  }
+  return desc.length > 0 ? `${desc.trimEnd()}\n\n${suffix}` : suffix;
+}
 
 interface CachedIndustry {
   id: IndustryId;
@@ -535,7 +555,7 @@ OUTPUT:
 - sufficiency: complete | partial | thin, with recommendations to enrich data.
 - hints_for_llm_fallback (only when sufficiency is thin and ecommerce extraction failed): platform_detected, sitemap_urls_to_try, og_image, next_steps_for_agent so the LLM can recover via WebFetch or user prompts.
 - meta: extractors_succeeded, extractors_failed, parser_used, requires_js_render, platform_detected, sitemap_diagnostics, duration_ms.
-- cache_suggestion (optional): when the agent decides to persist the detected industry across conversations, it can append the provided suffix to Company.description via update_company. The MCP does NOT mutate Company itself.
+- cache_suggestion: deep_research now persists the [industry:<id>@<date>] marker on Company.description automatically before returning, so subsequent prepare_content_plan_context / draft_content_plan calls read cached_industry and skip the re-classification. The suffix in cache_suggestion.suffix_to_append is what was applied; cache_suggestion.persisted is true when the write succeeded (false + persistence_error when not, in which case the planning tools will trigger another deep_research instead of reading from cache). The agent does NOT need to call any follow-up tool to apply the cache.
 
 LIMITATIONS:
 - Pure custom SPAs without documented APIs and without a sitemap may still return empty. The tool surfaces hints_for_llm_fallback in that case so the LLM can try its own WebFetch on specific URLs.
@@ -760,6 +780,32 @@ LIMITATIONS:
           }
         }
 
+        // 12.5. Persist the industry cache to Company.description so that
+        //       downstream planning tools (prepare_content_plan_context,
+        //       draft_content_plan) can read cached_industry on subsequent
+        //       calls without re-classifying or asking the agent to write
+        //       it back manually. The MCP exposes no generic update_company
+        //       tool to the agent on purpose (Company has many sensitive
+        //       fields); leaving the cache persistence to the agent created
+        //       a structural block where draft_content_plan refused to run
+        //       because cached_industry was null and the agent had no tool
+        //       to fix it. We do it here, where we know exactly the right
+        //       suffix and we are already paying the deep_research cost.
+        const suffix = buildCacheSuffix(profile.id);
+        let cachePersisted: { ok: true } | { ok: false; reason: string };
+        try {
+          const newDescription = applyCacheSuffixToDescription(description, suffix);
+          if (newDescription !== description) {
+            await client.updateCompany(company_id, { description: newDescription });
+          }
+          cachePersisted = { ok: true };
+        } catch (err) {
+          cachePersisted = {
+            ok: false,
+            reason: err instanceof Error ? err.message : String(err),
+          };
+        }
+
         // 13. Build response.
         const response = buildFullResult({
           company,
@@ -777,6 +823,7 @@ LIMITATIONS:
           extraPagesCount: extraPages.length,
           platform,
           sitemapDiagnostics: sitemapResult?.diagnostics ?? null,
+          cachePersisted,
           llmFallbackHints:
             productsAfterExtractors === 0 &&
             isEcommerceProfile &&
@@ -1158,6 +1205,7 @@ interface BuildFullResultInput {
     sitemap_urls_to_try: string[];
     next_steps_for_agent: string;
   } | null;
+  cachePersisted: { ok: true } | { ok: false; reason: string };
 }
 
 function buildFullResult(input: BuildFullResultInput) {
@@ -1228,7 +1276,11 @@ function buildFullResult(input: BuildFullResultInput) {
     cache_suggestion: {
       field: "description",
       suffix_to_append: buildCacheSuffix(input.profile.id),
-      note: "Append this suffix to Company.description via update_company to cache the classification for 30 days. Optional; deep_research will re-classify if missing or expired.",
+      note: input.cachePersisted.ok
+        ? "Already applied. deep_research wrote this suffix to Company.description so prepare_content_plan_context / draft_content_plan will read cached_industry on the next call without further action from the agent. The suffix is shown here for transparency only."
+        : `deep_research attempted to persist this suffix to Company.description and FAILED (${input.cachePersisted.reason}). The next planning call will re-run deep_research instead of reading the cache. Consider retrying deep_research with force_refresh: false to attempt the persistence again, or surface the failure to the user.`,
+      persisted: input.cachePersisted.ok,
+      persistence_error: input.cachePersisted.ok ? null : input.cachePersisted.reason,
     },
   };
 }
