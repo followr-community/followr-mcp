@@ -41,6 +41,7 @@ import {
   computeSetupStatus,
   hasBrandIdentityMarker,
   parseBrandIdentityFromDescription,
+  pickBrandReferenceAssetIds,
   reconcileBrandIdentityState,
   stripBrandIdentityFromDescription,
   tagAssetInIdentity,
@@ -1435,10 +1436,23 @@ NEXT STEP: after manufacture, call finalize_brand_templates with user's per-asse
           aspectRatio: "1:1" | "4:3" | "16:9" | "3:4" | "9:16";
           refUrls: string[];
         };
+        const refsByCategory = new Map<TemplateCategory, string[]>();
+        await Promise.all(
+          input.categories.map(async (category) => {
+            const refUrls = await pickReferenceUrlsForCategory(
+              client,
+              input.company_id,
+              identity,
+              assetIdToUrl,
+              category,
+            );
+            refsByCategory.set(category, refUrls);
+          }),
+        );
         const jobs: Job[] = [];
         for (const category of input.categories) {
           const tag = templateTagForCategory(category);
-          const refUrls = pickReferenceUrlsForCategory(identity, assetIdToUrl, category);
+          const refUrls = refsByCategory.get(category) ?? [];
           for (let v = 1; v <= input.templates_per_category; v += 1) {
             jobs.push({ category, variation: v, tag, aspectRatio: input.aspect_ratio, refUrls });
           }
@@ -1450,6 +1464,9 @@ NEXT STEP: after manufacture, call finalize_brand_templates with user's per-asse
           status: "succeeded" | "failed";
           ai_result_id: number | null;
           asset_id: number | null;
+          /** Public CDN URL of the generated template image (Followr AI result URL).
+           *  Used to render thumbnails for the user via markdown_preview. */
+          asset_url: string | null;
           tag: BrandTag;
           prompt_excerpt: string;
           error: string | null;
@@ -1484,6 +1501,7 @@ NEXT STEP: after manufacture, call finalize_brand_templates with user's per-asse
                     status: "failed",
                     ai_result_id: final.id,
                     asset_id: null,
+                    asset_url: null,
                     tag: job.tag,
                     prompt_excerpt: prompt.slice(0, 200),
                     error: final.status_message ?? `Generation status: ${final.status}`,
@@ -1499,6 +1517,7 @@ NEXT STEP: after manufacture, call finalize_brand_templates with user's per-asse
                     status: "failed",
                     ai_result_id: final.id,
                     asset_id: null,
+                    asset_url: null,
                     tag: job.tag,
                     prompt_excerpt: prompt.slice(0, 200),
                     error: "Generation completed but no image URL was returned.",
@@ -1526,6 +1545,7 @@ NEXT STEP: after manufacture, call finalize_brand_templates with user's per-asse
                   status: "succeeded",
                   ai_result_id: final.id,
                   asset_id: asset.id,
+                  asset_url: imageUrl,
                   tag: job.tag,
                   prompt_excerpt: prompt.slice(0, 200),
                   error: null,
@@ -1537,6 +1557,7 @@ NEXT STEP: after manufacture, call finalize_brand_templates with user's per-asse
                   status: "failed",
                   ai_result_id: null,
                   asset_id: null,
+                  asset_url: null,
                   tag: job.tag,
                   prompt_excerpt: prompt.slice(0, 200),
                   error: err instanceof Error ? err.message : String(err),
@@ -1554,6 +1575,7 @@ NEXT STEP: after manufacture, call finalize_brand_templates with user's per-asse
                 status: "failed",
                 ai_result_id: null,
                 asset_id: null,
+                asset_url: null,
                 tag: BRAND_TAGS.COVER_TEMPLATE,
                 prompt_excerpt: "",
                 error: r.reason instanceof Error ? r.reason.message : String(r.reason),
@@ -1622,6 +1644,56 @@ NEXT STEP: after manufacture, call finalize_brand_templates with user's per-asse
         const failedCount = allResults.length - succeededCount;
         const actualCost = succeededCount * costPerImage;
 
+        // Build a renderable markdown preview of every successful template
+        // so the agent can paste it verbatim into the user-facing message.
+        // claude.ai renders ![alt](url) inline in the agent's prose, which
+        // is the most portable way to surface thumbnails today (no MCP
+        // image content blocks needed; works in any client that handles
+        // markdown). Grouped by category so the user sees the variations
+        // side by side. The agent should literally paste markdown_preview
+        // when asking the user which templates to keep.
+        const successfulResults = allResults.filter(
+          (r) => r.status === "succeeded" && r.asset_url !== null,
+        );
+        const markdownPreviewLines: string[] = [];
+        if (successfulResults.length > 0) {
+          markdownPreviewLines.push(
+            `## Templates manufacturados (${successfulResults.length})`,
+            "",
+            "Mirá cada uno y avisame cuáles rechazás (los demás quedan aprobados en tu biblioteca).",
+            "",
+          );
+          const byCategory = new Map<TemplateCategory, JobResult[]>();
+          for (const r of successfulResults) {
+            const arr = byCategory.get(r.category) ?? [];
+            arr.push(r);
+            byCategory.set(r.category, arr);
+          }
+          for (const [cat, items] of byCategory) {
+            markdownPreviewLines.push(`### ${cat.toUpperCase()}`);
+            for (const item of items) {
+              markdownPreviewLines.push(
+                `- Variación ${String.fromCharCode(64 + item.variation)} · asset \`${item.asset_id ?? "?"}\`  `,
+                `  ![${cat}-v${item.variation}](${item.asset_url ?? ""})`,
+              );
+            }
+            markdownPreviewLines.push("");
+          }
+        }
+        const markdownPreview = markdownPreviewLines.join("\n");
+
+        // Pre-built decisions array the agent can mutate to call
+        // finalize_brand_templates. Starts as all-approved; the agent
+        // flips entries to "reject" based on user input and passes the
+        // whole array verbatim to finalize_brand_templates. Saves the
+        // agent from having to reconstruct asset_ids manually.
+        const decisionsTemplate = successfulResults.map((r) => ({
+          asset_id: r.asset_id,
+          decision: "approve" as const,
+          category: r.category,
+          variation: r.variation,
+        }));
+
         return {
           content: [
             {
@@ -1643,14 +1715,16 @@ NEXT STEP: after manufacture, call finalize_brand_templates with user's per-asse
                   aspect_ratio: input.aspect_ratio,
                   generated_assets: allResults,
                   updated_identity: updatedIdentity,
+                  markdown_preview: markdownPreview,
+                  decisions_template: decisionsTemplate,
                   user_facing_summary:
                     failedCount === 0
                       ? `Generé ${succeededCount} templates AI usando ${resolvedModel}. Costo total: ${actualCost} créditos. Te los muestro para que apruebes cuáles quedan en tu biblioteca y cuáles descarto.`
                       : `Generé ${succeededCount} de ${jobs.length} templates (${failedCount} fallaron). Costo facturado: ${actualCost} créditos (las fallidas NO cuentan). Te muestro los OK para que apruebes; las fallidas las puedo reintentar después.`,
                   _assistant_guidance: {
-                    next_step: "show_thumbnails_then_call_finalize",
+                    next_step: "paste_markdown_preview_then_call_finalize",
                     instructions:
-                      "Mostrale al usuario los thumbnails de los templates generados (1 a 1 o en grid). Por cada uno pedile que apruebe (queda en __brand_templates) o rechace (se borra). Recolectá decisiones y llamá finalize_brand_templates(company_id, decisions). El bloque ya está actualizado con los tags; finalize ajusta los counts según rejections.",
+                      "PEGÁ markdown_preview tal cual en tu próxima respuesta al usuario (el cliente renderiza los thumbnails inline). Pedile que mire las imágenes y te avise cuáles rechaza. Cuando responda, tomá decisions_template (todas vienen como 'approve' por default), cambiá decision a 'reject' en las que el usuario rechazó, y llamá finalize_brand_templates(company_id, decisions). El bloque ya está actualizado con los tags; finalize ajusta los counts y borra del library las rechazadas. NUNCA menciones al usuario los términos 'asset_id', 'decisions_template' ni 'tag_map'; hablale en lenguaje natural ('los 12 templates', 'las variaciones de cover', 'borrá las que no te gusten').",
                   },
                 },
                 null,
@@ -3042,63 +3116,70 @@ function perImageCostFor(modelId: string): number {
  *   hero: logo + hero + aspirational
  *
  * Capped at 5 references to fit nano_banana_2's effective input limit.
+ *
+ * Live-read: pickBrandReferenceAssetIds hits listAssets per tag, so manual
+ * uploads to __brand_elements / __brand_templates (via the Followr UI) are
+ * picked up immediately. The JSON asset_tag_map is metadata only; the folder
+ * is the source of truth. This mirrors the live-read picker used by the
+ * content plan resolver (content-plan.ts:pickBrandReferenceUrls).
  */
-function pickReferenceUrlsForCategory(
+async function pickReferenceUrlsForCategory(
+  client: FollowrClient,
+  companyId: number,
   identity: BrandVisualIdentity,
   assetIdToUrl: Map<number, string>,
   category: TemplateCategory,
-): string[] {
+): Promise<string[]> {
   const out: string[] = [];
-  const addByTag = (tag: BrandTag, limit: number) => {
+  const seen = new Set<string>();
+  const addByTag = async (tag: BrandTag, limit: number): Promise<void> => {
     let added = 0;
-    for (const [assetIdStr, tags] of Object.entries(identity.asset_tag_map)) {
+    const ids = await pickBrandReferenceAssetIds(client, companyId, identity, tag);
+    for (const id of ids) {
       if (added >= limit) break;
-      if (!tags.includes(tag)) continue;
-      const id = Number.parseInt(assetIdStr, 10);
-      if (!Number.isFinite(id)) continue;
       const url = assetIdToUrl.get(id);
-      if (!url) continue;
-      if (out.includes(url)) continue;
+      if (!url || seen.has(url)) continue;
       out.push(url);
+      seen.add(url);
       added += 1;
     }
   };
 
   // Logo always (max 1).
-  addByTag(BRAND_TAGS.LOGO, 1);
+  await addByTag(BRAND_TAGS.LOGO, 1);
 
   // Category-specific.
   switch (category) {
     case "cover":
-      addByTag(BRAND_TAGS.HERO, 2);
-      addByTag(BRAND_TAGS.PATTERN, 1);
+      await addByTag(BRAND_TAGS.HERO, 2);
+      await addByTag(BRAND_TAGS.PATTERN, 1);
       break;
     case "step":
-      addByTag(BRAND_TAGS.ICON, 2);
-      addByTag(BRAND_TAGS.PATTERN, 1);
+      await addByTag(BRAND_TAGS.ICON, 2);
+      await addByTag(BRAND_TAGS.PATTERN, 1);
       break;
     case "cta":
-      addByTag(BRAND_TAGS.PATTERN, 2);
-      addByTag(BRAND_TAGS.ICON, 1);
+      await addByTag(BRAND_TAGS.PATTERN, 2);
+      await addByTag(BRAND_TAGS.ICON, 1);
       break;
     case "feature":
-      addByTag(BRAND_TAGS.PRODUCT, 2);
-      addByTag(BRAND_TAGS.HERO, 1);
+      await addByTag(BRAND_TAGS.PRODUCT, 2);
+      await addByTag(BRAND_TAGS.HERO, 1);
       break;
     case "quote":
       // Quote slides are typography-heavy; reference logo + character only.
-      addByTag(BRAND_TAGS.CHARACTER, 1);
+      await addByTag(BRAND_TAGS.CHARACTER, 1);
       break;
     case "hero":
-      addByTag(BRAND_TAGS.HERO, 2);
-      addByTag(BRAND_TAGS.ASPIRATIONAL, 1);
+      await addByTag(BRAND_TAGS.HERO, 2);
+      await addByTag(BRAND_TAGS.ASPIRATIONAL, 1);
       break;
   }
 
   // Fallback: if we didn't reach at least 2 refs (e.g. brand has only logo),
   // pad with any aspirational refs we have to give the model SOMETHING.
   if (out.length < 2) {
-    addByTag(BRAND_TAGS.ASPIRATIONAL, 2);
+    await addByTag(BRAND_TAGS.ASPIRATIONAL, 2);
   }
 
   return out.slice(0, 5);
