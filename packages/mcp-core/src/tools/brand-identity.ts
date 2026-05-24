@@ -43,9 +43,11 @@ import {
   parseBrandIdentityFromDescription,
   pickBrandReferenceAssetIds,
   reconcileBrandIdentityState,
+  resolveBrandTag,
   stripBrandIdentityFromDescription,
   tagAssetInIdentity,
 } from "../lib/brand-identity.js";
+import { sanitizeImageModelPref } from "../lib/content-plan-catalog.js";
 import { resolveDriver } from "../lib/driver-resolver.js";
 import {
   type ProposedAction,
@@ -1315,7 +1317,7 @@ CATEGORIES generated (default 6, configurable):
 - cta (CTA_TEMPLATE): call-to-action closing slide
 - feature (FEATURE_TEMPLATE): single feature/product spotlight
 - quote (QUOTE_TEMPLATE): quote / testimonial layout
-- hero (HERO_TEMPLATE): hero / launch slide
+- launch (LAUNCH_TEMPLATE): launch / flagship slide (renamed from "hero" on 2026-05-24 to disambiguate against the HERO asset tag; the legacy "hero" identifier is still accepted as input for backwards compatibility but the canonical name is "launch")
 
 GENERATION FLOW per template:
 1. Build a prompt that combines: brand brief (from the block) + palette hex codes + typography hint + anti-patterns + category-specific layout instructions.
@@ -1351,13 +1353,17 @@ NEXT STEP: after manufacture, call finalize_brand_templates with user's per-asse
               "cta",
               "feature",
               "quote",
+              "launch",
+              // Legacy alias for "launch". Accepted on input and normalized to
+              // "launch" internally so already-shipped agent prompts keep
+              // working through the rename.
               "hero",
             ]),
           )
           .max(6)
-          .default(["cover", "step", "cta", "feature", "quote", "hero"])
+          .default(["cover", "step", "cta", "feature", "quote", "launch"])
           .describe(
-            "Subset of categories to generate. Default is all 6. Skip categories the brand definitely doesn't need (e.g. omit 'quote' for a product-only brand).",
+            "Subset of categories to generate. Default is all 6 (cover, step, cta, feature, quote, launch). Skip categories the brand definitely doesn't need (e.g. omit 'quote' for a product-only brand). 'hero' is accepted as a legacy alias for 'launch' and gets normalized internally.",
           ),
         model_override: z
           .string()
@@ -1408,15 +1414,27 @@ NEXT STEP: after manufacture, call finalize_brand_templates with user's per-asse
         // provider. Verified empirically (see driver-resolver.ts header).
         // resolveDriver consults explicit input -> prefs -> catalog hints.
         const prefs = (company as Company & { ai_preferences?: AiPreferences | null }).ai_preferences;
+        // sanitizeImageModelPref filters out stale ids (e.g. "dall-e-3"
+        // persisted on older Followr UI versions) so the fallback to
+        // nano_banana_2 actually takes over instead of leaking a value the
+        // backend would reject with HTTP 422 "selected model is invalid".
         const resolvedModel =
-          input.model_override ?? prefs?.image_model ?? "nano_banana_2";
+          input.model_override ?? sanitizeImageModelPref(prefs?.image_model) ?? "nano_banana_2";
         const resolvedDriver = resolveDriver({
           prefs: prefs ?? undefined,
           modality: "image",
           model: resolvedModel,
         });
         const costPerImage = perImageCostFor(resolvedModel);
-        const totalTemplates = input.templates_per_category * input.categories.length;
+        // Normalize the input categories (which may include the legacy "hero"
+        // alias) into the canonical TemplateCategory set, and dedupe in case
+        // the caller passed both "hero" and "launch". The user-facing output
+        // (per-category results, cost lines) is built from this normalized
+        // list so the response always speaks the new vocabulary.
+        const normalizedCategories: TemplateCategory[] = Array.from(
+          new Set(input.categories.map((c) => normalizeTemplateCategory(c as RawTemplateCategory))),
+        );
+        const totalTemplates = input.templates_per_category * normalizedCategories.length;
         const totalCost = totalTemplates * costPerImage;
 
         // 3. Pull asset library to resolve reference_image_urls by tag.
@@ -1461,7 +1479,7 @@ NEXT STEP: after manufacture, call finalize_brand_templates with user's per-asse
         };
         const refsByCategory = new Map<TemplateCategory, string[]>();
         await Promise.all(
-          input.categories.map(async (category) => {
+          normalizedCategories.map(async (category) => {
             const refUrls = await pickReferenceUrlsForCategory(
               client,
               input.company_id,
@@ -1473,7 +1491,7 @@ NEXT STEP: after manufacture, call finalize_brand_templates with user's per-asse
           }),
         );
         const jobs: Job[] = [];
-        for (const category of input.categories) {
+        for (const category of normalizedCategories) {
           const tag = templateTagForCategory(category);
           const refUrls = refsByCategory.get(category) ?? [];
           for (let v = 1; v <= input.templates_per_category; v += 1) {
@@ -2085,7 +2103,7 @@ LIMITATIONS v1:
                   _assistant_guidance: {
                     next_step: "show_candidates_then_call_apply",
                     instructions:
-                      "Mostrale al usuario los thumbnails de cada candidato (asset_thumbnail_url si existe, sino asset_url). Por cada uno preguntá: agregar como template? Si sí, qué tag (default suggested_tag, opciones: cover-template, step-template, cta-template, feature-template, quote-template, hero-template)? Si no, skip. Recolectá decisiones en formato { asset_id, accept: bool, target_tag: BrandTag } y llamá apply_brand_template_refresh. Templates ya tagged (already_tagged_in_brand=true) los podés saltar por default; mencionalo solo si el usuario quiere re-categorizar.",
+                      "Mostrale al usuario los thumbnails de cada candidato (asset_thumbnail_url si existe, sino asset_url). Por cada uno preguntá: agregar como template? Si sí, qué tag (default suggested_tag, opciones: cover-template, step-template, cta-template, feature-template, quote-template, launch-template)? Si no, skip. Recolectá decisiones en formato { asset_id, accept: bool, target_tag: BrandTag } y llamá apply_brand_template_refresh. Templates ya tagged (already_tagged_in_brand=true) los podés saltar por default; mencionalo solo si el usuario quiere re-categorizar.",
                   },
                 },
                 null,
@@ -2131,7 +2149,7 @@ UPDATES posts_count_at_last_sync and last_brand_sync_at on the block, which sile
                 .max(60)
                 .optional()
                 .describe(
-                  "BrandTag value to assign when accept=true. e.g. 'brand:cover-template'. Defaults to BRAND_TAGS.COVER_TEMPLATE if omitted.",
+                  "BrandTag value to assign when accept=true. e.g. 'brand:cover-template' or 'brand:launch-template'. Defaults to BRAND_TAGS.COVER_TEMPLATE if omitted. The legacy 'brand:hero-template' slug is still accepted as an alias for 'brand:launch-template'.",
                 ),
             }),
           )
@@ -2173,16 +2191,21 @@ UPDATES posts_count_at_last_sync and last_brand_sync_at on the block, which sile
             });
             continue;
           }
-          const tag: BrandTag = (d.target_tag as BrandTag) ?? BRAND_TAGS.COVER_TEMPLATE;
-          // Validate tag is in the known BrandTag enum.
-          const validTags = Object.values(BRAND_TAGS) as string[];
-          if (!validTags.includes(tag)) {
+          // Validate tag via resolveBrandTag so callers can pass either a
+          // current canonical slug or a legacy alias (e.g.
+          // 'brand:hero-template' -> LAUNCH_TEMPLATE). The persisted tag is
+          // always the canonical resolved value, so future reads do not need
+          // the alias map for assets written here.
+          const rawTag = d.target_tag ?? BRAND_TAGS.COVER_TEMPLATE;
+          const tag: BrandTag | null = resolveBrandTag(rawTag);
+          if (tag === null) {
+            const validTags = Object.values(BRAND_TAGS) as string[];
             decisionReport.push({
               asset_id: d.asset_id,
               accept: true,
               applied: "skipped_invalid_tag",
               tags_added: [],
-              error: `target_tag "${tag}" is not a recognized BrandTag value. Allowed: ${validTags.join(", ")}.`,
+              error: `target_tag "${rawTag}" is not a recognized BrandTag value. Allowed: ${validTags.join(", ")}.`,
             });
             continue;
           }
@@ -3081,7 +3104,17 @@ function countByIntent(uploaded: Array<{ folder_intent: "templates" | "elements"
 // Manufacture (F2.8) helpers
 // ──────────────────────────────────────────────────────────
 
-type TemplateCategory = "cover" | "step" | "cta" | "feature" | "quote" | "hero";
+// Canonical category names used internally. "launch" replaced "hero" on
+// 2026-05-24 to remove the ambiguity with BRAND_TAGS.HERO (the asset tag for
+// real hero shots from the site). RawTemplateCategory below preserves the
+// legacy "hero" input so older agent prompts that pass "hero" keep working
+// during the transition; we map it to "launch" before doing anything with it.
+type TemplateCategory = "cover" | "step" | "cta" | "feature" | "quote" | "launch";
+type RawTemplateCategory = TemplateCategory | "hero";
+
+function normalizeTemplateCategory(raw: RawTemplateCategory): TemplateCategory {
+  return raw === "hero" ? "launch" : raw;
+}
 
 function templateTagForCategory(category: TemplateCategory): BrandTag {
   switch (category) {
@@ -3095,8 +3128,8 @@ function templateTagForCategory(category: TemplateCategory): BrandTag {
       return BRAND_TAGS.FEATURE_TEMPLATE;
     case "quote":
       return BRAND_TAGS.QUOTE_TEMPLATE;
-    case "hero":
-      return BRAND_TAGS.HERO_TEMPLATE;
+    case "launch":
+      return BRAND_TAGS.LAUNCH_TEMPLATE;
   }
 }
 
@@ -3132,12 +3165,12 @@ function perImageCostFor(modelId: string): number {
 /**
  * Pick reference image URLs for a template category. Always includes the
  * logo if present. Adds category-specific assets:
- *   cover: logo + hero(s)
- *   step: logo + icon(s) + pattern
- *   cta: logo + pattern
+ *   cover:  logo + hero(s)
+ *   step:   logo + icon(s) + pattern
+ *   cta:    logo + pattern
  *   feature: logo + product + hero
- *   quote: logo only
- *   hero: logo + hero + aspirational
+ *   quote:  logo only
+ *   launch: logo + hero + aspirational
  *
  * Capped at 5 references to fit nano_banana_2's effective input limit.
  *
@@ -3194,7 +3227,12 @@ async function pickReferenceUrlsForCategory(
       // Quote slides are typography-heavy; reference logo + character only.
       await addByTag(BRAND_TAGS.CHARACTER, 1);
       break;
-    case "hero":
+    case "launch":
+      // Launch / flagship pieces: pull HERO asset references (real hero
+      // shots from the site) plus an aspirational reference for the
+      // cinematic mood. Note: BRAND_TAGS.HERO here is the asset tag, not
+      // the renamed template tag (BRAND_TAGS.LAUNCH_TEMPLATE); both are
+      // intentionally referenced from this case.
       await addByTag(BRAND_TAGS.HERO, 2);
       await addByTag(BRAND_TAGS.ASPIRATIONAL, 1);
       break;
@@ -3263,8 +3301,8 @@ const TEMPLATE_CATEGORY_BRIEFS: Record<TemplateCategory, string> = {
     "Single feature highlight slide. One prominent visual element (product / capability / mockup) in the focal center. Supporting space around it for caption text (LEFT BLANK). Brand palette accents. Composition draws the eye to the feature.",
   quote:
     "Quote / testimonial slide. Large quote-marks visible at top-left or as decoration. Central area for the quote text (LEFT BLANK). Subtle attribution space at the bottom. Typography-heavy aesthetic. Palette mostly neutral with one brand accent.",
-  hero:
-    "Hero / launch slide. Cinematic composition. Large bold visual element (product, scene, abstract shape) center or left. Bold headline space (LEFT BLANK). Brand palette as dominant background. Should feel like a magazine cover or product launch announcement.",
+  launch:
+    "Launch / flagship slide. Cinematic composition. Large bold visual element (product, scene, abstract shape) center or left. Bold headline space (LEFT BLANK). Brand palette as dominant background. Should feel like a magazine cover or product launch announcement. Format-agnostic: works as a stand-alone single-image post, as the cover of a carousel, or as the poster frame for a video.",
 };
 
 const TEMPLATE_VARIATION_HINTS = [

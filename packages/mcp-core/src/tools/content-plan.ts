@@ -42,6 +42,7 @@ import {
   PLANNING_STRATEGY,
   VIDEO_MODELS,
   compatibilityFor,
+  sanitizeImageModelPref,
 } from "../lib/content-plan-catalog.js";
 import {
   BRAND_TAGS,
@@ -59,6 +60,10 @@ import {
 } from "../lib/industry-profiles/index.js";
 import { normalizePreferences } from "../lib/normalize-preferences.js";
 import { getAiPreferences } from "../lib/preferences.js";
+import {
+  ensureIndustryClassified,
+  type EnsureIndustryClassifiedResult,
+} from "./research.js";
 import { localDateTimeToUtcIso, resolveTimezone } from "../lib/timezone.js";
 import {
   type AssetLayout,
@@ -464,7 +469,7 @@ USE THIS at the start of any content-planning task (a week of posts, a campaign,
 
 OUTPUT: a context_id you pass to draft_content_plan. The context expires after 2 hours; re-call if you come back later.
 
-MUTATION: none. Read-only. Safe to call multiple times if the user changes company or window.
+MUTATION: minimal. Read-only EXCEPT for one defensive write: when auto_classify_industry is true (default) and the company has no cached industry classification on Company.description, this tool runs a fast home-page fetch + heuristic classify + persists the [industry:<id>@<date>] suffix. That single write lifts the hard block on draft_content_plan without requiring an extra deep_research round-trip. Set auto_classify_industry: false to opt out of that behaviour. Safe to call multiple times: a fresh cache short-circuits the classify in ~1ms.
 
 IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. After receiving this context: (1) identify what user intent is still ambiguous (window, posts per day, networks, theme, promo, brand voice creation); (2) ask the user ONE multi-decision question; (3) ONLY THEN call draft_content_plan with your crafted plan_items array. Do not skip to drafting in the same turn.`,
       inputSchema: {
@@ -480,9 +485,16 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
           .describe(
             "Default true. Fetches the company's website (if set on the Company resource) and returns a shallow summary (title, meta description, og:* tags, top headings). Skip with false only if the website is known to be unreachable.",
           ),
+        auto_classify_industry: z
+          .boolean()
+          .optional()
+          .default(true)
+          .describe(
+            "Default true. When no [industry:<id>@<date>] suffix is present on Company.description, this tool runs a fast classification pass (fetch home page + heuristic classifier + persist suffix) BEFORE returning, so the context comes back with cached_industry already populated and downstream draft_content_plan does not hard-block on a missing cache. The fast pass takes ~3-8 seconds and intentionally skips the deep_research extractors (no product catalog crawl). Set false when you want to control the classification flow manually (e.g. you plan to call deep_research with depth=thorough yourself right after). Cache hits short-circuit immediately regardless of this flag; this only controls behaviour on cache miss.",
+          ),
       },
     },
-    async ({ company, include_website_summary }) => {
+    async ({ company, include_website_summary, auto_classify_industry }) => {
       // 1. Resolve company first; everything else depends on company_id.
       let companyResolved: Company;
       let disambiguation: Company[] | undefined;
@@ -669,24 +681,74 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
       const imageVideoRemaining = budgets?.ai_image_and_video_budget.remaining ?? Number.POSITIVE_INFINITY;
       const followrPlusEnabled = budgets?.followr_plus_enabled ?? false;
       // Read company AI preferences so we can highlight the user-configured
-      // default model in the catalog response (recommended_rank 0).
-      const companyPrefs = (companyResolved as Company & { ai_preferences?: AiPreferences }).ai_preferences;
+      // default model in the catalog response (recommended_rank 0). The
+      // image_model field may carry a stale id (e.g. "dall-e-3" left over
+      // from an older version of the Followr UI). When it does, we strip it
+      // from the prefs passed into annotateImageModels so no entry gets
+      // promoted to rank 0 based on an invalid string, and we surface a
+      // dedicated warning to the agent so the user can clean up the
+      // preference from the Followr UI. Without this, downstream consumers
+      // (ai-results, manufacture, avatars) leak the stale value to the AI
+      // image API, which rejects the call with HTTP 422 "selected model is
+      // invalid" the first time the user tries to generate.
+      const rawCompanyPrefs = (companyResolved as Company & { ai_preferences?: AiPreferences }).ai_preferences;
+      const rawImageModelPref = rawCompanyPrefs?.image_model ?? null;
+      const sanitizedImageModelPref = sanitizeImageModelPref(rawImageModelPref);
+      const imageModelPrefInvalid =
+        rawImageModelPref !== null &&
+        rawImageModelPref !== "" &&
+        sanitizedImageModelPref === null;
+      const companyPrefs: AiPreferences | undefined = rawCompanyPrefs
+        ? imageModelPrefInvalid
+          ? { ...rawCompanyPrefs, image_model: undefined }
+          : rawCompanyPrefs
+        : undefined;
       const videoModels = annotateVideoModels(imageVideoRemaining, followrPlusEnabled, companyPrefs);
       const imageModels = annotateImageModels(imageVideoRemaining, followrPlusEnabled, companyPrefs);
+      const aiPreferencesValidation = imageModelPrefInvalid
+        ? {
+            image_model: {
+              raw_value: rawImageModelPref,
+              is_valid: false,
+              reason: `"${rawImageModelPref}" is not a known image model id in the current Followr catalog. Likely a stale value persisted by an older version of the Followr UI.`,
+              effective_fallback: "nano_banana_2",
+              recommended_user_message:
+                `Detecté que la marca tiene seteado como modelo de imagen default un identificador que ya no existe en Followr ("${rawImageModelPref}"). Lo ignoré para esta sesión y usé Google Nano Banana 2 como fallback. Recomiendo entrar a la UI de Followr (Company Settings → AI Images) y elegir uno de los modelos vigentes para que no vuelva a pasar.`,
+            },
+          }
+        : null;
 
       // Detect deep_research cache marker on description. deep_research
       // suggests appending "[industry:<id>@<YYYY-MM-DD>]" to Company.description
       // via update_company so subsequent sessions can read the cached
       // classification without re-fetching. When present, we surface the
-      // cached industry directly. When missing, we emit a warning telling the
-      // agent to call deep_research BEFORE drafting (Rule 19 in instructions).
+      // cached industry directly. When missing, we used to emit a warning
+      // and let the agent decide; that produced a multi-round-trip flow
+      // (draft_content_plan would hard-block on the missing cache, the
+      // agent would call deep_research, then re-call this tool to get a
+      // fresh context_id). To collapse that, when auto_classify_industry
+      // is true (default) AND no cache exists, we run a fast in-tool
+      // classification + persistence cycle here. The agent still has the
+      // option to call deep_research afterwards if it wants the full
+      // catalog data (product images, menu items, etc.); ensureIndustry
+      // ClassifiedHelper deliberately stays minimal (industry id only).
       const description = companyResolved.description ?? "";
       const cacheRe = /\[industry:([a-z_]+)@(\d{4}-\d{2}-\d{2})\]/i;
       const cacheMatch = cacheRe.exec(description);
-      const cachedIndustry =
+      let cachedIndustry: { industry_id: string; cached_at: string } | null =
         cacheMatch && cacheMatch[1] && cacheMatch[2]
           ? { industry_id: cacheMatch[1], cached_at: cacheMatch[2] }
           : null;
+      let autoIndustryResult: EnsureIndustryClassifiedResult | null = null;
+      if (cachedIndustry === null && auto_classify_industry !== false) {
+        autoIndustryResult = await ensureIndustryClassified(client, company_id);
+        if (autoIndustryResult.classified && autoIndustryResult.industry_id !== null) {
+          cachedIndustry = {
+            industry_id: autoIndustryResult.industry_id,
+            cached_at: new Date().toISOString().slice(0, 10),
+          };
+        }
+      }
 
       // Derive recommended_video_strategy from the cached industry profile.
       // When the agent knows the industry, the profile.video_strategy block
@@ -1012,7 +1074,7 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
       const clarifyingFlowInstructions = [
         "EXECUTION ORDER (read carefully):",
         "0. PRECONDITION CHECK. If you did NOT call get_company_creative_brief earlier in this conversation for this company, do that FIRST and then re-call prepare_content_plan_context. The brief carries the brand voice prompts per network, audience_types, tones, language and existing tags that you need to ground every plan_item. Without it you end up improvising audience and tone from the company description scrape, which silently overrides the user's explicit brand voice. Real failure mode (PostApprove 2026-05-23): the agent skipped get_company_creative_brief and ad-libbed 'audience: agencies, social media managers' from the description; it happened to match but only by luck.",
-        "1. If next_step starts with 'call_deep_research_first', call deep_research(company_id) BEFORE anything else; then re-call prepare_content_plan_context to get a refreshed context. deep_research persists its industry result on Company.description by itself, so you do NOT need to chain update_company afterwards.",
+        "1. INDUSTRY CHECK. Read industry_auto_classification. When industry_auto_classification.classification_performed is true and resolved_industry_id is non-null, this tool already detected and persisted the industry for you (cheap fast pass, ~3-8s, no credits charged). Surface the recommended_user_message to the user one line and PROCEED without calling deep_research. Only call deep_research separately when industry_auto_classification.classified is false (the auto pass could not resolve the brand, e.g. no website on file or fetch failed) OR when the brand benefits from rich catalog data (fashion / food / retail / real estate) and you want product image URLs to ground the visuals. Do NOT call deep_research reflexively when the auto pass succeeded; that's the round-trip we explicitly designed away from. If next_step starts with 'call_deep_research_first', that means even auto-classification failed and the agent must escalate to deep_research.",
         "2. If phase_1_foundational has questions, ask THOSE in a SINGLE AskUserQuestion call this turn. NEVER mix phase_1 with phase_2 in the same turn. The phase_1 questions are blockers: the user picking 'avanzar sin' is acceptable, but you cannot skip the question itself.",
         "3. For each phase_1 question the user picks 'call_setup_tool' on, invoke option_actions[i].setup_tool with the suggested args (resolve the *_from references against the matching proposal block in this same _assistant_guidance). After every setup tool completes, re-call prepare_content_plan_context to refresh state, then continue.",
         "4. When phase_1 is empty OR fully resolved, ask phase_2_plan_scope in ONE AskUserQuestion call. There are 4 questions; AskUserQuestion supports up to 4, so submit them together.",
@@ -1084,7 +1146,36 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
           cached_industry: cachedIndustry,
           industry_cache_warning: cachedIndustry
             ? null
-            : "No industry classification cached on this company. Per instructions Rule 19 (INDUSTRY-AWARE PLANNING), call deep_research(company_id) ONCE BEFORE drafting a non-trivial content plan. It returns detected_industry, industry_specific.data (products, menu items, articles, properties, etc. depending on industry), content_pillars_inferred, and reference assets like product image URLs that you should pass as reference_image_url on each ai_generate source. deep_research persists the [industry:<id>@<date>] marker on Company.description automatically before returning, so the next call to prepare_content_plan_context will read cached_industry and skip the re-classification. You do NOT need to call any follow-up tool to apply the cache.",
+            : "No industry classification cached on this company and the auto-classification attempt did not produce a result (likely because the company has no website URL on Company.website or the home page fetch failed). Per instructions Rule 19 (INDUSTRY-AWARE PLANNING), call deep_research(company_id) ONCE BEFORE drafting a non-trivial content plan. It returns detected_industry, industry_specific.data (products, menu items, articles, properties, etc. depending on industry), content_pillars_inferred, and reference assets like product image URLs that you should pass as reference_image_url on each ai_generate source. deep_research persists the [industry:<id>@<date>] marker on Company.description automatically before returning. You do NOT need to call any follow-up tool to apply the cache.",
+          industry_auto_classification: autoIndustryResult
+            ? {
+                attempted: true,
+                from_cache: autoIndustryResult.from_cache,
+                classification_performed: autoIndustryResult.classification_performed,
+                resolved_industry_id: autoIndustryResult.industry_id,
+                persistence_ok: autoIndustryResult.persistence_ok,
+                duration_ms: autoIndustryResult.duration_ms,
+                reason: autoIndustryResult.reason,
+                recommended_user_message: autoIndustryResult.classification_performed && autoIndustryResult.classified
+                  ? `Auto-detecté la industria de la marca como "${autoIndustryResult.industry_id}" (~${Math.round(autoIndustryResult.duration_ms / 100) / 10}s, sin costo de créditos para el usuario). Si querés data más rica (catálogo de productos, fotos reales del sitio para usar como referencia en el plan), podés llamar deep_research aparte ahora; si no, sigo con el plan así.`
+                  : null,
+                follow_up_hint: autoIndustryResult.classified
+                  ? "The hard block on draft_content_plan is lifted. If the brand benefits from catalog grounding (fashion, food, retail, real estate), CONSIDER calling deep_research explicitly for product images. Otherwise proceed directly to draft_content_plan."
+                  : "Auto-classification did not produce a result. Either call deep_research (which has fuller fetch + extraction logic and may succeed where this faster pass failed) or proceed without industry context (the plan quality drops slightly).",
+              }
+            : {
+                attempted: false,
+                from_cache: cachedIndustry !== null,
+                classification_performed: false,
+                resolved_industry_id: cachedIndustry ? cachedIndustry.industry_id : null,
+                persistence_ok: true,
+                duration_ms: 0,
+                reason: cachedIndustry
+                  ? "fresh cache hit on Company.description; no classification attempt was needed"
+                  : "auto_classify_industry: false was passed by the caller; classification skipped",
+                recommended_user_message: null,
+                follow_up_hint: null,
+              },
         },
         ai_budgets: budgets ?? {
           _error: "Could not load subscription balance. Budget gating below may be unreliable.",
@@ -1205,6 +1296,7 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
         })),
         available_video_models: videoModels,
         available_image_models: imageModels,
+        ai_preferences_validation: aiPreferencesValidation,
         followr_capabilities_summary: FOLLOWR_CAPABILITIES_SUMMARY,
         _assistant_guidance: {
           ultrathink_required: PLANNING_STRATEGY.ultrathink_required,
@@ -1403,7 +1495,7 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
             : {
                 status: "industry_not_classified_yet",
                 policy_summary:
-                  "No hay industry cacheada en Company.description. Antes de armar un plan llamar a deep_research(company_id) para detectarla; sin la industry, el sistema no puede recomendar avatar vs AI clip por default.",
+                  "No hay industry cacheada en Company.description y el auto-classify no resolvió la marca (ver industry_auto_classification.reason para el motivo concreto). Para destrabar, llamá deep_research(company_id) que tiene una pipeline de fetch + extracción más robusta. Sin la industry, el sistema no puede recomendar avatar vs AI clip por default.",
               },
           recommended_video_model_policy:
             "available_video_models is pre-sorted: the FIRST entry is the recommended default for this company. ALWAYS pick the first entry, and ALWAYS use the model_id verbatim from the catalog. Do NOT invent model IDs from memory: Followr's canonical format uses dots for major.minor versions (veo_3.1_fast, veo_3.1, wan_2.2, seedance_1.1_light, seedance_2.0_fast, etc.) and no separator for hailuo (hailuo_02_standard, hailuo_02_premium). Underscored variants like veo_3_1_fast or hailuo_0_2_premium do NOT exist in Followr; the backend rejects them with HTTP 422 'selected model is invalid'. The sort accounts for company ai_preferences.video_model (rank 0 when set, with is_company_default: true) and for plan gating (when followr_plus_enabled is false, wan_2.2 is promoted to rank 0 with is_plan_fallback_default: true and every premium-bucket model is marked blocked_by_plan: true and affordable_at_default_duration: false). On accounts WITHOUT Followr Plus the ONLY accepted video model is wan_2.2; never recommend a premium-bucket model on those accounts. If the user explicitly asks for a premium model and followr_plus_enabled is false, explain the limitation and point them to followr.ai to activate the Followr Plus add-on.",
@@ -1414,7 +1506,7 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
           per_item_preview_strategy:
             "Plan size playbook for confirmation flows. NEVER decide the detail level alone: always ASK the user first which view they want, presenting 2-3 options sized to the plan. Then act on the answer. Plan-size defaults to offer:\n(1) 1-3 items: surface summary_for_user, then ask 'Te muestro el detalle completo de cada uno (copy + descripción de cada imagen y video), o te alcanza con el resumen y avanzamos?'. If user picks detail, call preview_plan_item per item.\n(2) 4-7 items: surface summary_for_user, then ask 'Querés (a) ver el detalle completo de los 5, (b) que te muestre solo uno representativo y aprobás todos juntos, o (c) avanzamos con el resumen?'. Use preview_plan_item only on the chosen subset.\n(3) 8-15 items: surface summary_for_user, then ask 'Es un plan grande. Te lo (a) agrupo por día y vamos día por día, (b) te muestro 2-3 representativos (uno por concept type) y aprobás todo de una, (c) te dejo el resumen y avanzamos?'. Group by date or by concept_shared keyword.\n(4) 16+ items: surface summary_for_user, then ask 'Plan extenso. Para no abrumarte, te propongo (a) spot-check de 2-3 representativos antes de aprobar todo, (b) agrupar por semana y aprobar por semana, (c) avanzar con el resumen tal cual?'. Default recommendation: option (a) for product-heavy industries, (b) for cadence-based plans.\nNEVER dump 30 detailed previews in a row - it is unusable. NEVER pick the view yourself without asking.",
           industry_grounding_strategy:
-            "Before drafting any non-trivial content plan, check brand_context.cached_industry. When null, call deep_research(company_id) ONCE. It returns detected_industry, industry_specific.data (products, menu_items, articles, properties, etc. depending on the industry), content_pillars_inferred, and reference assets like product image URLs, AND persists the industry marker on Company.description so the next call to prepare_content_plan_context reads from cache. No follow-up tool needed to apply the cache; deep_research handles persistence itself. Skipping deep_research means the plan grounds on shallow website metadata only and AI assets get generated without product references, producing generic visuals that do not look like the real catalog.",
+            "brand_context.cached_industry should normally be non-null when you read this response, because prepare_content_plan_context auto-classifies (via a fast home-page fetch) on cache miss. Check industry_auto_classification.classification_performed to know whether the classification just happened or was already cached. The auto pass is FAST (3-8s) and FREE (no credits charged) but INTENTIONALLY MINIMAL: it sets the industry id and unblocks draft_content_plan, nothing else. It does NOT fetch the product catalog, menu items, article archive, or property listings. For brands with rich catalogs you want to ground on (fashion, beauty, food, retail, real estate), call deep_research(company_id) explicitly AFTER the auto pass to get product image URLs and structured catalog data; pass those URLs as reference_image_url on each ai_generate source. If cached_industry IS null when you read this, it means the auto pass failed (no website on file, fetch error, etc.). Read industry_auto_classification.reason for the cause; the typical recovery is to call deep_research(company_id) which has more aggressive fetch and extraction logic.",
           autolist_reasoning_strategy:
             "publishing_rule_groups contains every Autopilot autolist with rich signals. Before proposing a content plan, REASON over each autolist using these inputs (NO regex, NO keyword matching: use full LLM judgment):\n" +
             "- tags[].name + history.recent_posts[].topic + history.recent_posts[].title → infer the theme of the autolist in 1-2 sentences. If history is empty, infer from tag names + brand voice (lower confidence).\n" +
@@ -1819,7 +1911,7 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
                   {
                     tool: "manufacture_brand_templates",
                     rationale:
-                      "RECOMENDADO. Generar 12 templates AI (2 por categoría × 6 categorías: cover, step, cta, feature, quote, hero) usando el brief + paleta + elements ya cargados. Costo: 300 cr con nano_banana_2 default. Surface el costo exacto al usuario y obtené aprobación antes de llamar. Sin Plus, usar nano_banana_2 o z_image_turbo; con Plus, cualquier modelo del catálogo.",
+                      "RECOMENDADO. Generar 12 templates AI (2 por categoría × 6 categorías: cover, step, cta, feature, quote, launch) usando el brief + paleta + elements ya cargados. Costo: 300 cr con nano_banana_2 default. Surface el costo exacto al usuario y obtené aprobación antes de llamar. Sin Plus, usar nano_banana_2 o z_image_turbo; con Plus, cualquier modelo del catálogo. La categoría 'launch' reemplazó a 'hero' (2026-05-24) para evitar la colisión con el asset tag HERO; ambos identificadores se siguen aceptando como input para compatibilidad con prompts viejos.",
                   },
                   {
                     rationale:

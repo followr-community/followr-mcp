@@ -594,6 +594,55 @@ export const IMAGE_MODELS: ImageModelInfo[] = [
   },
 ];
 
+// ── Image model preference validation ──────────────────────────────────────
+//
+// Companies persist a default image_model in Company.ai_preferences. The
+// Followr web UI used to expose model ids that are no longer accepted by the
+// backend (e.g. "dall-e-3" before the migration to the current OpenAI ids).
+// When a stale value leaks into ai_preferences.image_model, every consumer
+// that does `model ?? prefs.image_model ?? "nano_banana_2"` propagates the
+// invalid id to the AI image API, which rejects the call with
+// HTTP 422 "selected model is invalid". The end-user sees this as a hard
+// failure on the first generation attempt.
+//
+// The helpers below let consumers sanitize the preference before using it as
+// a fallback. Pass an id (or null/undefined); get back the same id when it
+// matches an IMAGE_MODELS entry, or null when it does not (and the caller
+// should fall back to the platform default).
+
+const IMAGE_MODEL_IDS: Set<string> = new Set(IMAGE_MODELS.map((m) => m.model_id));
+
+/**
+ * True when modelId matches a current entry in the IMAGE_MODELS catalog.
+ * False for null / undefined / empty / unknown ids. Use this before trusting
+ * any model id sourced from Company.ai_preferences (which may carry stale
+ * values written by older versions of the Followr web UI).
+ */
+export function isValidImageModelId(modelId: string | null | undefined): boolean {
+  if (modelId === null || modelId === undefined) return false;
+  if (typeof modelId !== "string" || modelId.length === 0) return false;
+  return IMAGE_MODEL_IDS.has(modelId);
+}
+
+/**
+ * Return modelId when it's a known image model id, otherwise null. Use this
+ * to sanitize Company.ai_preferences.image_model in fallback chains:
+ *
+ *   const resolvedModel =
+ *     explicit ??
+ *     sanitizeImageModelPref(prefs.image_model) ??
+ *     "nano_banana_2";
+ *
+ * This shifts unknown values out of the fallback chain so the platform
+ * default (nano_banana_2) takes over instead of the backend rejecting the
+ * generation outright.
+ */
+export function sanitizeImageModelPref(
+  modelId: string | null | undefined,
+): string | null {
+  return isValidImageModelId(modelId) ? (modelId as string) : null;
+}
+
 // ── Capabilities summary ────────────────────────────────────────────────────
 
 export const FOLLOWR_CAPABILITIES_SUMMARY = {

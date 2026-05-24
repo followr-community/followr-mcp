@@ -5,6 +5,7 @@ import { z } from "zod";
 
 import type { RegisterOptions } from "../index.js";
 import { MUTATION, MUTATION_OPEN_WORLD, READ_ONLY } from "../lib/annotations.js";
+import { sanitizeImageModelPref } from "../lib/content-plan-catalog.js";
 import { getAiPreferences } from "../lib/preferences.js";
 import { toolError, toolErrorFromException } from "../lib/tool-error.js";
 
@@ -242,7 +243,12 @@ NOT UNDOABLE VIA MCP: there is no delete_avatar tool exposed here. The created a
         // image-to-image is derived from the user-provided prompt if any, or
         // synthesized from a generic "avatar portrait" template otherwise.
         const prefs = await getAiPreferences(client, company_id);
-        const resolvedModel = image_model ?? prefs.image_model ?? "nano_banana_2";
+        // sanitizeImageModelPref filters out stale ids (e.g. "dall-e-3"
+        // persisted on older Followr UI versions) so the fallback to
+        // nano_banana_2 actually takes over instead of leaking a value the
+        // backend would reject with HTTP 422.
+        const resolvedModel =
+          image_model ?? sanitizeImageModelPref(prefs.image_model) ?? "nano_banana_2";
         const resolvedDriver =
           image_driver ?? prefs.image_driver ?? (resolvedModel === "nano_banana_2" ? "fal" : undefined);
         const generationPrompt =

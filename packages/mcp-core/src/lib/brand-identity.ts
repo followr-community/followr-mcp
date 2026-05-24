@@ -77,8 +77,16 @@ export const BRAND_TAGS = {
   FEATURE_TEMPLATE: "brand:feature-template",
   /** Quote / testimonial template. */
   QUOTE_TEMPLATE: "brand:quote-template",
-  /** Hero / launch template. */
-  HERO_TEMPLATE: "brand:hero-template",
+  /**
+   * Launch / flagship template. Cinematic, magazine-cover composition with
+   * brand palette dominant and large visual element + bold headline space.
+   * Renamed from HERO_TEMPLATE (2026-05-24) to remove the ambiguity with
+   * BRAND_TAGS.HERO (the reference-asset tag for actual hero shots from the
+   * site). The legacy slug "brand:hero-template" is still recognised on
+   * read via LEGACY_BRAND_TAG_ALIASES so already-manufactured templates from
+   * older brands keep working.
+   */
+  LAUNCH_TEMPLATE: "brand:launch-template",
   /** Background pattern, geometric motif, gradient. */
   PATTERN: "brand:pattern",
   /** Icon asset (line or filled, atomic). */
@@ -103,6 +111,46 @@ export const BRAND_TAGS = {
 } as const;
 
 export type BrandTag = (typeof BRAND_TAGS)[keyof typeof BRAND_TAGS];
+
+/**
+ * Backwards-compatible alias map for tag slugs that were renamed. Only used
+ * on READ paths (lookupAssetsByTag, pickBrandReferenceAssetIds, tag-to-folder
+ * routing inside syncBrandIdentityAfterDelete). New writes always emit the
+ * canonical current slug.
+ *
+ * 2026-05-24: BRAND_TAGS.HERO_TEMPLATE was renamed to BRAND_TAGS.LAUNCH_TEMPLATE
+ * to disambiguate against BRAND_TAGS.HERO (the asset-reference tag). Companies
+ * that manufactured their templates before the rename still hold
+ * "brand:hero-template" in their asset_tag_map; this alias keeps reads working
+ * without a forced data migration.
+ */
+const LEGACY_BRAND_TAG_ALIASES: Readonly<Record<string, BrandTag>> = {
+  "brand:hero-template": BRAND_TAGS.LAUNCH_TEMPLATE,
+};
+
+/**
+ * Map a possibly-legacy tag slug to its current canonical BrandTag. Returns
+ * null when the slug is neither a current value nor a known legacy alias.
+ * Use this before any code path that pattern-matches on a BrandTag literal
+ * (e.g. tagToFolderIntent) so legacy data stays routable.
+ */
+export function resolveBrandTag(raw: string): BrandTag | null {
+  if ((Object.values(BRAND_TAGS) as string[]).includes(raw)) return raw as BrandTag;
+  const aliased = LEGACY_BRAND_TAG_ALIASES[raw];
+  return aliased ?? null;
+}
+
+/**
+ * True when the array of tag slugs contains the target tag, accounting for
+ * legacy aliases. Equivalent to a `.includes(target)` that also matches
+ * pre-rename slugs of the target.
+ */
+export function brandTagsArrayMatchesTarget(entryTags: string[], target: BrandTag): boolean {
+  for (const t of entryTags) {
+    if (resolveBrandTag(t) === target) return true;
+  }
+  return false;
+}
 
 // ──────────────────────────────────────────────────────────
 // Schema (zod, with derived TypeScript type)
@@ -444,7 +492,7 @@ export function lookupAssetsByTag(
 ): number[] {
   const out: number[] = [];
   for (const [assetIdStr, tags] of Object.entries(identity.asset_tag_map)) {
-    if (tags.includes(tag)) {
+    if (brandTagsArrayMatchesTarget(tags, tag)) {
       const n = Number.parseInt(assetIdStr, 10);
       if (Number.isFinite(n) && n > 0) out.push(n);
     }
@@ -498,7 +546,7 @@ export type BrandFolderIntent = "templates" | "elements" | "anti_patterns";
  * picker so manual uploads (assets in a brand folder without explicit tags)
  * can still be picked up when the agent asks for that folder's content type.
  *
- * Templates folder holds full compositions: COVER/STEP/CTA/FEATURE/QUOTE/HERO
+ * Templates folder holds full compositions: COVER/STEP/CTA/FEATURE/QUOTE/LAUNCH
  * templates plus ASPIRATIONAL and PAST_WINNER references that are full layouts.
  *
  * Elements folder holds atomic visual building blocks: LOGO, HERO,
@@ -515,7 +563,7 @@ export function tagToFolderIntent(tag: BrandTag): BrandFolderIntent {
     case BRAND_TAGS.CTA_TEMPLATE:
     case BRAND_TAGS.FEATURE_TEMPLATE:
     case BRAND_TAGS.QUOTE_TEMPLATE:
-    case BRAND_TAGS.HERO_TEMPLATE:
+    case BRAND_TAGS.LAUNCH_TEMPLATE:
     case BRAND_TAGS.ASPIRATIONAL:
     case BRAND_TAGS.PAST_WINNER:
       return "templates";
@@ -617,7 +665,11 @@ export async function pickBrandReferenceAssetIds(
   const out: number[] = [];
   for (const a of liveAssets) {
     const entry = identity.asset_tag_map[String(a.id)];
-    if (entry === undefined || entry.length === 0 || entry.includes(tag)) {
+    if (
+      entry === undefined ||
+      entry.length === 0 ||
+      brandTagsArrayMatchesTarget(entry, tag)
+    ) {
       out.push(a.id);
     }
   }
@@ -870,7 +922,13 @@ export async function syncBrandIdentityAfterDelete(
     if (tagsForAsset !== undefined || inAspirationalList) {
       let intent: BrandFolderIntent | null = null;
       if (tagsForAsset !== undefined && tagsForAsset.length > 0) {
-        intent = tagToFolderIntent(tagsForAsset[0] as BrandTag);
+        // Normalize the raw slug through resolveBrandTag so legacy aliases
+        // (e.g. "brand:hero-template" -> LAUNCH_TEMPLATE) route to the right
+        // folder. Without this, an asset tagged with a pre-rename slug falls
+        // off the templates folder count and silently leaks into elements.
+        const firstRaw = tagsForAsset[0];
+        const firstTag = firstRaw !== undefined ? resolveBrandTag(firstRaw) : null;
+        intent = firstTag !== null ? tagToFolderIntent(firstTag) : null;
       }
       const { [key]: _omit, ...restMap } = identity.asset_tag_map;
       next = {
@@ -950,7 +1008,7 @@ export async function syncBrandIdentityAfterDelete(
  *   "cover slide for Tuesday's carousel" -> [COVER_TEMPLATE, LOGO, HERO]
  *   "step 2 of 3 illustration" -> [STEP_TEMPLATE, ICON, LOGO]
  *   "CTA card with arrow"  -> [CTA_TEMPLATE, LOGO]
- *   "product hero shot for launch" -> [HERO_TEMPLATE, PRODUCT, LOGO]
+ *   "product hero shot for launch" -> [LAUNCH_TEMPLATE, PRODUCT, LOGO]
  *
  * Conservative defaults: when nothing matches strongly, falls back to
  * COVER_TEMPLATE + LOGO. The resolver also always includes LOGO when the
@@ -975,7 +1033,7 @@ export function suggestedTagsForConcept(concept: string): BrandTag[] {
     tags.push(BRAND_TAGS.FEATURE_TEMPLATE);
   }
   if (/(hero|launch|lanzamiento|drop principal|flagship|destacad[ao])/u.test(c)) {
-    tags.push(BRAND_TAGS.HERO_TEMPLATE);
+    tags.push(BRAND_TAGS.LAUNCH_TEMPLATE);
   }
   if (/(product|producto|catalog|item|sku|prenda|modelo)/u.test(c)) {
     tags.push(BRAND_TAGS.PRODUCT);
@@ -1073,14 +1131,14 @@ export function autoClassifyAsset(args: {
       if (/(banner|cover|jumbotron|feature)/u.test(hint)) {
         return {
           classification: "template",
-          suggested_tags: [BRAND_TAGS.HERO_TEMPLATE],
+          suggested_tags: [BRAND_TAGS.LAUNCH_TEMPLATE],
           confidence: "high",
           reason: "Hero / banner region: carries brand composition style.",
         };
       }
       return {
         classification: "template",
-        suggested_tags: [BRAND_TAGS.HERO_TEMPLATE],
+        suggested_tags: [BRAND_TAGS.LAUNCH_TEMPLATE],
         confidence: "medium",
         reason: "In <main> or <header> region. Likely brand-carrying composition.",
       };

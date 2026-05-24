@@ -518,6 +518,155 @@ function isEmpty(value: unknown): boolean {
   return false;
 }
 
+// ── Auto-orchestration helper for prepare_content_plan_context ────────────
+//
+// THE PROBLEM this solves
+// =======================
+// prepare_content_plan_context surfaces a warning when the company has no
+// cached industry, then draft_content_plan refuses to execute when the cache
+// is still missing. The agent has to: (1) notice the warning OR hit the
+// draft block, (2) call deep_research separately, (3) call
+// prepare_content_plan_context AGAIN because the first context_id captured
+// cached_industry_id: null (now stale, since deep_research wrote the suffix).
+// That's three round-trips for what should be a single bootstrap operation.
+//
+// THE SHAPE of this fix
+// =====================
+// ensureIndustryClassified is a thin, fast version of deep_research that
+// does ONLY what's needed to unblock the planning hard-block:
+//
+//   1. read the company description, return early on a fresh cache hit
+//   2. fetch the home page with the "fast" depth budget (5s / 500KB)
+//   3. run the heuristic classifier
+//   4. persist [industry:<id>@<date>] back to Company.description
+//
+// It deliberately SKIPS the full deep_research extractors (no product
+// catalog crawl, no sitemap fallback, no ecommerce platform fast-path),
+// because those are expensive and not required to lift the draft block.
+// prepare_content_plan_context calls this when it detects a cache miss;
+// the agent can still call deep_research explicitly later for the full
+// catalog data if the brand benefits from product image grounding (fashion,
+// food, retail, real estate).
+//
+// All errors are absorbed and surfaced via the discriminated result so a
+// classification failure never breaks prepare_content_plan_context (the
+// existing "no cache" path remains a graceful degradation).
+export interface EnsureIndustryClassifiedResult {
+  /** True when an industry id is available after this call (cache hit or fresh classify). */
+  classified: boolean;
+  /** The industry id when classified, null otherwise. */
+  industry_id: IndustryId | null;
+  /** True when the cache was already populated before this call. */
+  from_cache: boolean;
+  /** True when a fresh classification was performed (i.e. fetch + classify ran). */
+  classification_performed: boolean;
+  /** True when the suffix was written back to Company.description. */
+  persistence_ok: boolean;
+  /** When classification failed, a short human-readable explanation. */
+  reason: string | null;
+  /** Wall-clock duration in ms. */
+  duration_ms: number;
+}
+
+export async function ensureIndustryClassified(
+  client: FollowrClient,
+  company_id: number,
+  options: { userIndustryHint?: string } = {},
+): Promise<EnsureIndustryClassifiedResult> {
+  const startedAt = Date.now();
+  const durationMs = (): number => Date.now() - startedAt;
+
+  let company: Company;
+  try {
+    company = await client.getCompany(company_id);
+  } catch (err) {
+    return {
+      classified: false,
+      industry_id: null,
+      from_cache: false,
+      classification_performed: false,
+      persistence_ok: false,
+      reason: `getCompany failed: ${err instanceof Error ? err.message : String(err)}`,
+      duration_ms: durationMs(),
+    };
+  }
+
+  const description = (company as Company & { description?: string | null }).description ?? null;
+  const websiteUrl = (company as Company & { website?: string | null }).website ?? null;
+
+  // Cache hit: nothing to do.
+  const cached = readCachedIndustry(description);
+  if (cached && cached.fresh) {
+    return {
+      classified: true,
+      industry_id: cached.id,
+      from_cache: true,
+      classification_performed: false,
+      persistence_ok: true,
+      reason: null,
+      duration_ms: durationMs(),
+    };
+  }
+
+  if (!websiteUrl || websiteUrl.trim().length === 0) {
+    return {
+      classified: false,
+      industry_id: null,
+      from_cache: false,
+      classification_performed: false,
+      persistence_ok: false,
+      reason: "company has no website URL, cannot classify automatically",
+      duration_ms: durationMs(),
+    };
+  }
+
+  // Fetch the home page at the cheapest depth. We're after the industry
+  // classification, not the full catalog. The agent can call deep_research
+  // explicitly afterwards for the rich data when the brand needs it.
+  const fetched = await fetchWithBudget(websiteUrl, DEPTH_SETTINGS.fast);
+  if (!fetched.ok) {
+    return {
+      classified: false,
+      industry_id: null,
+      from_cache: false,
+      classification_performed: false,
+      persistence_ok: false,
+      reason: `home page fetch failed: ${fetched.error ?? `HTTP ${fetched.status}`}`,
+      duration_ms: durationMs(),
+    };
+  }
+
+  const parsed = parseHtml(fetched.body, websiteUrl);
+  const og = extractOgMeta(parsed);
+  const classification = classifyWithHint(parsed, og, options.userIndustryHint);
+  const profile = getProfile(classification.best.id);
+
+  // Persist the cache suffix. Failure here is non-fatal: we still return
+  // classified: true so the caller can use the industry_id in-memory for the
+  // current session; the next session will re-classify (cheap).
+  let persistence_ok = false;
+  try {
+    const suffix = buildCacheSuffix(profile.id);
+    const newDescription = applyCacheSuffixToDescription(description, suffix);
+    if (newDescription !== description) {
+      await client.updateCompany(company_id, { description: newDescription });
+    }
+    persistence_ok = true;
+  } catch {
+    persistence_ok = false;
+  }
+
+  return {
+    classified: true,
+    industry_id: profile.id,
+    from_cache: false,
+    classification_performed: true,
+    persistence_ok,
+    reason: null,
+    duration_ms: durationMs(),
+  };
+}
+
 // ── Tool registrations ────────────────────────────────────────────────────
 
 export function registerResearchTools(
@@ -533,6 +682,8 @@ export function registerResearchTools(
       description: `Investigar el sitio de una empresa y extraer assets reales (imágenes de catálogo, fotos de productos, lookbook, menu items, articles, properties) para usar como referencia en planes de contenido. The tool fetches the company website, detects ecommerce platform (Shopify, WooCommerce, VTEX), uses documented JSON catalog APIs when available, falls back to sitemap parsing for unrecognized sites, runs industry-specific HTML extractors, classifies the industry from page text, and returns a normalized payload the planning agent uses to ground content plans in the brand's real material.
 
 WHEN TO CALL: al inicio de cualquier tarea de contenido no trivial (a week of posts, a campaign, a launch, a series). Una llamada por conversación por compañía alcanza; cacheá el resultado con el cache_suggestion. Llamar SIEMPRE antes de armar un plan si la marca tiene catálogo visual (moda, comida, retail, real estate) para que los assets generados se parezcan a la marca real y no a fashion-genérico-AI.
+
+NOTE (2026-05-24): prepare_content_plan_context now auto-classifies the industry on cache miss via a fast (~3-8s) home-page fetch. That covers the unblock-the-draft case without requiring you to call deep_research. Call deep_research EXPLICITLY when (a) the auto pass failed (industry_auto_classification.classified is false on the context response), OR (b) the brand is catalog-rich and you want product image URLs, menu items, articles or properties to ground the plan. Skip deep_research when industry_auto_classification.classification_performed is true AND the brand is service / SaaS / general (no catalog to grab).
 
 EXTRACTION STRATEGY (in priority order):
 1. Ecommerce platform fast-path. Detects Shopify (cdn.shopify.com header, _shopify_* cookie), WooCommerce (meta generator, /wp-json/wc/), VTEX (vtexassets.com, vtexcommerce.com). When matched, hits the platform's documented JSON catalog API (/products.json, /wp-json/wc/store/v1/products, /api/catalog_system/pub/products/search/) for full product data with image arrays in one request.

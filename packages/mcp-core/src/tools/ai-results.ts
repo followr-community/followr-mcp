@@ -5,6 +5,7 @@ import { z } from "zod";
 
 import type { RegisterOptions } from "../index.js";
 import { MUTATION_OPEN_WORLD, READ_ONLY } from "../lib/annotations.js";
+import { sanitizeImageModelPref } from "../lib/content-plan-catalog.js";
 import { resolveDriver } from "../lib/driver-resolver.js";
 import { getAiPreferences } from "../lib/preferences.js";
 import { toolError, toolErrorFromException } from "../lib/tool-error.js";
@@ -112,7 +113,12 @@ ASYNC: wait=true (default) blocks until completion (30-120s typical). wait=false
         // The fallback model "nano_banana_2" exists because the
         // /api/aiResults/image endpoint does not apply company preferences
         // when model is omitted from the body (verified empirically).
-        const resolvedModel = model ?? prefs.image_model ?? "nano_banana_2";
+        // sanitizeImageModelPref filters out stale ids (e.g. "dall-e-3" left
+        // over from older versions of the Followr UI) so the fallback can
+        // actually take over instead of being shadowed by an invalid prefs
+        // value that the backend would reject with HTTP 422.
+        const resolvedModel =
+          model ?? sanitizeImageModelPref(prefs.image_model) ?? "nano_banana_2";
         const resolvedDriver = resolveDriver({
           explicitDriver: driver,
           prefs,
