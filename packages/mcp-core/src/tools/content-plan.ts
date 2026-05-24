@@ -1765,13 +1765,92 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
         });
       }
 
+      // 1c. Brand templates gate. When the company has a Brand Visual
+      // Identity configured AND the plan generates at least one AI image,
+      // we require the brand to have manufactured templates in
+      // __brand_templates. Without templates the picker has nothing to
+      // anchor on for feed images: it falls back to LOGO (often a small
+      // favicon), pads with HERO or ASPIRATIONAL if available, and ends
+      // up sending the model a tiny / generic ref for a cinematic prompt.
+      // The provider then rejects the combination (Nano Banana 2 returns
+      // "could not generate") and the user pays for failed retries. Hard
+      // block here forces the manufacture step before drafting. Live-read
+      // the folder so manual uploads to __brand_templates count even when
+      // identity.templates_count is stale.
+      //
+      // Skip the gate when the company has no Brand Visual Identity at
+      // all: that case is handled upstream by prepare_content_plan_context
+      // via brand_visual_identity_setup_proposal.
+      const planItemsArr = input.plan_items as PlanItem[];
+      const planUsesAiImages = planItemsArr.some((it) =>
+        it.sub_posts.some((sp) => {
+          const s = sp.assets_strategy as {
+            image_source?: { type?: string };
+            carousel_sources?: Array<{ type?: string }>;
+          };
+          if (s.image_source?.type === "ai_generate") return true;
+          if (s.carousel_sources?.some((cs) => cs.type === "ai_generate")) return true;
+          return false;
+        }),
+      );
+      if (planUsesAiImages) {
+        try {
+          const company = await client.getCompany(ctx.company_id);
+          const parsedBvi = parseBrandIdentityFromDescription(
+            company.description ?? null,
+          );
+          if (parsedBvi.status === "ok") {
+            // Live-read __brand_templates via any TEMPLATE tag. Manual
+            // uploads to the folder are picked up because the picker
+            // includes assets present in the folder but absent from
+            // asset_tag_map (intentional user uploads).
+            const liveTemplates = await pickBrandReferenceAssetIds(
+              client,
+              ctx.company_id,
+              parsedBvi.identity,
+              BRAND_TAGS.COVER_TEMPLATE,
+            );
+            if (liveTemplates.length === 0) {
+              return toolError({
+                reason: "brand_templates_missing",
+                user_message:
+                  "La identidad visual de esta empresa está configurada pero no tiene templates manufacturados ni uploads manuales en __brand_templates. Sin templates, las imágenes del feed se generan sin referencia visual coherente: el modelo termina recibiendo iconos sueltos o el favicon como única guía y rechaza la generación (o devuelve piezas fuera de marca). Antes de armar el plan necesito que ejecutemos la manufactura de templates.",
+                suggested_actions: [
+                  {
+                    tool: "manufacture_brand_templates",
+                    rationale:
+                      "Generar ~12 templates AI (2 por categoría × 6 categorías) usando el brief + paleta + elements ya cargados. Costo aproximado: 300 cr con nano_banana_2 default. Surface el costo exacto al usuario y obtené aprobación antes de llamar.",
+                  },
+                  {
+                    rationale:
+                      "Alternativa: el usuario puede subir manualmente templates al folder __brand_templates desde la UI de Followr. Los uploads manuales se reconocen automáticamente como templates aprobados (sin necesidad de re-correr manufacture). Si elige esta vía, esperá a que confirme que ya subió y reintentá draft_content_plan.",
+                  },
+                ],
+                blocking: true,
+                details: {
+                  company_id: ctx.company_id,
+                  templates_count_in_block: parsedBvi.identity.templates_count,
+                  live_templates_count: liveTemplates.length,
+                },
+              });
+            }
+          }
+        } catch (err) {
+          // Tolerant: if the gate check itself fails (network blip,
+          // listAssets down), let the plan proceed. The downstream
+          // generation will surface its own error if templates are
+          // genuinely missing. We do NOT want a transient failure here
+          // to block a perfectly valid draft.
+          void err;
+        }
+      }
+
       // 2. Auto-resolve near-duplicate AI image prompts silently. The
       // resolver collapses any two ai_generate refs that share a
       // shared_concept_key to ONE generation, so the user pays for one
       // image even when the same concept appears across multiple
       // sub_posts. Done before validation so the (now-silent)
       // near_duplicate warning never fires.
-      const planItemsArr = input.plan_items as PlanItem[];
       autoApplyImageDedupHints(planItemsArr);
 
       // 3. Run the validation pipeline (extracted helper so update_content_plan
