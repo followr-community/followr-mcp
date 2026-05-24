@@ -46,6 +46,7 @@ import {
   stripBrandIdentityFromDescription,
   tagAssetInIdentity,
 } from "../lib/brand-identity.js";
+import { resolveDriver } from "../lib/driver-resolver.js";
 import {
   type ProposedAction,
   type ProposedActionKind,
@@ -72,11 +73,20 @@ const BRAND_FOLDER_NAMES = {
   ],
 };
 
-// Per-image generation cost in credits, used to compute the Phase 1 estimate.
-// Matches the company default model (nano_banana_2 = 25 cr / image).
-// The actual cost at execute time reads from the catalog and the company's
-// ai_preferences.image_model, so this is just a planning estimate.
-const PHASE_1_TEMPLATE_COUNT = 13;
+// Phase 1 = template manufacturing. The constants here drive both the cost
+// estimate surfaced before/during the call (assess_brand_visual_identity,
+// draft_brand_visual_identity, execute_brand_visual_identity) AND the schema
+// defaults of manufacture_brand_templates. Single source of truth prevents
+// drift like the prior 13/325 vs actual 12/300 mismatch where the estimate
+// quoted one number and the tool charged another.
+//
+// templates_per_category(2) × categories.length(6) = 12 templates.
+// nano_banana_2 = 25 cr / image. The actual cost at execute time reads from
+// perImageCostFor(resolvedModel) so this is a planning estimate only.
+const PHASE_1_DEFAULT_TEMPLATES_PER_CATEGORY = 2;
+const PHASE_1_DEFAULT_CATEGORIES_COUNT = 6;
+const PHASE_1_TEMPLATE_COUNT =
+  PHASE_1_DEFAULT_TEMPLATES_PER_CATEGORY * PHASE_1_DEFAULT_CATEGORIES_COUNT;
 const PHASE_1_COST_PER_IMAGE_CR = 25;
 const PHASE_1_ESTIMATE_CR = PHASE_1_TEMPLATE_COUNT * PHASE_1_COST_PER_IMAGE_CR;
 
@@ -1234,7 +1244,7 @@ After success the agent should offer Phase 1 template manufacturing as a follow-
           failedActions.length === 0
             ? succeededUploads === 0
               ? `Brand Visual Identity persistida con folders creados pero CERO assets subidos. __brand_templates (${folderIdTemplates ?? "-"}), __brand_elements (${folderIdElements ?? "-"}), __brand_anti_patterns (${folderIdAntiPatterns ?? "-"}) quedan vacíos. El brief se persistió como aspirational (marcado [SETUP PARTIAL]). Antes de avanzar a Phase 1 conviene subir manualmente al menos 1 logo + 1 hero, o re-correr setup con curación que incluya assets. assess va a devolver next_step: refresh con repair_needed.`
-              : `Brand Visual Identity persistida con éxito. Folders creados: __brand_templates (${folderIdTemplates ?? "-"}), __brand_elements (${folderIdElements ?? "-"}), __brand_anti_patterns (${folderIdAntiPatterns ?? "-"}). ${succeededUploads} asset${succeededUploads === 1 ? "" : "s"} subido${succeededUploads === 1 ? "" : "s"}. El bloque BRAND_VISUAL_IDENTITY queda en Company.description. ¿Querés avanzar con Phase 1 (manufactura de ${PHASE_1_TEMPLATE_COUNT} templates AI con costo ~${PHASE_1_ESTIMATE_CR} créditos)?`
+              : `Brand Visual Identity persistida con éxito. Folders creados: __brand_templates (${folderIdTemplates ?? "-"}), __brand_elements (${folderIdElements ?? "-"}), __brand_anti_patterns (${folderIdAntiPatterns ?? "-"}). ${succeededUploads} asset${succeededUploads === 1 ? "" : "s"} subido${succeededUploads === 1 ? "" : "s"}. El bloque BRAND_VISUAL_IDENTITY queda en Company.description.\n\nPróximo paso recomendado: Phase 1 (manufactura de ${PHASE_1_TEMPLATE_COUNT} templates AI con costo ~${PHASE_1_ESTIMATE_CR} créditos). Sin templates, cualquier plan que incluya imágenes generadas con AI va a quedar hard-blocked en draft_content_plan. La única alternativa válida es subir manualmente al menos 1 cover template al folder __brand_templates desde la UI de Followr. ¿Avanzamos con Phase 1?`
             : succeededUploads === 0
               ? `Brand Visual Identity persistida pero TODOS los uploads fallaron (${failedActions.length} fallos). Folders creados quedan vacíos y el brief queda marcado [SETUP PARTIAL]. Revisá action_report para diagnosticar y reintentá el setup. assess va a devolver next_step: refresh con repair_needed.`
               : `Brand Visual Identity persistida parcialmente. ${succeededUploads} asset${succeededUploads === 1 ? "" : "s"} OK, ${failedActions.length} acción${failedActions.length === 1 ? "" : "es"} falló${failedActions.length === 1 ? "" : "ron"}. Revisá el action_report para detalles. Podés reintentar con update_brand_visual_identity (no disponible todavía en esta versión) o seguir adelante.`;
@@ -1263,7 +1273,7 @@ After success the agent should offer Phase 1 template manufacturing as a follow-
                         : "review_failures_with_user",
                     instructions:
                       failedActions.length === 0
-                        ? `Mostrá user_facing_summary al usuario. Si dice que sí a Phase 1, llamá manufacture_brand_templates (tool pendiente, F2.8). Si dice que no, agradecé y avisá que el identity ya está cargado y se aplicará a las próximas generaciones AI de imagen.`
+                        ? `Mostrá user_facing_summary al usuario y RECOMENDÁ explícitamente avanzar con Phase 1 (manufacture_brand_templates). Es el único path que llena __brand_templates con assets AI sintetizados desde el brief. Sin templates, draft_content_plan hard-bloquea con reason=brand_templates_missing cualquier plan que use ai_generate (image_source o carousel_sources). NO presentes Phase 1 como opcional ni recomendes saltarlo: si el usuario rechaza ahora, la próxima sesión de planning queda bloqueada hasta que vuelva acá o suba templates manualmente. Si el usuario insiste en no gastar créditos en AI, la ÚNICA alternativa legítima es que suba manualmente al menos 1 cover template al folder __brand_templates desde la UI de Followr (los uploads manuales se reconocen sin re-correr manufacture).`
                         : "Mostrale el resumen + lista de acciones fallidas. El identity quedó parcialmente persistido. No bloquees al usuario; sugerile revisar la lista y decidir si quiere reintentar las fallidas o avanzar igual.",
                   },
                 },
@@ -1388,10 +1398,23 @@ NEXT STEP: after manufacture, call finalize_brand_templates with user's per-asse
         }
         const identity = parsed.identity;
 
-        // 2. Resolve image model + cost.
+        // 2. Resolve image model + driver + cost.
+        //
+        // PARITY with execute_content_plan + generate_image: Followr's
+        // backend cannot reliably infer the driver from `model` alone for
+        // nano_banana_2 and the Veo/Wan/SeeDance/Hailuo/Imagen sets. When
+        // driver is omitted, /api/aiResults/image returns HTTP 422
+        // "selected model is invalid" before the request reaches the
+        // provider. Verified empirically (see driver-resolver.ts header).
+        // resolveDriver consults explicit input -> prefs -> catalog hints.
         const prefs = (company as Company & { ai_preferences?: AiPreferences | null }).ai_preferences;
         const resolvedModel =
           input.model_override ?? prefs?.image_model ?? "nano_banana_2";
+        const resolvedDriver = resolveDriver({
+          prefs: prefs ?? undefined,
+          modality: "image",
+          model: resolvedModel,
+        });
         const costPerImage = perImageCostFor(resolvedModel);
         const totalTemplates = input.templates_per_category * input.categories.length;
         const totalCost = totalTemplates * costPerImage;
@@ -1487,6 +1510,7 @@ NEXT STEP: after manufacture, call finalize_brand_templates with user's per-asse
                   q: prompt,
                   company_id: input.company_id,
                   model: resolvedModel,
+                  ...(resolvedDriver ? { driver: resolvedDriver } : {}),
                   aspect_ratio: job.aspectRatio,
                   ...(job.refUrls.length > 0 ? { image_urls: job.refUrls.slice(0, 5) } : {}),
                 });

@@ -1819,11 +1819,11 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
                   {
                     tool: "manufacture_brand_templates",
                     rationale:
-                      "Generar ~12 templates AI (2 por categoría × 6 categorías) usando el brief + paleta + elements ya cargados. Costo aproximado: 300 cr con nano_banana_2 default. Surface el costo exacto al usuario y obtené aprobación antes de llamar.",
+                      "RECOMENDADO. Generar 12 templates AI (2 por categoría × 6 categorías: cover, step, cta, feature, quote, hero) usando el brief + paleta + elements ya cargados. Costo: 300 cr con nano_banana_2 default. Surface el costo exacto al usuario y obtené aprobación antes de llamar. Sin Plus, usar nano_banana_2 o z_image_turbo; con Plus, cualquier modelo del catálogo.",
                   },
                   {
                     rationale:
-                      "Alternativa: el usuario puede subir manualmente templates al folder __brand_templates desde la UI de Followr. Los uploads manuales se reconocen automáticamente como templates aprobados (sin necesidad de re-correr manufacture). Si elige esta vía, esperá a que confirme que ya subió y reintentá draft_content_plan.",
+                      "Alternativa manual (si el usuario no quiere gastar créditos en AI): subir al menos 1 cover template (basta 1 asset taggeado COVER_TEMPLATE para desbloquear draft_content_plan) al folder __brand_templates desde la UI de Followr. Los uploads manuales al folder __brand_templates se reconocen automáticamente como cover templates sin necesidad de re-correr manufacture. Si elige esta vía, esperá a que confirme que ya subió y reintentá draft_content_plan.",
                   },
                 ],
                 blocking: true,
