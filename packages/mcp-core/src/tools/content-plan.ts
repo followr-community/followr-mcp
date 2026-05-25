@@ -4473,6 +4473,33 @@ function describeAiImage(prompt: string): string {
   return clean.length > 320 ? clean.slice(0, 317) + "..." : clean;
 }
 
+// Avatar video cost model. Sources:
+//   - Lipsync / multi-scene lipsync billing: veed_fabric_1.0 @ 25 cr/sec
+//     (documented in ai-results.ts:222 and ai-results.ts:385).
+//   - TTS speech rate: ~14 chars/sec measured across recent ElevenLabs
+//     runs at default speed for ES + EN; close enough as a planning
+//     estimate. Floor at 8 sec because Followr enforces a payload floor.
+//   - Background generation (multi-scene with generate_backgrounds=true):
+//     ~60 cr per scene median, measured on recent multi-scene runs. The
+//     actual cost is dominated by an image-to-image generation per scene.
+//
+// The prior estimator used a flat 12 sec for lipsync (300 cr fixed) and
+// 10 sec/scene for multi-scene (250 cr/scene), which silently
+// underbilled long scripts. Real example from a recent session: 3 scripts
+// of ~30 chars each => prior estimate 750 cr, actual ~750 cr. Same
+// scripts of ~150 chars each => prior estimate 750 cr, actual ~1500 cr.
+// The new estimator scales with script length.
+const AVATAR_TTS_COST_PER_SECOND = 25;
+const AVATAR_BACKGROUND_COST_PER_SCENE = 60;
+const AVATAR_TTS_CHARS_PER_SECOND = 14;
+const AVATAR_TTS_FLOOR_SECONDS = 8;
+
+function estimateTtsSeconds(script: string): number {
+  const chars = script.trim().length;
+  if (chars === 0) return AVATAR_TTS_FLOOR_SECONDS;
+  return Math.max(AVATAR_TTS_FLOOR_SECONDS, Math.round(chars / AVATAR_TTS_CHARS_PER_SECOND));
+}
+
 function describeAssetSource(
   src: NonNullable<AssetsStrategy["image_source"] | AssetsStrategy["video_source"]> | NonNullable<AssetsStrategy["carousel_sources"]>[number],
   mode: "image" | "video",
@@ -4527,19 +4554,38 @@ function describeAssetSource(
     return desc;
   }
   if (src.type === "ai_avatar_lipsync") {
+    // Estimate speech duration from script length. ElevenLabs TTS at
+    // default speed reads at roughly ~14 chars/sec for Spanish and
+    // English (verified empirically across recent avatar lipsync runs).
+    // Minimum 8 seconds because Followr enforces a floor on TTS payload.
+    // Billing model: 25 cr/sec on veed_fabric_1.0 (the only lipsync
+    // model wired in for avatars).
+    const seconds = estimateTtsSeconds(src.script);
     return {
       kind: "avatar_lipsync",
-      description: `Avatar lipsync (avatar #${src.avatar_id}). Script: "${describeAiImage(src.script)}"`,
-      cost_credits: 25 * 12,
+      description: `Avatar lipsync (avatar #${src.avatar_id}, ~${seconds}s). Script: "${describeAiImage(src.script)}"`,
+      cost_credits: AVATAR_TTS_COST_PER_SECOND * seconds,
+      duration_seconds: seconds,
       video_kind_user_facing: "avatar_lipsync",
       audio_status: "synthetic_voice",
     };
   }
   if (src.type === "ai_avatar_video") {
+    // Sum the per-scene speech duration, then bill the total at 25 cr/sec.
+    // Backgrounds (when enabled) add an image-to-image generation per
+    // scene; empirically 60 cr/scene is the median observed (verified
+    // across recent multi-scene runs with generate_backgrounds=true).
+    const perSceneSeconds = src.scripts.map((s) => estimateTtsSeconds(s));
+    const totalSeconds = perSceneSeconds.reduce((a, b) => a + b, 0);
+    const speechCost = AVATAR_TTS_COST_PER_SECOND * totalSeconds;
+    const bgCost = src.generate_backgrounds
+      ? AVATAR_BACKGROUND_COST_PER_SCENE * src.scripts.length
+      : 0;
     return {
       kind: "avatar_video",
-      description: `Avatar video con ${src.scripts.length} escena(s) (avatar #${src.avatar_id})${src.generate_backgrounds ? ", con backgrounds generados" : ""}.`,
-      cost_credits: 25 * 10 * src.scripts.length + (src.generate_backgrounds ? 60 * src.scripts.length : 0),
+      description: `Avatar video con ${src.scripts.length} escena(s) (avatar #${src.avatar_id}, ~${totalSeconds}s totales)${src.generate_backgrounds ? ", con backgrounds generados" : ""}.`,
+      cost_credits: speechCost + bgCost,
+      duration_seconds: totalSeconds,
       video_kind_user_facing: "avatar_multi_scene_video",
       audio_status: "synthetic_voice",
     };
