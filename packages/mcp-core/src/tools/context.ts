@@ -98,7 +98,9 @@ NEXT STEPS based on _assistant_guidance.next_step:
 - "ask_user_to_pick_company": multiple owned companies (or admin-scope token with no owned), present by name and wait for the user.
 - "no_companies_available": token is invalid or unprovisioned; surface and stop.
 
-OWNED VS ACCESSIBLE COMPANIES: the response field "companies" lists ONLY the companies the current user owns (where Company.user_id === user.id), matching how the Followr web UI presents them. If the token has admin/superuser scope (cofounders, staff, platform admins), the response also includes "accessible_companies" with companies owned by OTHER users that the token can read. Those are NOT presented by default in user_facing_options. Only consult accessible_companies when the user explicitly mentions a company by exact name or id that is not in the owned list. _assistant_guidance.has_admin_scope is true when this distinction applies.
+OWNED VS ACCESSIBLE COMPANIES: the response field "companies" lists the companies the current user owns (where Company.user_id === user.id), matching how the Followr web UI presents them. Each company carries a relationship: "owner" marker. If the token has admin/superuser scope (cofounders, staff, platform admins), the response also includes "accessible_companies" with companies owned by OTHER users that the token can read, each marked relationship: "guest". Those guest companies are NOT presented by default in user_facing_options. Only consult accessible_companies when the user explicitly mentions a company by exact name or id that is not in the owned list. _assistant_guidance.has_admin_scope is true when this distinction applies.
+
+NAME COLLISIONS: when an accessible (guest) company shares the SAME name as an owned company, the response merges that guest company into user_facing_options with a "(invitada)" suffix and sets _assistant_guidance.has_name_collision = true. In that case, when you ask the user which company to use, ALWAYS surface both options together in the SAME first turn (e.g. 'Tenés acceso a 2 PipeLime: una es tuya y otra es donde sos invitado. ¿Cuál usamos?'). Do NOT pose a generic "which X do you mean?" without showing the owner/guest disambiguation up front. The id_lookup map already contains both name -> id mappings (the guest entry is keyed with the "(invitada)" suffix).
 
 If creative work follows (post generation, scheduling), consider calling get_company_creative_brief(company_id) once the company is chosen, to load brand voice / audience / existing tags / connected networks.`,
       inputSchema: {},
@@ -128,34 +130,65 @@ If creative work follows (post generation, scheduling), consider calling get_com
       const accessibleCompanies = allCompanies.filter((c) => c.user_id !== me.id);
       const hasAdminScope = accessibleCompanies.length > 0;
 
-      const user_facing_options = ownedCompanies.map((c) => c.name);
+      // Detect name collisions between owned and accessible. When the user
+      // is invited to (or has admin access to) a company with the same name
+      // as one they own, the agent must surface BOTH in the first turn with
+      // explicit ownership labels; otherwise the user picks blind and the
+      // session burns a round-trip on disambiguation. This is the only case
+      // where we promote accessible_companies into user_facing_options.
+      const ownedNames = new Set(ownedCompanies.map((c) => c.name));
+      const collidingAccessibles = accessibleCompanies.filter((c) => ownedNames.has(c.name));
+      const hasNameCollision = collidingAccessibles.length > 0;
+
+      // user_facing_options is the array the agent presents to the user.
+      // - Always includes all owned companies (labelled "owner" implicitly).
+      // - Adds accessible companies ONLY when their name collides with an
+      //   owned one, with a parenthetical label so the agent can render the
+      //   distinction in the first message.
+      const user_facing_options: string[] = [
+        ...ownedCompanies.map((c) => c.name),
+        ...collidingAccessibles.map((c) => `${c.name} (invitada)`),
+      ];
       const id_lookup: Record<string, number> = {};
       for (const c of ownedCompanies) {
         id_lookup[c.name] = c.id;
       }
+      for (const c of collidingAccessibles) {
+        id_lookup[`${c.name} (invitada)`] = c.id;
+      }
       const multipleOwned = ownedCompanies.length > 1;
       const singleOwned = ownedCompanies.length === 1 ? ownedCompanies[0] : undefined;
+      // When there is a name collision the user MUST pick; single-owned
+      // shortcut does not apply because we cannot guess which "PipeLime"
+      // they mean.
       const next_step =
         ownedCompanies.length === 0
           ? hasAdminScope
             ? "ask_user_to_pick_company"
             : "no_companies_available"
-          : singleOwned
-            ? "proceed_with_single_company"
-            : "ask_user_to_pick_company";
+          : hasNameCollision
+            ? "ask_user_to_pick_company"
+            : singleOwned
+              ? "proceed_with_single_company"
+              : "ask_user_to_pick_company";
       const adminScopeNote = hasAdminScope
-        ? ` Note: this token has admin/superuser scope and can also access ${accessibleCompanies.length} companies owned by other users; these are listed in accessible_companies and are not presented by default. Use them only when the user explicitly references one (by exact name or id).`
+        ? ` Note: this token has admin/superuser scope and can also access ${accessibleCompanies.length} companies owned by other users; these are listed in accessible_companies. Use them only when the user explicitly references one (by exact name or id), with the exception of name collisions which are already merged into user_facing_options.`
+        : "";
+      const collisionNote = hasNameCollision
+        ? ` There ${collidingAccessibles.length === 1 ? "is" : "are"} ${collidingAccessibles.length} accessible compan${collidingAccessibles.length === 1 ? "y" : "ies"} with the SAME name as a company the user owns (${collidingAccessibles.map((c) => `"${c.name}"`).join(", ")}). They appear in user_facing_options with the suffix "(invitada)" so you can distinguish them in the first message. Tell the user up front which "${collidingAccessibles[0]?.name ?? "company"}" is their own and which is the one they were invited to; do NOT ask "which X do you mean?" without showing this disambiguation.`
         : "";
       const instruction =
         ownedCompanies.length === 0
           ? hasAdminScope
             ? `This token has admin/superuser scope but no companies are owned by the current user. Ask the user which of the ${accessibleCompanies.length} accessible companies they want to operate on, by exact name or id. Use accessible_companies for context.`
             : `No companies accessible to this API token. The token may be invalid or the account unprovisioned. Surface this to the user and stop further Followr work.`
-          : multipleOwned
-            ? `The user owns ${ownedCompanies.length} companies. Before any write or scoped-read operation, ask the user which company by name (use user_facing_options). Once chosen, reuse the same company_id for the rest of the conversation. Never default silently to the first listed.${adminScopeNote}`
-            : singleOwned
-              ? `Single company owned by the user ("${singleOwned.name}"). Safe to use its id for subsequent operations without re-asking, unless the user explicitly mentions a different company.${adminScopeNote}`
-              : "";
+          : hasNameCollision
+            ? `The user owns ${ownedCompanies.length} compan${ownedCompanies.length === 1 ? "y" : "ies"} AND has access to ${collidingAccessibles.length} additional compan${collidingAccessibles.length === 1 ? "y" : "ies"} with a colliding name. Ask the user which one by name, surfacing the "(invitada)" label so they can tell which is which.${collisionNote}`
+            : multipleOwned
+              ? `The user owns ${ownedCompanies.length} companies. Before any write or scoped-read operation, ask the user which company by name (use user_facing_options). Once chosen, reuse the same company_id for the rest of the conversation. Never default silently to the first listed.${adminScopeNote}`
+              : singleOwned
+                ? `Single company owned by the user ("${singleOwned.name}"). Safe to use its id for subsequent operations without re-asking, unless the user explicitly mentions a different company.${adminScopeNote}`
+                : "";
       // Per-modality AI budgets. Mirrors get_ai_budget output shape (the
       // simpler 4-bucket model) so any agent that sees only get_session_context
       // already has the correct mental model. The legacy 'credits' field from
@@ -194,6 +227,7 @@ If creative work follows (post generation, scheduling), consider calling get_com
           id: c.id,
           name: c.name,
           type: c.type,
+          relationship: "owner" as const,
         })),
         subscription,
         _assistant_guidance: {
@@ -206,6 +240,14 @@ If creative work follows (post generation, scheduling), consider calling get_com
           owned_companies_count: ownedCompanies.length,
           has_admin_scope: hasAdminScope,
           accessible_companies_count: accessibleCompanies.length,
+          has_name_collision: hasNameCollision,
+          name_collisions: hasNameCollision
+            ? collidingAccessibles.map((c) => ({
+                name: c.name,
+                owned_id: ownedCompanies.find((o) => o.name === c.name)?.id ?? null,
+                accessible_id: c.id,
+              }))
+            : [],
         },
       };
       if (hasAdminScope) {
@@ -214,6 +256,7 @@ If creative work follows (post generation, scheduling), consider calling get_com
           name: c.name,
           type: c.type,
           owner_user_id: c.user_id,
+          relationship: "guest" as const,
         }));
       }
       return { content: [{ type: "text", text: JSON.stringify(response, null, 2) }] };
