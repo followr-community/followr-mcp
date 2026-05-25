@@ -12,6 +12,7 @@
 //   See PostApprove RULE 7 in CLAUDE.md.
 
 import { FollowrApiError, translateError } from "./errors.js";
+import { stripLegacyCredits } from "./sanitize.js";
 import type {
   AiResult,
   ApiCollection,
@@ -104,7 +105,14 @@ export class FollowrClient {
     if (response.status === 204) {
       return undefined as T;
     }
-    return (await response.json()) as T;
+    const json = (await response.json()) as T;
+    // Strip the legacy `credits` field from every response. The backend
+    // exposes it on FollowrUser, SubscriptionBalance, and embedded user
+    // objects in other resources; it is a vestigial AppSumo + topups
+    // counter that prior incidents misread as the real budget
+    // (e.g. "you have 221 credits" when the real images_allowed budget
+    // was ~16,000). See packages/shared/src/sanitize.ts for the rules.
+    return stripLegacyCredits(json);
   }
 
   // ──────────────────────────────────────────────────────────
