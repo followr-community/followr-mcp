@@ -1986,13 +1986,14 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
           budget_remaining_after_execution:
             v.budget_remaining !== null ? v.budget_remaining - v.totals.total_ai_cost : null,
         },
+        upfront_decisions_required: extractUpfrontDecisions(v.warnings),
         warnings: filterUserFacingWarnings(v.warnings),
         _internal_warning_signals: extractInternalOnlyWarnings(v.warnings),
         blockers: v.blockers,
         next_step_instructions:
           v.blockers.length > 0
             ? "There are blockers (listed above). Surface them to the user with the resolution_options for each, then call update_content_plan(plan_id, changes) with the chosen fixes. Do NOT call execute_content_plan until status is ready_for_execution."
-            : "Show summary_for_user to the user (translate display_name fields, never expose ids) AND tell them the cost in natural language: read totals.estimated_total_credits_cost and totals.budget_remaining_after_execution and say something like 'el plan consume aprox N créditos de imagen y video, te quedarían M después de ejecutarlo'. NEVER omit the cost just because summary_for_user does not include it; the user is paying for these credits and needs to know upfront. Surface ONLY warnings array (each has a user_facing_message safe to surface verbatim). Do NOT mention _internal_warning_signals; those are debug-only and you must obey USER-FACING LANGUAGE LOCK when speaking to the user. Ask for explicit approval ('lo ejecuto?' / 'cambio algo?'). When the user confirms, call execute_content_plan(plan_id, confirm: true). If the user wants to change a specific item, call update_content_plan(plan_id, changes) internally without naming the tool to the user. DO NOT propose your own prose version of the plan; summary_for_user is the canonical view.",
+            : "FIRST handle upfront_decisions_required if not empty: each entry has a user_facing_message phrased as a question. Surface it BEFORE the plan summary, ask the user how to proceed (typical: 'la armamos ahora / avanzamos sin'), and ONLY after that decision is resolved continue to the summary. Do NOT bury these in a 'PD' at the end of the plan: by then the user has mentally approved the plan and won't pause to add the missing piece. THEN show summary_for_user to the user (translate display_name fields, never expose ids) AND tell them the cost in natural language: read totals.estimated_total_credits_cost and totals.budget_remaining_after_execution and say something like 'el plan consume aprox N créditos de imagen y video, te quedarían M después de ejecutarlo'. NEVER omit the cost just because summary_for_user does not include it; the user is paying for these credits and needs to know upfront. Surface ONLY warnings array (each has a user_facing_message safe to surface verbatim). Do NOT mention _internal_warning_signals; those are debug-only and you must obey USER-FACING LANGUAGE LOCK when speaking to the user. Ask for explicit approval ('lo ejecuto?' / 'cambio algo?'). When the user confirms, call execute_content_plan(plan_id, confirm: true). If the user wants to change a specific item, call update_content_plan(plan_id, changes) internally without naming the tool to the user. DO NOT propose your own prose version of the plan; summary_for_user is the canonical view.",
       };
 
       return { content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }] };
@@ -2224,13 +2225,14 @@ AFTER THIS: same flow as draft. Show the updated table, await explicit approval,
           budget_remaining_after_execution:
             v.budget_remaining !== null ? v.budget_remaining - v.totals.total_ai_cost : null,
         },
+        upfront_decisions_required: extractUpfrontDecisions(v.warnings),
         warnings: filterUserFacingWarnings(v.warnings),
         _internal_warning_signals: extractInternalOnlyWarnings(v.warnings),
         blockers: v.blockers,
         next_step_instructions:
           v.blockers.length > 0
             ? "Plan still has blockers. Surface to the user, then iterate. Obey USER-FACING LANGUAGE LOCK: do not name tools or internal fields when explaining changes."
-            : "Plan is valid. Surface summary_for_user verbatim AND mention the updated cost in natural language using totals.estimated_total_credits_cost and totals.budget_remaining_after_execution. Ask the user for explicit approval before executing. Surface ONLY warnings array (already filtered to user-safe); never mention _internal_warning_signals to the user. DO NOT replace summary_for_user with your own prose table.",
+            : "FIRST handle upfront_decisions_required if non-empty (same rule as draft_content_plan: surface BEFORE the plan summary, never as a trailing PD). Plan is valid. Surface summary_for_user verbatim AND mention the updated cost in natural language using totals.estimated_total_credits_cost and totals.budget_remaining_after_execution. Ask the user for explicit approval before executing. Surface ONLY warnings array (already filtered to user-safe); never mention _internal_warning_signals to the user. DO NOT replace summary_for_user with your own prose table.",
       };
       return { content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }] };
     },
@@ -5021,7 +5023,13 @@ function filterUserFacingWarnings(
 ): Array<Record<string, unknown>> {
   return warnings.filter((w) => {
     const msg = w["user_facing_message"];
-    return typeof msg === "string" && msg.length > 0;
+    if (typeof msg !== "string" || msg.length === 0) return false;
+    // upfront decisions live in their own array (extractUpfrontDecisions
+    // below); they MUST NOT also appear in warnings, otherwise the LLM
+    // tends to surface them twice (once up front, once at the bottom)
+    // and the user gets confused.
+    if (w["is_upfront_decision"] === true) return false;
+    return true;
   });
 }
 
@@ -5031,6 +5039,24 @@ function extractInternalOnlyWarnings(
   return warnings.filter((w) => {
     const msg = w["user_facing_message"];
     return msg === null || msg === undefined;
+  });
+}
+
+/**
+ * Warnings flagged is_upfront_decision are routed to a dedicated array
+ * that the LLM is instructed to surface BEFORE the plan summary (so the
+ * user decides on these before mentally approving the plan). Example:
+ * brand_voice_missing. Without this, the same warning ends up at the end
+ * of the warnings array and the LLM presents it as a "PD/aviso" after
+ * the user has already approved the plan, which is too late.
+ */
+function extractUpfrontDecisions(
+  warnings: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+  return warnings.filter((w) => {
+    if (w["is_upfront_decision"] !== true) return false;
+    const msg = w["user_facing_message"];
+    return typeof msg === "string" && msg.length > 0;
   });
 }
 
@@ -5506,10 +5532,20 @@ async function runValidation(args: {
       // accidentally drop the warning when prompts actually are missing.
     }
     if (!hasVoicePromptLive) {
+      // upfront_decision marker: the validator emits this with a special
+      // issue prefix so the response builder can re-route it from the
+      // generic "warnings" array (which the LLM tends to present at the
+      // BOTTOM, after the plan summary) into an upfront_decisions_required
+      // array (which the LLM is instructed to present BEFORE the summary).
+      // Without this routing, brand-voice-missing typically shipped as a
+      // "PD/aviso al pie" trailing the plan, which is the wrong moment
+      // for the user to decide: they have already mentally approved the
+      // plan and won't pause to add the voice.
       warnings.push({
         issue: "brand_voice_missing",
+        is_upfront_decision: true,
         user_facing_message:
-          "Esta marca no tiene voz de marca configurada todavía. Los copies van a salir con el tono default, más genérico. Si querés, antes de ejecutar te la armo en una llamada.",
+          "Esta marca no tiene voz de marca configurada todavía. Los copies van a salir con el tono default, más genéricos. Antes de mostrarte el plan armado, ¿la armamos en una llamada (recomendado) o avanzamos con el tono default?",
       });
     }
   }
