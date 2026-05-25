@@ -212,18 +212,30 @@ function validatePrivacyLevel(
   const level = prefs?.["privacy_level"];
 
   if (level == null || typeof level !== "string" || level === "") {
+    // Bias the suggestion toward the most common default. Most public
+    // accounts allow PUBLIC_TO_EVERYONE; the agent can use it without a
+    // confirmation round-trip unless the runtime context says otherwise.
+    // Private / brand-only accounts will be flagged in the second branch
+    // when the runtime context reports a restricted option set.
+    const optionsList = context.tiktok_privacy_level_options;
+    const safeDefault =
+      optionsList && optionsList.length > 0
+        ? optionsList.includes("PUBLIC_TO_EVERYONE")
+          ? "PUBLIC_TO_EVERYONE"
+          : optionsList[0]
+        : "PUBLIC_TO_EVERYONE";
     warnings.push({
       spec_key: specKey,
       field: "preferences.privacy_level",
       rule: "required",
       current_value: level ?? null,
-      expected: context.tiktok_privacy_level_options ?? "one of TikTok's privacy levels",
+      expected: optionsList ?? "one of TikTok's privacy levels",
       severity: "hard_fail",
-      suggestion: `TikTok requires preferences.privacy_level. ${
-        context.tiktok_privacy_level_options
-          ? `Allowed for this account: ${context.tiktok_privacy_level_options.join(", ")}.`
-          : "Check the connected TikTok account for allowed values."
-      }`,
+      suggestion: `TikTok requires preferences.privacy_level (UPPERCASE_WITH_UNDERSCORES). Common safe default: "${safeDefault}". ${
+        optionsList
+          ? `Allowed for this connected account: ${optionsList.join(", ")}.`
+          : "Allowed values vary per connected account. Confirm with the user that the post should be public, or call gatherRuntimeContext (this happens automatically inside create_post / create_post_group_with_posts) to discover the live options."
+      } Pre-validate by calling validate_against_specs(network: "tiktok", product_type: "feed", preferences: { privacy_level: "${safeDefault}", ... }) before invoking the create tools so this never blocks the create call.`,
     });
     return warnings;
   }

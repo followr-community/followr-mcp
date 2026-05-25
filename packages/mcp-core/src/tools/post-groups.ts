@@ -456,6 +456,8 @@ VIDEO WORKFLOW: if any sub-post targets a reel / short, the validator requires a
 
 TIKTOK CONSTRAINT: tiktok_feed REQUIRES a single video asset. Single images are rejected by the spec (max_images_length=0). If the user wants to publish a still image to TikTok, the agent must first generate a video (the most complete flow is generate_avatar_video with subtitles burned in, or a lifestyle/motion clip via generate_ai_video_clip if no person speaking is needed) or upload an existing one via upload_video_from_url.
 
+TIKTOK PRIVACY_LEVEL: tiktok_feed REQUIRES preferences.privacy_level. Always pass it on TikTok sub-posts (UPPERCASE_WITH_UNDERSCORES: PUBLIC_TO_EVERYONE | MUTUAL_FOLLOW_FRIENDS | SELF_ONLY | FOLLOWER_OF_CREATOR). The common safe default for public brand posts is PUBLIC_TO_EVERYONE. The allowed set varies per connected account: if you have any doubt the user's TikTok permits the value you picked, call validate_against_specs first (or read the gatherRuntimeContext output) so the create call never aborts on this. The tool will pre-validate and abort with a hard_fail if privacy_level is missing on a TikTok sub-post, so set it up front to save a round-trip.
+
 SCHEDULING: pass publish_at on the PostGroup-level fields if the group should be scheduled at creation; same semantics as create_post_group (draft=true + publish_at parks the schedule).
 
 RETURNS: { post_group, posts: Post[], validation: { warnings_by_post: SpecWarning[][] }, runtime_context }.`,
