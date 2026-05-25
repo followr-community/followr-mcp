@@ -3431,6 +3431,81 @@ function mergeReferenceUrls(
   return out;
 }
 
+/**
+ * HEAD-probe a list of reference image URLs in parallel. Returns the
+ * subset that responded 2xx and looked like images. Used as a guard
+ * before passing brand identity references to /api/aiResults/image:
+ * stale signed URLs, deleted assets, or non-image content-types are
+ * the suspected cause of the "Missing required parameter: 'images'"
+ * error class seen with nano_banana_2 in execute_content_plan v0.4.4
+ * (the SPA web does NOT pre-inject brand refs, so it never hits the
+ * same failure mode).
+ *
+ * Never blocks: a refusing remote (HEAD not supported, network blip)
+ * leaves the URL on the OK list rather than dropping it. Worst case we
+ * pass through to the backend with a slightly stale URL, which is what
+ * the v0.4.3 behavior did anyway. Best case we drop the actually-broken
+ * URL before it poisons the request.
+ */
+async function filterReachableImageUrls(
+  urls: string[],
+  fetchImpl: typeof fetch = globalThis.fetch,
+): Promise<{ valid: string[]; dropped: Array<{ url: string; reason: string }> }> {
+  if (urls.length === 0) return { valid: [], dropped: [] };
+  const probes = await Promise.all(
+    urls.map(async (url): Promise<{ url: string; ok: boolean; reason?: string }> => {
+      try {
+        const resp = await fetchImpl(url, { method: "HEAD" });
+        if (!resp.ok) {
+          return { url, ok: false, reason: `HTTP ${resp.status}` };
+        }
+        const contentType = resp.headers.get("content-type") ?? "";
+        // Be liberal: many CDNs return image/* and some return
+        // application/octet-stream with a correct extension. Only drop
+        // explicit non-image content types.
+        if (contentType && !contentType.startsWith("image/") && !contentType.startsWith("application/octet-stream")) {
+          return { url, ok: false, reason: `non-image content-type "${contentType}"` };
+        }
+        return { url, ok: true };
+      } catch (err) {
+        // Network blip / HEAD blocked: assume usable rather than drop.
+        return { url, ok: true, reason: `head_probe_failed:${err instanceof Error ? err.message : String(err)}` };
+      }
+    }),
+  );
+  const valid: string[] = [];
+  const dropped: Array<{ url: string; reason: string }> = [];
+  for (const p of probes) {
+    if (p.ok) {
+      valid.push(p.url);
+    } else {
+      dropped.push({ url: p.url, reason: p.reason ?? "unknown" });
+    }
+  }
+  return { valid, dropped };
+}
+
+/**
+ * Detects the class of backend error that we want to recover from by
+ * retrying without reference images. Pattern observed: nano_banana_2
+ * occasionally rejects a call with "Missing required parameter:
+ * 'images'" or a generic 4xx when reference URLs included in the
+ * request are unreachable or in a format the provider rejects. The SPA
+ * web of Followr does NOT pre-inject brand refs and never hits this
+ * failure mode (verified empirically 2026-05-24 with the same prompt +
+ * model + count).
+ */
+function isImageRefRejectionError(message: string): boolean {
+  const m = message.toLowerCase();
+  return (
+    m.includes("missing required parameter") ||
+    m.includes("'images'") ||
+    m.includes("invalid image") ||
+    m.includes("image_urls") ||
+    m.includes("reference image")
+  );
+}
+
 async function resolveAssetSourceFresh(
   client: FollowrClient,
   companyId: number,
@@ -3490,11 +3565,27 @@ async function resolveAssetSourceFresh(
 
     // Merge caller-provided refs (legacy single + new plural) with brand
     // auto-refs. Cap at 5 total.
-    const finalRefs = mergeReferenceUrls(
+    const mergedRefs = mergeReferenceUrls(
       imgSrc.reference_image_url,
       imgSrc.reference_image_urls,
       brandRefsPicked.urls,
     );
+
+    // Pre-flight reachability check on the merged ref list. Stale signed
+    // URLs / deleted brand assets / wrong content-types are the suspected
+    // cause of "Missing required parameter: 'images'" failures from
+    // nano_banana_2 (verified empirically that the SPA web has no such
+    // pre-injection and never fails). This step is best-effort: if HEAD
+    // probing is itself blocked, the URL stays on the list. See
+    // filterReachableImageUrls for the policy.
+    const probe = await filterReachableImageUrls(mergedRefs);
+    const finalRefs = probe.valid;
+    if (probe.dropped.length > 0) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[execute_content_plan] Dropped ${probe.dropped.length} unreachable reference image(s) before generation: ${probe.dropped.map((d) => `${d.url} (${d.reason})`).join("; ")}`,
+      );
+    }
 
     // F6: when at least one reference is a TYPOGRAPHY_REFERENCE asset,
     // append the negative-literal-copy suffix so the model uses the
@@ -3508,7 +3599,7 @@ async function resolveAssetSourceFresh(
     // the user prompt so they don't dilute its primary intent.
     const finalPrompt = `${hardenAiImagePrompt(imgSrc.prompt)}${brandSuffix}${typoSuffix}`;
 
-    const aiResult = await client.generateImage({
+    const buildPayload = (refs: string[]) => ({
       q: finalPrompt,
       company_id: companyId,
       ...(resolvedAspectRatio ? { aspect_ratio: resolvedAspectRatio } : {}),
@@ -3517,18 +3608,50 @@ async function resolveAssetSourceFresh(
       // Prefer the new plural field when we have more than one ref; fall back
       // to the legacy singular when only one is present (which is what the
       // pre-F3 behavior used, so semantics are preserved).
-      ...(finalRefs.length > 1
-        ? { image_urls: finalRefs }
-        : finalRefs.length === 1
-          ? { image_url: finalRefs[0] }
+      ...(refs.length > 1
+        ? { image_urls: refs }
+        : refs.length === 1
+          ? { image_url: refs[0] }
           : {}),
     });
+
+    let aiResult;
+    let usedRefs = finalRefs;
+    let retriedWithoutRefs = false;
+    try {
+      aiResult = await client.generateImage(buildPayload(finalRefs));
+    } catch (err) {
+      // First-attempt failure with refs in the payload: retry once
+      // without refs if the error class matches the known ref-rejection
+      // pattern. Recovery is "best effort"; if the second attempt also
+      // fails we surface the original error context to the caller.
+      const message = err instanceof Error ? err.message : String(err);
+      if (finalRefs.length > 0 && isImageRefRejectionError(message)) {
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[execute_content_plan] generateImage failed with ref-related error ("${message.slice(0, 200)}"); retrying without ${finalRefs.length} reference image(s).`,
+        );
+        usedRefs = [];
+        retriedWithoutRefs = true;
+        aiResult = await client.generateImage(buildPayload([]));
+      } else {
+        throw err;
+      }
+    }
     const final = await client.waitForAiResult(aiResult.id, { timeoutMs: 5 * 60 * 1000 });
     if (final.status !== "completed") {
+      const retryNote = retriedWithoutRefs
+        ? " (retry without refs after initial ref-related failure also did not complete)"
+        : finalRefs.length > 0
+          ? ` (payload included ${finalRefs.length} reference image(s); model=${imgSrc.model ?? "default"})`
+          : "";
       throw new Error(
-        `AI image generation failed (id=${final.id}, status=${final.status}, message=${final.status_message ?? "no message"}). Backend response: ${JSON.stringify(final).slice(0, 500)}`,
+        `AI image generation failed (id=${final.id}, status=${final.status}, message=${final.status_message ?? "no message"})${retryNote}. Backend response: ${JSON.stringify(final).slice(0, 500)}`,
       );
     }
+    // Use usedRefs.length to silence the unused-variable lint when no
+    // retry happened. The variable carries useful debug info above.
+    void usedRefs;
     const imageUrl =
       (final as unknown as { image_url?: string; response?: string }).image_url ??
       (final as unknown as { response?: string }).response;
