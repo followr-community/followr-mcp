@@ -1349,7 +1349,7 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
                   {
                     id: "setup_bvi_first",
                     description:
-                      "Llamar assess_brand_visual_identity(company_id) para arrancar el cold-start flow. Volver al plan cuando la BVI esté lista. Recomendado cuando el plan incluye piezas hero, launch, o cualquier contenido brand-crítico.",
+                      "Llamar assess_brand_visual_identity(company_id) para arrancar el cold-start flow. Volver al plan cuando la BVI esté lista. Recomendado para cualquier plan que vaya a generar imágenes con AI (sin BVI las imágenes salen genéricas, sin paleta ni templates curados).",
                   },
                   {
                     id: "proceed_without_bvi",
@@ -1500,7 +1500,7 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
           recommended_video_model_policy:
             "available_video_models is pre-sorted: the FIRST entry is the recommended default for this company. ALWAYS pick the first entry, and ALWAYS use the model_id verbatim from the catalog. Do NOT invent model IDs from memory: Followr's canonical format uses dots for major.minor versions (veo_3.1_fast, veo_3.1, wan_2.2, seedance_1.1_light, seedance_2.0_fast, etc.) and no separator for hailuo (hailuo_02_standard, hailuo_02_premium). Underscored variants like veo_3_1_fast or hailuo_0_2_premium do NOT exist in Followr; the backend rejects them with HTTP 422 'selected model is invalid'. The sort accounts for company ai_preferences.video_model (rank 0 when set, with is_company_default: true) and for plan gating (when followr_plus_enabled is false, wan_2.2 is promoted to rank 0 with is_plan_fallback_default: true and every premium-bucket model is marked blocked_by_plan: true and affordable_at_default_duration: false). On accounts WITHOUT Followr Plus the ONLY accepted video model is wan_2.2; never recommend a premium-bucket model on those accounts. If the user explicitly asks for a premium model and followr_plus_enabled is false, explain the limitation and point them to followr.ai to activate the Followr Plus add-on.",
           recommended_image_model_policy:
-            "available_image_models is pre-sorted by quality (best → worst). The FIRST entry is the recommended default (company ai_preferences.image_model when set, otherwise Google Nano Banana 2). When passing the value to a tool, ALWAYS use model_id verbatim from the catalog (the backend is strict about format: gpt-image-1-auto uses hyphens, flux_pro_1.1 uses a dot, wan_25_preview has no separator between 2 and 5, recraftv3 is one word). When TALKING TO THE USER, use the human display_name (Google Nano Banana 2, OpenAI GPT Image 2, Google Imagen 4 Fast, etc.) and the quality positioning from recommended_for; never quote the model_id, never quote 'premium bucket' or HTTP error codes.\n\nQUALITY LADDER (Followr team ranking, all model_ids verified against backend on 2026-05-22, best → worst):\n  1. Google Nano Banana 2 (default, balanced, 25 cr)\n  2. OpenAI GPT Image 2 (flagship, 70 cr)\n  3. Google Nano Banana (12 cr, high tier just below GPT Image 2)\n  4. Google Imagen 4 (12 cr)\n  5. Google Imagen 4 Fast (6 cr)\n  6. GPT Image (10 cr, older OpenAI)\n  7. Ideogram V3 (18 cr, use when the image needs legible baked-in text)\n  8. Wan 2.5 Preview (15 cr)\n  9. Fal Flux Pro 1.1 (12 cr, Flux aesthetic)\n  10. Fal Flux.1 Dev (8 cr)\n  11. Seedream V4 (10 cr)\n  12. Recraft v3 - Digital (3 cr, flat illustration style)\n  Z-Image Turbo (2 cr, fallback, lowest quality)\n\nAVAILABLE ON REQUEST (not in default ladder, but still callable): Google Nano Banana Pro (45 cr, marked 'best' in the Followr UI but excluded from the user's explicit quality ranking) and Fal Flux Pro Kontext (12 cr, Kontext capability variant). Surface these only when the user specifically asks for them.\n\nWhen the user is making a hero / launch / brand-critical piece and is on Followr Plus, propose stepping up to OpenAI GPT Image 2 or Google Nano Banana explicitly. Do NOT silently swap to a model with WORSE quality just because the cost is lower (anti-pattern from PostApprove 2026-05-22: suggesting 'Fal Flux Pro 1.1 (12 cr) for the hero' when it actually ranks BELOW Nano Banana 2 in raw quality).\n\nPLAN GATING: on accounts WITHOUT followr_plus_enabled the ONLY accepted image models are Google Nano Banana 2 and Z-Image Turbo; every other entry above is premium and the backend rejects them. If the user explicitly asks for a premium model on a non-Plus account, translate the limitation to plain language (without quoting field names or HTTP codes) and offer Google Nano Banana 2 as the alternative.",
+            "available_image_models is pre-sorted by quality (best → worst). The FIRST entry is the recommended default (company ai_preferences.image_model when set, otherwise Google Nano Banana 2). When passing the value to a tool, ALWAYS use model_id verbatim from the catalog (the backend is strict about format: gpt-image-1-auto uses hyphens, flux_pro_1.1 uses a dot, wan_25_preview has no separator between 2 and 5, recraftv3 is one word). When TALKING TO THE USER, use the human display_name (Google Nano Banana 2, OpenAI GPT Image 2, Google Imagen 4 Fast, etc.) and the quality positioning from recommended_for; never quote the model_id, never quote 'premium bucket' or HTTP error codes.\n\nQUALITY LADDER (Followr team ranking, all model_ids verified against backend on 2026-05-22, best → worst):\n  1. Google Nano Banana 2 (default, balanced, 25 cr)\n  2. OpenAI GPT Image 2 (flagship, 70 cr)\n  3. Google Nano Banana (12 cr, high tier just below GPT Image 2)\n  4. Google Imagen 4 (12 cr)\n  5. Google Imagen 4 Fast (6 cr)\n  6. GPT Image (10 cr, older OpenAI)\n  7. Ideogram V3 (18 cr, use when the image needs legible baked-in text)\n  8. Wan 2.5 Preview (15 cr)\n  9. Fal Flux Pro 1.1 (12 cr, Flux aesthetic)\n  10. Fal Flux.1 Dev (8 cr)\n  11. Seedream V4 (10 cr)\n  12. Recraft v3 - Digital (3 cr, flat illustration style)\n  Z-Image Turbo (2 cr, fallback, lowest quality)\n\nAVAILABLE ON REQUEST (not in default ladder, but still callable): Google Nano Banana Pro (45 cr, marked 'best' in the Followr UI but excluded from the user's explicit quality ranking) and Fal Flux Pro Kontext (12 cr, Kontext capability variant). Surface these only when the user specifically asks for them.\n\nTREAT EVERY PIECE EQUALLY. Do NOT auto-upgrade the image model for posts that look 'important' or 'hero' or 'launch'. The default model applies uniformly across the whole plan; users explicitly opt-in to an upgrade via update_content_plan when they want a specific piece in a different tier. Do NOT silently swap to a model with WORSE quality just because the cost is lower (anti-pattern from PostApprove 2026-05-22: suggesting 'Fal Flux Pro 1.1 (12 cr)' for a piece when it actually ranks BELOW Nano Banana 2 in raw quality).\n\nPLAN GATING: on accounts WITHOUT followr_plus_enabled the ONLY accepted image models are Google Nano Banana 2 and Z-Image Turbo; every other entry above is premium and the backend rejects them. If the user explicitly asks for a premium model on a non-Plus account, translate the limitation to plain language (without quoting field names or HTTP codes) and offer Google Nano Banana 2 as the alternative.",
           website_grounding_strategy:
             "brand_context.website_summary is a SHALLOW metadata scrape (title, meta description, og:* tags, top headings). It does NOT contain product image URLs. When the company has a product website AND the plan involves product imagery (fashion, beauty, food, retail, packaging), STRONGLY CONSIDER calling deep_research(company_id) BEFORE draft_content_plan to retrieve real product URLs and image URLs. Use the resulting image URLs as reference_image_url on each ai_generate source so the generated assets resemble the actual brand catalog instead of generic AI imaginings. If you skip this step on a product-heavy brand, mention it explicitly to the user so they can opt in.",
           per_item_preview_strategy:
@@ -1694,7 +1694,7 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
       .max(20)
       .optional()
       .describe(
-        "Ordered list of carousel slides. Array position equals display order in the published carousel: index 0 is the cover, the last index is the closing slide. The order is preserved end-to-end (validator, resolver, execute_content_plan, create_post). Plan accordingly: cover -> steps in numeric order -> CTA, or hero -> details -> CTA. NEVER assume the platform re-sorts; it does not.",
+        "Ordered list of carousel slides. Array position equals display order in the published carousel: index 0 is the cover, the last index is the closing slide. The order is preserved end-to-end (validator, resolver, execute_content_plan, create_post). Plan accordingly: cover -> steps in numeric order -> CTA. NEVER assume the platform re-sorts; it does not.",
       ),
     video_source: z
       .union([
@@ -4650,36 +4650,16 @@ function buildItemPreview(
     flags.push("use_brand_voice está en false: los copys finales no van a usar el brand voice prompt aunque esté cargado.");
   }
 
-  // Quality-upgrade heuristic. Surface a soft suggestion when the asset
-  // plan looks "hero" (rationale hints at launch/promo/key piece) but the
-  // chosen models are the cheapest in their tier. The user can ignore;
-  // not blocking. Only fires when the account has Followr Plus (premium
-  // models are usable). Helps the user discover that "you could pay more
-  // for noticeably better quality on the key piece of the week".
-  const heroKeywords = /(lanzamiento|launch|hero|pieza\s+hero|principal|cinematogr[aá]fico|cinematic|promo\s+clave|drop\s+principal|featured|flagship|destacad[ao])/i;
-  const looksHero = heroKeywords.test(item.rationale + " " + item.concept_shared);
-  if (looksHero && followrPlusEnabled === true) {
-    const lowTierVideo = sharedAssetPlan.some((e) => {
-      if (e.preview.kind !== "ai_video") return false;
-      const vm = VIDEO_MODELS.find((m) => m.model_id === e.preview.model);
-      return vm?.model_id === "veo_3.1_fast" || vm?.model_id === "wan_2.2";
-    });
-    if (lowTierVideo) {
-      flags.push(
-        'El concepto se lee como "hero" pero el video usa un modelo de entrada (veo_3.1_fast). Si querés calidad superior, podés subir a veo_3_fast (~3200 cr/8s) o veo_3.1 (~4800 cr/8s) con update_content_plan. Solo aplica si vale la pena el costo extra.',
-      );
-    }
-    const lowTierImage = sharedAssetPlan.some((e) => {
-      if (e.preview.kind !== "ai_image") return false;
-      const im = IMAGE_MODELS.find((m) => m.model_id === e.preview.model);
-      return im?.model_id === "nano_banana_2" || im?.model_id === "z_image_turbo";
-    });
-    if (lowTierImage) {
-      flags.push(
-        'El concepto se lee como "hero" pero las imágenes usan modelos de entrada. Si querés calidad superior, podés subir a nano_banana_pro (~45 cr) o flux_pro_1.1 (~12 cr) con update_content_plan.',
-      );
-    }
-  }
+  // Quality-upgrade heuristic deliberately removed (2026-05-24): the prior
+  // code detected "hero/launch/cinematic" keywords in the rationale and
+  // suggested swapping the cheap model for veo_3_fast (~3200 cr/8s) or
+  // nano_banana_pro (~45 cr) on those items. The detection produced
+  // confusing "tu pieza hero podría ser mejor" warnings and silently
+  // upsold parts of the plan to 8x more expensive video. The product
+  // direction is now: every piece in a plan is treated equally, the user
+  // picks the model tier explicitly at draft time (or upgrades a specific
+  // item via update_content_plan), and the agent never auto-flags some
+  // items as "more important" than others.
 
   const minGen = imageAiCount > 0 ? 1 : 0;
   const maxGen = imageAiCount * 0.5 + (videoAiCount > 0 ? 10 : 0);
