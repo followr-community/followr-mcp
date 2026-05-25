@@ -217,7 +217,9 @@ ASYNC: wait=true (default) blocks. wait=false returns pending id.`,
       title: "Generate one avatar lipsync clip (single talking-head scene, no subtitles, no concat, fast quote)",
       description: `Compound workflow that produces a single avatar lipsync video clip. Internally: 1) fetch the avatar's voice + image, 2) generate TTS audio with the avatar's voice, 3) wait for audio, 4) generate the lipsync video (avatar talking head).
 
-USE THIS WHEN: the user wants a quick single-scene clip without subtitles or multi-scene concatenation. For the standard "AI Video Avatars" multi-scene flow with burned-in subtitles, use generate_avatar_video instead.
+THIS IS THE EXCEPTION, NOT THE DEFAULT. Generates a SINGLE talking head, NO subtitles, NO transitions, NO multi-scene. The polished "AI Video Avatars" output the Followr UI ships by default (multi-scene reel with burned-in subtitles + per-scene backgrounds) lives in generate_avatar_video. If the user did NOT explicitly ask for a single bare clip, OR if a content_plan PlanItem described the asset as "video avatar multi-escena" / "avatar narra N escenas" / "avatar_video", you MUST use generate_avatar_video. Using lipsync to "save credits" on a request that expected multi-scene is a regression: the user gets a stripped-down output without the subtitles they expected, AND the cost saving is usually small because both tools bill at 25 cr/seg.
+
+USE THIS ONLY WHEN: the user explicitly requested a single bare talking-head clip with no subtitles and no scene changes (e.g. "just give me one quick 15-second clip of the avatar saying X, no extras"). Otherwise default to generate_avatar_video.
 
 CRITICAL: heavy operation. Cost is per SECOND of generated video (model veed_fabric_1.0 = 25 cr/seg). A typical lipsync clip is ~10-15 seconds = roughly 250-400 credits. Call get_credits_balance before to confirm the user has budget.
 
@@ -368,6 +370,8 @@ MODEL: hardcoded to fal + veed_fabric_1.0 (the only lipsync model verified to wo
 3. For each scene (in parallel): generate avatar lipsync video using audio + per-scene background (or avatar portrait directly when backgrounds are disabled).
 4. Wait for lipsync jobs.
 5. Concat all lipsync clips into one MP4 with burned-in subtitles via Creatomate (driver=creatomate, model=creatomate_video).
+
+DEFAULT FOR ALL AVATAR VIDEOS. Use this whenever the user (or a content_plan PlanItem) describes an asset as "avatar video", "video con avatar", "video avatar multi-escena", "avatar narra N escenas", or anything that implies more than a single bare clip. The single-scene generate_avatar_lipsync_clip is the exception, reserved for users who explicitly want a stripped-down talking head with no subtitles. If a planning step produced an ai_avatar_video source (multi-scene with subtitles, transitions, animations) and the executing agent has to materialize it manually because execute_content_plan v1 does not run avatar tools end-to-end, use THIS tool, not the lipsync one. Replacing multi-scene with lipsync "to save credits" is a regression: the user loses the subtitles and the cost saving is small (both bill at 25 cr/seg of speech).
 
 USE THIS WHEN: the user wants a real avatar video like the one Followr UI produces from Avatar Video Creator (multi-scene, with subtitles, ready to publish to Reels/Shorts/TikTok). This is the flagship video tool of Followr.
 

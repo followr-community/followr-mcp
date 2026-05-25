@@ -3579,8 +3579,22 @@ async function resolveAssetSourceFresh(
     };
   }
   if (src.type === "ai_avatar_lipsync" || src.type === "ai_avatar_video") {
+    // execute_content_plan v1 does not run avatar tools end-to-end. The
+    // agent has to materialize the avatar asset manually and then point
+    // the plan at the resulting asset id. The original draft already
+    // committed to a SHAPE (single-scene lipsync vs multi-scene with
+    // subtitles); the recovery suggestion must preserve that shape and
+    // not silently degrade to lipsync to save credits.
+    const targetTool =
+      src.type === "ai_avatar_video"
+        ? "generate_avatar_video"
+        : "generate_avatar_lipsync_clip";
+    const shapeNote =
+      src.type === "ai_avatar_video"
+        ? "Multi-scene reel with burned-in subtitles, transitions, and per-scene backgrounds. Do NOT substitute generate_avatar_lipsync_clip even if it looks cheaper: that tool produces a single bare talking head without subtitles, which is a different output shape than what the plan committed to."
+        : "Single-scene bare talking head, no subtitles, no concat. This shape was chosen explicitly at draft time; do not upgrade to generate_avatar_video unless the user re-confirms.";
     throw new Error(
-      `Asset strategy ${src.type} is not supported by execute_content_plan in v1. Generate the avatar video first by calling generate_avatar_lipsync_clip or generate_avatar_video, then pass the resulting asset id via assets_strategy.video_source = { type: "asset_id", id: <n> }.`,
+      `Asset strategy ${src.type} is not supported by execute_content_plan in v1. Generate the avatar video first by calling ${targetTool} (the tool that matches the plan's avatar shape), then pass the resulting asset id via assets_strategy.video_source = { type: "asset_id", id: <n> } and re-run execute_content_plan. ${shapeNote}`,
     );
   }
   throw new Error(`Unknown asset source type: ${(src as { type?: string }).type ?? "unknown"}`);
