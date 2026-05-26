@@ -22,6 +22,7 @@ import type {
   CanvaDesign,
   Company,
   Conversation,
+  Creative,
   ElevenLabsVoice,
   ExternalUser,
   Folder,
@@ -963,8 +964,32 @@ export class FollowrClient {
   // AI Results (master endpoint for all AI generation)
   // ──────────────────────────────────────────────────────────
 
-  /** POST /api/aiResults/chat. Text generation. */
-  async generateChat(body: { q: string; company_id?: number; driver?: string; model?: string; queue?: boolean; chargeable?: number }): Promise<AiResult> {
+  /**
+   * POST /api/aiResults/chat. Text generation.
+   *
+   * Body fields verified empíricamente:
+   * - `q`: user prompt (required).
+   * - `q_system`: system prompt (optional). Inyectado por la SPA al usar
+   *   Post Generator chat. NO procesa imágenes aunque el modelo
+   *   subyacente (Claude Sonnet 4 default) tenga vision. Para vision,
+   *   usar `captionImage` separado y concatenar el caption al `q`.
+   * - `temperature`, `top_p`: opcionales, defaults 1 y 1.
+   * - `chargeable`: 1 para que cuente como uso facturable (la SPA siempre
+   *   lo manda). 0 no testeado.
+   * - `image_url`: SERVIDOR LO IGNORA. Comprobado empíricamente
+   *   2026-05-25. Para image input usar `captionImage` separado.
+   */
+  async generateChat(body: {
+    q: string;
+    q_system?: string;
+    company_id?: number;
+    driver?: string;
+    model?: string;
+    queue?: boolean;
+    chargeable?: number;
+    temperature?: number;
+    top_p?: number;
+  }): Promise<AiResult> {
     const result = await this.request<ApiSingle<AiResult>>("POST", "/api/aiResults/chat", { body });
     return result.data;
   }
@@ -1111,6 +1136,159 @@ export class FollowrClient {
     if (options.model) query["filter[model]"] = options.model;
     if (options.include) query["include"] = options.include;
     const result = await this.request<ApiCollection<AiResult>>("GET", "/api/aiResults", { query });
+    return result.data;
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // Creative Studio (POST /api/companies/{id}/creative)
+  //
+  // Status: 🔍 Descubierto 2026-05-25 (followr-mcp empírico).
+  // Doc: docs/followr-api/creative-studio.md
+  //
+  // Genera creatives brand-aware con design system y copy AI. Backend hace
+  // text AI step interno para inventar la copy literal (headlines, CTAs),
+  // arma un prompt enriquecido de ~1850 chars con secciones de
+  // background/palette/typography/layout/composition, y lo manda al image
+  // model (nano_banana_2 default) con el logo del brand como reference image.
+  //
+  // Cost: 25 cr/slide con nano_banana_2. ~45 cr con nano_banana_pro.
+  // ──────────────────────────────────────────────────────────
+
+  /**
+   * POST /api/companies/{id}/creative. Crea un Creative y devuelve su id +
+   * shell vacío. Las ai_results se van llenando vía polling con
+   * `getCreative` hasta status=completed.
+   */
+  async createCreative(
+    companyId: number,
+    body: {
+      content_type: "single" | "carousel" | "auto";
+      style_key: string;
+      prompt: string;
+      aspect_ratio: "1:1" | "4:5" | "9:16" | "16:9" | "2:3";
+      slide_count: number;
+      model?: string;
+      brand_context?: string;
+      include_brand_logo?: boolean;
+      use_brand_colors?: boolean;
+      image_urls?: string[] | null;
+      carousel_format?: Record<string, unknown> | null;
+    },
+  ): Promise<Creative> {
+    const fullBody = {
+      model: "nano_banana_2",
+      include_brand_logo: true,
+      use_brand_colors: true,
+      image_urls: null,
+      carousel_format: null,
+      ...body,
+    };
+    const result = await this.request<ApiSingle<Creative>>(
+      "POST",
+      `/api/companies/${companyId}/creative`,
+      { body: fullBody },
+    );
+    return result.data;
+  }
+
+  /**
+   * GET /api/creative/{id}. Polling endpoint. Pasar `include` para hidratar
+   * las ai_results con sus images.
+   *
+   * Default include = "aiResults,aiResults.images,aiResults.images.thumbnail"
+   * (la query mínima útil; sin esto, ai_results vienen vacíos).
+   */
+  async getCreative(
+    creativeId: number,
+    options?: { include?: string },
+  ): Promise<Creative> {
+    const query: Query = {
+      include:
+        options?.include ??
+        "aiResults,aiResults.images,aiResults.images.thumbnail",
+    };
+    const result = await this.request<ApiSingle<Creative>>(
+      "GET",
+      `/api/creative/${creativeId}`,
+      { query },
+    );
+    return result.data;
+  }
+
+  /**
+   * Convenience: poll `getCreative` hasta que todos los ai_results esperados
+   * estén `completed` o alguno esté `failed`.
+   *
+   * Default interval: 3s. Default timeout: 3 minutos (single takes 30-60s,
+   * carousel de 5+ slides puede tardar 90-120s con jitter).
+   *
+   * @returns el Creative final (con images hidratadas). Throws si timeout o si
+   *   algún ai_result quedó `failed`.
+   */
+  async waitForCreative(
+    creativeId: number,
+    options?: {
+      expectedSlides?: number;
+      intervalMs?: number;
+      timeoutMs?: number;
+    },
+  ): Promise<Creative> {
+    const intervalMs = options?.intervalMs ?? 3000;
+    const timeoutMs = options?.timeoutMs ?? 3 * 60_000;
+    const expectedSlides = options?.expectedSlides ?? 1;
+    const start = Date.now();
+    let lastSeen: Creative | null = null;
+    while (Date.now() - start < timeoutMs) {
+      const creative = await this.getCreative(creativeId);
+      lastSeen = creative;
+      const results = creative.ai_results ?? [];
+      const failed = results.find((r) => r.status === "failed");
+      if (failed) {
+        throw new FollowrApiError(
+          `Creative ${creativeId} ai_result ${failed.id} failed: ${failed.status_message ?? "(no message)"}`,
+          500,
+          `/api/creative/${creativeId}`,
+        );
+      }
+      const completedCount = results.filter((r) => r.status === "completed").length;
+      if (results.length >= expectedSlides && completedCount === results.length) {
+        return creative;
+      }
+      await new Promise((resolve) => setTimeout(resolve, intervalMs));
+    }
+    throw new FollowrApiError(
+      `Timeout waiting for creative ${creativeId} (>${timeoutMs}ms). Last seen: ${lastSeen?.ai_results?.length ?? 0} ai_results, ${lastSeen?.ai_results?.filter((r) => r.status === "completed").length ?? 0} completed.`,
+      408,
+      `/api/creative/${creativeId}`,
+    );
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // Image Caption (vision endpoint dedicado)
+  //
+  // Status: 🔍 Descubierto 2026-05-25 (followr-mcp empírico).
+  // Doc: docs/followr-api/ai-results.md (sección GET /api/openai/imageCaption)
+  //
+  // El endpoint /api/aiResults/chat NO procesa imágenes (el backend strippea
+  // image fields del body antes de llamar al provider). Este endpoint sí.
+  // Útil para clasificación visual (ej: detectar el visual_style de una
+  // marca a partir de screenshots de su landing y posts publicados).
+  // ──────────────────────────────────────────────────────────
+
+  /**
+   * GET /api/openai/imageCaption?url=<image_url>. Vision: devuelve un caption
+   * descriptivo de la imagen.
+   *
+   * @param imageUrl  URL accesible de la imagen. Acepta URLs internas de
+   *   Followr CDN (blob storage con SAS tokens) y URLs externas públicas.
+   * @returns el caption textual (50-150 words típicamente).
+   */
+  async captionImage(imageUrl: string): Promise<string> {
+    const result = await this.request<{ data: string }>(
+      "GET",
+      "/api/openai/imageCaption",
+      { query: { url: imageUrl } },
+    );
     return result.data;
   }
 

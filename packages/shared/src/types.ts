@@ -229,11 +229,46 @@ export interface AiResult {
   words?: number | null;
   created_at: Iso8601 | null;
   updated_at: Iso8601 | null;
+  /**
+   * Cuando este AiResult vino como parte de un Creative (POST /creative),
+   * el polling con include=aiResults.images hidrata `images[]` con las URLs
+   * finales (no en `response` como los aiResults de /aiResults/image). Cada
+   * entry tiene `url` (CDN URL, pre-signed) y opcionalmente thumbnail.
+   * Verificado empíricamente 2026-05-25 en `/api/creative/{id}` response.
+   */
+  images?: Array<{
+    id?: number;
+    url: string;
+    thumbnail?: { url: string } | null;
+    width?: number;
+    height?: number;
+  }>;
   // Note: when status is `completed`, the output URL (image / audio / video)
   // lives in the `response` field above (a string URL on CDN), NOT in
   // dedicated `image_url` / `audio_url` / `video_url` fields. The internal
   // doc previously claimed otherwise; corrected via empirical probe
   // 2026-05-14. For type=chat, `response` is the raw text completion.
+  // Exception: AiResults belonging to a Creative use `images[]` (see above).
+}
+
+/**
+ * Creative resource del endpoint Creative Studio (POST /api/companies/{id}/creative).
+ *
+ * Cada Creative es un container con N ai_results (uno por slide del creative).
+ * El polling vía GET /api/creative/{id} hidrata `ai_results[].images` con las
+ * URLs finales cuando cada slide queda `completed`.
+ *
+ * Status 🔍 Descubierto 2026-05-25 (followr-mcp empírico).
+ * Doc: docs/followr-api/creative-studio.md
+ */
+export interface Creative {
+  id: number;
+  title: string;
+  created_at: Iso8601 | null;
+  updated_at: Iso8601 | null;
+  ai_results: AiResult[];
+  user?: FollowrUser;
+  company?: Company;
 }
 
 export interface Conversation {

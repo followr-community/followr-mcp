@@ -65,6 +65,24 @@ export type AssetSourceAiImage = {
    * compat; the field is accepted by the schema but ignored at execute.
    */
   inspired_by_brand?: string;
+  /**
+   * Cuando true (default), execute_content_plan rutea esta generación a
+   * Creative Studio (POST /api/companies/{id}/creative) en lugar de al
+   * endpoint genérico /api/aiResults/image. Beneficios:
+   *   - Design system de 1850 chars enriquecido server-side
+   *   - Visual style elegido por el user (marker [visual_style:X@date])
+   *     se aplica como style_key automáticamente
+   *   - Logo + colors auto-inyectados sin armar manualmente reference_image_urls
+   *   - Copy en la imagen (headlines, CTAs) generada por un text AI step
+   *     interno desde el prompt + brand_context
+   * Set a false cuando se necesita un model NO soportado por Creative
+   * Studio (recraftv3, flux_pro_1.1, ideogram_v3, gpt-image-2, etc.) o
+   * cuando se quiere control fino sobre reference_image_urls. Default
+   * true (Creative Studio = mejor calidad on-brand para el caso típico).
+   *
+   * Agregado 2026-05-25.
+   */
+  use_creative_studio?: boolean;
 };
 export type AssetSourceAiVideo = {
   type: "ai_generate";
@@ -271,6 +289,14 @@ export interface ContextSnapshot {
   // industry-aware policies (recommended_video_strategy, format biases) have a
   // valid value to dispatch on.
   cached_industry_id: string | null;
+  // Visual style marker presence parsed from Company.description at bootstrap
+  // time (the `[visual_style:slug@date]` suffix written by confirm_visual_style).
+  // true when the company already fixed a default template, false when it
+  // didn't. draft_content_plan emits a visual_style_missing warning with
+  // is_upfront_decision: true when this is false, so the agent asks the user
+  // up front (same routing as brand_voice_missing) instead of burying it as a
+  // PD after the plan summary.
+  has_visual_style_marker: boolean;
 }
 
 // ── Memory store ────────────────────────────────────────────────────────────

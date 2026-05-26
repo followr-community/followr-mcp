@@ -301,6 +301,57 @@ export const BrandVisualIdentitySchema = z.object({
   asset_tag_map: z
     .record(z.string().regex(/^\d+$/u, "expected asset id as digit string"), z.array(z.string()))
     .default({}),
+
+  /**
+   * Visual style preferido de la marca para Creative Studio (POST /api/companies/{id}/creative).
+   *
+   * Lo setea `confirm_visual_style` después de que el agent muestre los
+   * options al user (vía list_visual_styles / propose_visual_style_options /
+   * detect_brand_visual_style) y el user elija uno. `generate_brand_creative`
+   * usa `primary_slug` como default cuando el caller no pasa style_key.
+   *
+   * Optional + nullable para backwards compatibility: companies que ya
+   * tenían BVI configurado antes de 2026-05-25 no tienen este field, parsean
+   * fine. Si null, generate_brand_creative cae al fallback "ai_decides".
+   *
+   * Status: agregado 2026-05-25 (followr-mcp). Coexiste con manufacture_brand_templates
+   * legacy hasta que el flow viejo se remueva.
+   */
+  recommended_visual_style: z
+    .object({
+      /**
+       * Slug del style elegido. Validado contra los 32 del catálogo
+       * (lib/creative-studio-styles.ts) en el tool, no acá (zod no conoce
+       * el catálogo, evitar import circular).
+       */
+      primary_slug: z.string().min(1).max(60),
+      /**
+       * Top alternativas rankeadas para que el agent pueda ofrecer
+       * variaciones sin re-detectar. Max 5.
+       */
+      ranked_alternatives: z
+        .array(
+          z.object({
+            slug: z.string().min(1).max(60),
+            confidence: z.number().min(0).max(1),
+          }),
+        )
+        .max(5)
+        .default([]),
+      /** Cómo se llegó al primary_slug. */
+      source: z.enum(["detection", "user_choice", "manual"]),
+      /** ISO timestamp del setting. */
+      decided_at: z.string().min(1),
+      /**
+       * Resumen humano de por qué este style hace match con la marca.
+       * Útil para que el agent pueda explicarle al user en el futuro
+       * "elegimos X porque...". Opcional.
+       */
+      evidence_summary: z.string().max(500).optional(),
+    })
+    .optional()
+    .nullable()
+    .default(null),
 });
 
 export type BrandVisualIdentity = z.infer<typeof BrandVisualIdentitySchema>;
@@ -478,6 +529,26 @@ export function buildBrandVisualIdentity(args: {
     elements_count: 0,
     anti_patterns_count: 0,
     asset_tag_map: {},
+    recommended_visual_style: null,
+  };
+}
+
+/**
+ * Devuelve una copia de la identity con el `recommended_visual_style`
+ * actualizado. Para callers que necesitan persistir cambios via
+ * `appendBrandIdentityToDescription(company.description, updated)`.
+ *
+ * Si `recommended` es `null`, limpia el field (volvemos a "no preferencia
+ * cacheada"). Bumpea `last_brand_sync_at` al timestamp del cambio.
+ */
+export function setRecommendedVisualStyle(
+  identity: BrandVisualIdentity,
+  recommended: BrandVisualIdentity["recommended_visual_style"],
+): BrandVisualIdentity {
+  return {
+    ...identity,
+    recommended_visual_style: recommended,
+    last_brand_sync_at: new Date().toISOString(),
   };
 }
 

@@ -178,7 +178,9 @@ function containsWord(haystack: string, needle: string): boolean {
 // ── Cache helpers ──────────────────────────────────────────────────────────
 
 const CACHE_SUFFIX_RE = /\[industry:([a-z_]+)@(\d{4}-\d{2}-\d{2})\]/i;
-const CACHE_TTL_DAYS = 30;
+// Bump 2026-05-25: 30 → 90 días. La industria de una marca cambia rara vez;
+// si cambia el user puede forzar refresh con force_refresh: true.
+const CACHE_TTL_DAYS = 90;
 
 /**
  * Append (or replace) the `[industry:<id>@<date>]` marker on a company
@@ -620,10 +622,12 @@ export async function ensureIndustryClassified(
     };
   }
 
-  // Fetch the home page at the cheapest depth. We're after the industry
-  // classification, not the full catalog. The agent can call deep_research
-  // explicitly afterwards for the rich data when the brand needs it.
-  const fetched = await fetchWithBudget(websiteUrl, DEPTH_SETTINGS.fast);
+  // Fetch the home page at STANDARD depth (10s, 2MB cap). Antes era "fast"
+  // (5s/500KB) y producía clasificaciones flacas: landings con un home
+  // minimalista (ej. SaaS con poco copy en home) caían en clasificación
+  // generica/local_business porque las keywords técnicas del producto vivían
+  // en sub-pages que el fast budget no alcanzaba a llegar.
+  const fetched = await fetchWithBudget(websiteUrl, DEPTH_SETTINGS.standard);
   if (!fetched.ok) {
     return {
       classified: false,
@@ -638,7 +642,56 @@ export async function ensureIndustryClassified(
 
   const parsed = parseHtml(fetched.body, websiteUrl);
   const og = extractOgMeta(parsed);
-  const classification = classifyWithHint(parsed, og, options.userIndustryHint);
+  let classification = classifyWithHint(parsed, og, options.userIndustryHint);
+
+  // CAMBIO 2026-05-25: confidence-gated sub-path crawl.
+  // Si la home page DIO una clasificación con alta confidence, no perdemos
+  // tiempo crawleando sub-pages (la mayoría de los casos obvios: pizza shop,
+  // fashion store, gym). Solo cuando confidence es medium/low/ambiguous
+  // intentamos enriquecer con 2 sub-pages del candidato top, y re-clasificamos
+  // con el texto combinado. Mantiene el path rápido cuando es trivial,
+  // mejora accuracy cuando es ambiguo.
+  //
+  // Esto fixea el caso PipeLime (SaaS minimal-landing → clasificaba como
+  // local_business) y similares.
+  if (classification.confidence !== "high") {
+    const candidateProfile = getProfile(classification.best.id);
+    try {
+      const extraPages = await crawlExtraPages(
+        candidateProfile,
+        websiteUrl,
+        DEPTH_SETTINGS.standard,
+      );
+      if (extraPages.length > 0) {
+        // Re-clasifica con el texto combinado de home + sub-pages.
+        // Cada sub-page aporta hasta 3000 chars del body para no inflar.
+        const combinedTextParts: string[] = [];
+        if (options.userIndustryHint) combinedTextParts.push(options.userIndustryHint);
+        if (og.title) combinedTextParts.push(og.title);
+        if (og.description) combinedTextParts.push(og.description);
+        if (og.og_description) combinedTextParts.push(og.og_description);
+        combinedTextParts.push(bodyTextExcerpt(parsed, 6000));
+        for (const extra of extraPages) {
+          combinedTextParts.push(bodyTextExcerpt(extra.parsed, 3000));
+        }
+        const combinedText = combinedTextParts.join("\n");
+        const secondPass = classifyText(combinedText);
+        // Solo aceptamos la second pass si mejoró la confidence o cambió la
+        // industria a algo más específico. Si bajó la confidence, descartamos.
+        const confidenceRank: Record<typeof secondPass.confidence, number> = {
+          ambiguous: 0,
+          low: 1,
+          medium: 2,
+          high: 3,
+        };
+        if (confidenceRank[secondPass.confidence] >= confidenceRank[classification.confidence]) {
+          classification = secondPass;
+        }
+      }
+    } catch {
+      // Sub-page fetch failures non-fatal: nos quedamos con la first-pass.
+    }
+  }
   const profile = getProfile(classification.best.id);
 
   // Persist the cache suffix. Failure here is non-fatal: we still return
