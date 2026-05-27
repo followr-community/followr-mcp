@@ -185,7 +185,19 @@ function containsWord(haystack: string, needle: string): boolean {
 // state. Legacy markers (no flag) are treated as auto / not confirmed; that is
 // intentional, so cached values written before 2026-05-26 get re-confirmed by
 // the user the next time prepare_content_plan_context runs.
-export const CACHE_SUFFIX_RE = /\[industry:([a-z_]+)@(\d{4}-\d{2}-\d{2})(?::([a-z_]+))?\]/i;
+//
+// The id class MUST include digits ([a-z0-9_]+): industries like service_b2b
+// contain a digit and were silently unparseable with the old [a-z_]+ class.
+// That bug manifested in the PipeLime session (2026-05-27) as an infinite
+// confirm_industry → prepare_content_plan_context loop because the marker
+// was being written but never matched on read, and applyCacheSuffixToDescription
+// then appended a duplicate marker on every retry.
+export const CACHE_SUFFIX_RE = /\[industry:([a-z0-9_]+)@(\d{4}-\d{2}-\d{2})(?::([a-z0-9_]+))?\]/i;
+// Global variant used by applyCacheSuffixToDescription to strip ALL existing
+// markers before writing a fresh one. Without this, two confirm_industry calls
+// can leave two markers in the description when the first marker was unreadable
+// by the previous buggy regex.
+const CACHE_SUFFIX_STRIP_RE = /\n*\s*\[industry:[a-z0-9_]+@\d{4}-\d{2}-\d{2}(?::[a-z0-9_]+)?\]\s*/gi;
 export const CONFIRMED_FLAG = "confirmed";
 // Bump 2026-05-25: 30 → 90 días. La industria de una marca cambia rara vez;
 // si cambia el user puede forzar refresh con force_refresh: true.
@@ -201,10 +213,13 @@ const CACHE_TTL_DAYS = 90;
  */
 export function applyCacheSuffixToDescription(currentDescription: string | null, suffix: string): string {
   const desc = currentDescription ?? "";
-  if (CACHE_SUFFIX_RE.test(desc)) {
-    return desc.replace(CACHE_SUFFIX_RE, suffix);
-  }
-  return desc.length > 0 ? `${desc.trimEnd()}\n\n${suffix}` : suffix;
+  // Strip ALL existing industry markers (global flag) so any duplicates left
+  // behind by the pre-fix bug get collapsed into a single fresh marker. Then
+  // append the new suffix. Plain replace-first-match would leave older
+  // duplicates intact and let the read path pick a stale auto marker over the
+  // newly written :confirmed one.
+  const stripped = desc.replace(CACHE_SUFFIX_STRIP_RE, "").trimEnd();
+  return stripped.length > 0 ? `${stripped}\n\n${suffix}` : suffix;
 }
 
 export interface CachedIndustry {
