@@ -223,6 +223,8 @@ USE THIS ONLY WHEN: the user explicitly requested a single bare talking-head cli
 
 CRITICAL: heavy operation. Cost is per SECOND of generated video (model veed_fabric_1.0 = 25 cr/seg). A typical lipsync clip is ~10-15 seconds = roughly 250-400 credits. Call get_credits_balance before to confirm the user has budget.
 
+REQUIRES TEXT BUDGET TOO. The lipsync flow internally calls Followr's TTS endpoint (ElevenLabs via Followr), which consumes ai_text_budget words on top of the video credits. If get_ai_budget shows ai_text_budget.total === 0 (plan does not include the text/audio module) or ai_text_budget.remaining <= 0 (cycle exhausted), this tool will fail with HTTP 402 entity="words" at the audio step BEFORE generating any video. get_session_context._assistant_guidance.plan_capability_warnings already surfaces this gate at orient time; honor that warning instead of attempting to call here.
+
 PRECONDITION: company_id required. avatar_id required, and the avatar MUST have a voice and an image attached (list_avatars to verify, or create_avatar_full_flow if needed).
 
 LATENCY: 60-180 seconds typical.
@@ -385,6 +387,8 @@ WHEN TO USE THE OTHER VIDEO TOOLS INSTEAD:
 OUTFIT PRESERVATION: when the avatar portrait shows a specific outfit that must appear in EVERY scene (fashion brand reels, product showcase with the avatar wearing the brand, lifestyle reels for a recurring look), pass outfit_description with a precise text of the clothing (e.g. "gray bomber jacket with black collar, white tee, dark jeans"). Without this, the AI may interpret clothing differently per scene based on script context (e.g. a "beach" script may put the avatar in swimwear even if the portrait shows winter wear).
 
 CRITICAL: heavy operation. Cost is per SECOND of total video duration (each lipsync scene uses veed_fabric_1.0 at 25 cr/seg; backgrounds add more). For a 3-scene 9:16 video without backgrounds at ~30s total = roughly 750 credits; with backgrounds enabled add 30-100 cr per scene. A 60s multi-scene piece can reach 2000+ cr. Always confirm with the user before proceeding and surface get_credits_balance first.
+
+REQUIRES TEXT BUDGET TOO. This flow internally calls Followr's TTS endpoint (ElevenLabs via Followr) for each scene's audio, which consumes ai_text_budget words on top of the image/video credits. When generate_backgrounds=true the per-scene visual prompt derivation also runs through Followr's chat AI (more words). If get_ai_budget shows ai_text_budget.total === 0 (plan does not include the text/audio module) or ai_text_budget.remaining <= 0 (cycle exhausted), this tool will fail with HTTP 402 entity="words" at the audio step BEFORE generating any video. get_session_context._assistant_guidance.plan_capability_warnings already surfaces this gate at orient time; honor that warning AND, per Rule 21 of the system prompt, NEVER silently downgrade to a no-voice alternative (generate_ai_video_clip) without surfacing the trade-off to the user first.
 
 PRECONDITION: company_id + avatar_id required. The avatar MUST have a voice and an image attached. Verify with get_avatar before calling.
 

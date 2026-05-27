@@ -1574,10 +1574,10 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
                 available_avatars_count: availableAvatarsCount,
                 policy_summary:
                   recommendedVideoStrategy.default_video_kind === "ai_avatar_video"
-                    ? `Default para esta industria: video con avatar. AI clip puro SOLO si el concepto del plan_item está entre [${recommendedVideoStrategy.flip_concepts.join(", ")}]. Para CUALQUIER otro concepto, usar avatar es la opción correcta.`
+                    ? `Default para esta industria: reel multi-escena con avatar hablando y subtítulos quemados. En schema: video_source.type = "ai_avatar_video" con scripts: string[]. AI clip puro (video_source.type = "ai_generate") SOLO si el concepto del plan_item está entre [${recommendedVideoStrategy.flip_concepts.join(", ")}]. Para CUALQUIER otro concepto, usar avatar_video es la opción correcta. NO usar "ai_avatar_lipsync" para cumplir esta policy: lipsync es una SHAPE DEGRADADA (single-scene, sin subtítulos, sin transiciones) reservada solo para cuando el usuario PIDE EXPLÍCITAMENTE "una toma simple sin subtítulos, una sola escena". Si estás pensando degradar a lipsync porque el budget se ve apretado, AVISALE AL USER PRIMERO con la opción multi-escena vs simple y el costo diferencial; nunca elijas lipsync silencioso (Rule 21 del system prompt). El auto-corrector del validator promueve lipsync → avatar_video cuando se filtra en plan_items para industrias con default avatar.`
                     : `Default para esta industria: AI clip. Video con avatar SOLO si el concepto del plan_item está entre [${recommendedVideoStrategy.flip_concepts.join(", ")}]. Para CUALQUIER otro concepto, usar AI clip es la opción correcta.`,
                 enforcement_policy:
-                  "ESTA NO ES UNA SUGERENCIA, ES LA POLICY DE LA INDUSTRIA. Cuando construyas plan_items[] para draft_content_plan, cada video sub_post debe respetar default_video_kind a menos que el concepto matchee uno de los flip_concepts listados arriba. Si construís un plan con 6 AI clips para una industria con default avatar (o viceversa), estás INVIRTIENDO la policy. El validador de draft_content_plan emite warning video_strategy_inverted en ese caso y ofrece resolution_options al user. Anti-pattern observado 2026-05-25 en PipeLime (local_business, default avatar): el agente armó 6 AI clips + 1 avatar cuando debió ser ~6 avatars + 1 AI clip basado en flip_concepts.",
+                  "ESTA NO ES UNA SUGERENCIA, ES LA POLICY DE LA INDUSTRIA. Cuando construyas plan_items[] para draft_content_plan, cada video sub_post debe respetar default_video_kind a menos que el concepto matchee uno de los flip_concepts listados arriba. Si construís un plan con 6 AI clips para una industria con default avatar (o viceversa), estás INVIRTIENDO la policy. El validador de draft_content_plan emite warning video_strategy_inverted en ese caso y ofrece resolution_options al user. Anti-pattern observado 2026-05-25 en PipeLime (local_business, default avatar): el agente armó 6 AI clips + 1 avatar cuando debió ser ~6 avatars + 1 AI clip basado en flip_concepts. Anti-pattern observado 2026-05-26 en PipeLime (saas, default avatar_video): el agente armó 5 piezas con ai_avatar_lipsync (single-scene, sin subtítulos) en lugar de ai_avatar_video (multi-escena con subtítulos), perdiendo la SHAPE que la policy define como default. El auto-corrector hoy promueve lipsync → avatar_video silenciosamente para industrias avatar-default, así que si vos elegís lipsync sin que el user lo pida explícito, igualmente termina como avatar_video.",
               }
             : {
                 status: "industry_not_confirmed_yet",
@@ -2073,6 +2073,16 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
           budget_remaining_before_execution: v.budget_remaining,
           budget_remaining_after_execution:
             v.budget_remaining !== null ? v.budget_remaining - v.totals.total_ai_cost : null,
+          // Text/words bucket. Avatar TTS + chat fallback for copy generation
+          // consume words. estimated_text_words_cost is intentionally NOT
+          // exposed because Followr does not publish a per-call word cost; we
+          // surface only whether the plan has text-dependent pieces and the
+          // current bucket state so the agent can decide. Honor Rule 21 of
+          // the system prompt: if text budget is short or missing, surface to
+          // the user BEFORE proposing model swaps or shape downgrades.
+          text_dependent_pieces_count: v.text_dependent_count,
+          ai_text_budget_total: v.text_budget_total,
+          ai_text_budget_remaining: v.text_budget_remaining,
         },
         upfront_decisions_required: extractUpfrontDecisions(v.warnings),
         manual_materialization_required: manualMaterialization,
@@ -2324,6 +2334,9 @@ AFTER THIS: same flow as draft. Show the updated table, await explicit approval,
           budget_remaining_before_execution: v.budget_remaining,
           budget_remaining_after_execution:
             v.budget_remaining !== null ? v.budget_remaining - v.totals.total_ai_cost : null,
+          text_dependent_pieces_count: v.text_dependent_count,
+          ai_text_budget_total: v.text_budget_total,
+          ai_text_budget_remaining: v.text_budget_remaining,
         },
         upfront_decisions_required: extractUpfrontDecisions(v.warnings),
         manual_materialization_required: manualMaterialization,
@@ -4942,7 +4955,7 @@ function collectManualMaterializationSteps(
     total_estimated_credits: totalCredits,
     affected_plan_item_slugs: affectedSlugs,
     steps,
-    user_message: `Aviso importante: el plan tiene ${steps.length} pieza(s) con avatar (${affectedSlugs.length} día(s) afectado(s)) que no se generan automáticamente en el flujo de execute. Las voy a generar manualmente antes de publicar, aprox ${totalCredits} créditos en total. Una vez generadas las attacheo al plan y recién ahí se publica. Los días sin avatar se publican normalmente.`,
+    user_message: `Aviso importante: este plan tiene ${steps.length} pieza(s) con avatar (${affectedSlugs.length} día(s) afectado(s)) que requieren un paso extra de mi parte antes de publicar, aprox ${totalCredits} créditos en total para esos videos. Las voy a generar una por una, las agrego al plan y recién ahí se publica el día completo. Los días sin avatar se publican directo, sin esa pausa.`,
     instructions_for_agent: `ANTES del cost summary y de pedir aprobación final, surface manual_materialization_required.user_message al usuario. Después, cuando el user apruebe el plan, el flujo correcto es: (1) para cada step, llamar suggested_tool y esperar el asset, (2) llamar update_content_plan con replace_sub_post para cada entry de consumed_by swappeando video_source a { type: "asset_id", id: <asset_id> }, (3) execute_content_plan con plan_item_slugs cubriendo los slugs afectados. Los plan_items NO afectados (sin avatar) se ejecutan con execute_content_plan normalmente sin esa danza. NUNCA llamar execute_content_plan sobre los slugs en affected_plan_item_slugs sin antes completar (1) y (2): el executor tira "Asset strategy ai_avatar_* is not supported by execute_content_plan in v1" y aborta el item. Cuando el user pide "arrancá con los primeros 2 posteos" y uno de esos 2 está en affected_plan_item_slugs, hacer la danza para ese antes de publicar.`,
   };
 }
@@ -5493,7 +5506,14 @@ interface ValidationResult {
   blockers: Array<Record<string, unknown>>;
   warnings: Array<Record<string, unknown>>;
   totals: ValidationTotals;
+  /** ai_image_and_video_budget.remaining before plan execution. null if budget fetch failed. */
   budget_remaining: number | null;
+  /** ai_text_budget.remaining before plan execution. null if budget fetch failed. */
+  text_budget_remaining: number | null;
+  /** ai_text_budget.total. 0 means the plan does not include text/TTS modality. */
+  text_budget_total: number | null;
+  /** Count of sub_posts that consume words (avatar TTS or missing copy_draft path B). */
+  text_dependent_count: number;
 }
 
 /**
@@ -5577,6 +5597,14 @@ function extractUpfrontDecisions(
  *     avatar cargado. Si no, NO se corrige (el avatar_setup_proposal
  *     upstream debió pedir al user que cree uno antes). Scripts se derivan
  *     del caption_concept del sub_post o del concept_shared del item.
+ *   ai_avatar_lipsync → ai_avatar_video: SHAPE upgrade dentro de la familia
+ *     avatar. La industry policy default avatar_video define "reel multi-
+ *     escena con subtítulos quemados" como shape canónica; lipsync (single-
+ *     scene sin subtítulos) es la versión degradada. El upgrade es
+ *     non-breaking: misma cost-per-second de TTS, generate_backgrounds queda
+ *     en false así que cost total no se mueve, output gana subtítulos.
+ *     Agregado 2026-05-26 tras la sesión PipeLime (saas) donde se filtró
+ *     lipsync en 5 piezas.
  *   ai_avatar_video → ai_clip: convierte scripts a un prompt visual
  *     concatenado, defaults a veo_3.1_fast 8s sin reference image.
  *   ai_avatar_lipsync → ai_clip: idem, prompt del script.
@@ -5662,6 +5690,50 @@ async function autoCorrectInvertedVideoSources(
       const subConcept = sp.caption_concept ?? itemConcept;
       const concept = `${itemConcept} ${subConcept}`.trim();
       if (conceptMatchesFlip(concept)) continue; // legítimamente flipped
+
+      // ai_avatar_lipsync → ai_avatar_video (industry default avatar; lipsync
+      // es la SHAPE degradada dentro de la familia avatar). Agregado 2026-05-26
+      // tras la sesión PipeLime (saas) donde el agente eligió ai_avatar_lipsync
+      // para 5 piezas en lugar de ai_avatar_video. El enum VideoKind del
+      // industry profile solo distingue ai_clip vs ai_avatar_video; lipsync
+      // pasaba el filtro silencioso porque "no es ai_clip", pero pierde la
+      // shape multi-escena con subtítulos que la policy define como default.
+      //
+      // El upgrade es non-breaking porque:
+      //   - El TTS cost por segundo es idéntico (25 cr/seg de speech) tanto
+      //     en avatar_video como en lipsync, sin backgrounds.
+      //   - generate_backgrounds queda en false por default, así que el costo
+      //     total no cambia vs la versión lipsync (mismo costo, MEJOR output:
+      //     ahora con subtítulos quemados).
+      //   - El user nunca pidió lipsync explícitamente (Rule 21 del system
+      //     prompt: si fuera un downgrade por presupuesto deliberado, el
+      //     agente tenía que avisar primero; si llegó hasta acá sin avisar,
+      //     es un slip y lo corregimos).
+      //
+      // Si el user en futuras iteraciones PIDE explícitamente lipsync
+      // ("solo una toma corta sin subtítulos"), la flip_concepts del profile
+      // o un update_content_plan con replace_sub_post explícito quedan como
+      // escape hatches; ESTA corrección solo se dispara cuando el concept NO
+      // matchea ningún flip_concept (chequeado arriba).
+      if (
+        defaultKind === "ai_avatar_video" &&
+        vs.type === "ai_avatar_lipsync"
+      ) {
+        if (vs.script.length < 8) continue;
+        sp.assets_strategy.video_source = {
+          type: "ai_avatar_video",
+          scripts: [vs.script],
+          avatar_id: vs.avatar_id,
+        };
+        corrections.push({
+          slug: item.slug,
+          sub_post_index: i,
+          from_kind: "ai_avatar_lipsync",
+          to_kind: "ai_avatar_video",
+          reason: `Industry ${cachedIndustryId} default is ai_avatar_video (multi-scene reel with subtitles); lipsync is the degraded single-scene shape and concept "${concept.slice(0, 80)}" does not match any flip_concept that would justify the simpler shape`,
+        });
+        continue;
+      }
 
       // ai_clip → ai_avatar_video (industry default avatar)
       if (
@@ -6203,9 +6275,13 @@ async function runValidation(args: {
   // Budget.
   totals.total_ai_cost = totals.image_ai_cost + totals.video_ai_cost;
   let budgetRemaining: number | null = null;
+  let textBudgetRemaining: number | null = null;
+  let textBudgetTotal: number | null = null;
   try {
     const budget = await loadBudgets(client);
     budgetRemaining = budget?.ai_image_and_video_budget.remaining ?? null;
+    textBudgetRemaining = budget?.ai_text_budget.remaining ?? null;
+    textBudgetTotal = budget?.ai_text_budget.total ?? null;
   } catch {
     budgetRemaining = null;
   }
@@ -6230,6 +6306,95 @@ async function runValidation(args: {
         {
           id: "shrink_time_window",
           description: "Reduce the number of plan_items, the time_window or the posts_per_day.",
+        },
+      ],
+    });
+  }
+
+  // Text/TTS budget check. Avatar pieces (ai_avatar_lipsync, ai_avatar_video)
+  // require words budget for the TTS step; detect_brand_visual_style and the
+  // copy-draft fallback also consume words. The ai_image_and_video_budget
+  // check above is silent about this even when total_ai_cost looks fine,
+  // because words are billed against a separate bucket.
+  //
+  // PipeLime 2026-05-26 session: ai_text_budget.total was 0 (plan did not
+  // include AI text + TTS). The plan validated fine on image/video budget,
+  // got approved by the user for day 1, and then 402'd at TTS time with
+  // entity="words". Surfacing the gate at validation time avoids the wasted
+  // approval cycle.
+  let textDependentCount = 0;
+  for (const item of plan_items) {
+    for (const sp of item.sub_posts) {
+      const vs = sp.assets_strategy.video_source;
+      if (vs && (vs.type === "ai_avatar_lipsync" || vs.type === "ai_avatar_video")) {
+        textDependentCount += 1;
+      }
+      // copy_draft missing implies path B (server-side generate_text); that
+      // also consumes words. Count those too.
+      if (!sp.copy_draft || sp.copy_draft.trim().length === 0) {
+        textDependentCount += 1;
+      }
+    }
+  }
+  if (textDependentCount > 0 && textBudgetTotal === 0) {
+    blockers.push({
+      issue: "plan_requires_text_or_tts_but_not_in_plan",
+      text_dependent_count: textDependentCount,
+      detail: `This plan has ${textDependentCount} piece(s) that depend on AI text generation or TTS audio (avatar pieces with scripted speech, or sub_posts without copy_draft that would trigger server-side copy generation). The current Followr plan does not include this modality (ai_text_budget.total === 0), so the plan will 402 with entity="words" at execution time.`,
+      user_facing_message: `Tu plan actual de Followr no incluye generación de texto AI ni audio narrado. Eso bloquea las ${textDependentCount} pieza(s) del plan que dependen de voz de avatar o copies auto-redactados. Hay tres caminos: activar ese módulo en Followr (página de Subscription), reemplazar los avatares por AI clips sin voz (animación sin persona ni audio) y escribir vos los copies, o pausar acá. ¿Cómo seguimos?`,
+      is_upfront_decision: true,
+      resolution_options: [
+        {
+          id: "activate_text_feature_in_followr",
+          description:
+            "Direct the user to app.followr.ai > Subscription to add the text/TTS module to their current plan. The MCP cannot mutate subscriptions; the user has to complete this on the web. After they confirm, re-run prepare_content_plan_context to refresh the capability state.",
+          user_facing_description:
+            "Activá generación de texto y audio en Followr (página de Subscription) y volvemos.",
+        },
+        {
+          id: "swap_avatars_for_ai_clips",
+          description:
+            "Replace ai_avatar_lipsync / ai_avatar_video sub_posts with ai_generate video (AI clips, no voice, no persona). Use update_content_plan with replace_sub_post for each affected piece. Cost stays in the image/video bucket; words are no longer consumed.",
+          user_facing_description:
+            "Cambio los videos con avatar por clips AI cinematográficos sin voz ni persona. Mantengo el mensaje en texto del posteo.",
+        },
+        {
+          id: "manual_copy_only_plan",
+          description:
+            "Drop avatar pieces entirely; the remaining sub_posts need copy_draft filled in by the agent (no server-side fallback) since words are still unavailable for path B. The user gets copies you write inline.",
+          user_facing_description:
+            "Armo el plan sin avatares; los copies los redacto yo en el chat para que no haya generación AI de texto.",
+        },
+      ],
+    });
+  } else if (textDependentCount > 0 && textBudgetRemaining !== null && textBudgetRemaining <= 0) {
+    blockers.push({
+      issue: "text_budget_exhausted_in_cycle",
+      text_dependent_count: textDependentCount,
+      detail: `This plan has ${textDependentCount} text/TTS-dependent piece(s) but ai_text_budget.remaining is ${textBudgetRemaining}. The plan will 402 with entity="words" at execution time until the cycle renews.`,
+      user_facing_message: `El bucket de texto AI y audio narrado se agotó en el ciclo actual de Followr. Tu plan TIENE incluido el módulo, pero las palabras del mes están consumidas. Las ${textDependentCount} pieza(s) que dependen de voz de avatar o copies auto-generados van a fallar hasta el renewal. Podés esperar al renewal, activar más créditos en Followr (página de Subscription), o ajusto el plan ahora para que no use texto AI. ¿Cómo seguimos?`,
+      is_upfront_decision: true,
+      resolution_options: [
+        {
+          id: "wait_for_renewal",
+          description:
+            "Schedule the plan AFTER ai_text_budget.renews_at. The agent should ask the user when they want to schedule (post-renewal) and adjust publish_at_time_local accordingly.",
+          user_facing_description:
+            "Esperamos al renewal del plan y arrancamos después.",
+        },
+        {
+          id: "topup_text_credits",
+          description:
+            "Direct the user to add more text credits via app.followr.ai > Subscription. Same MCP limitation: cannot mutate subscriptions from here.",
+          user_facing_description:
+            "Activá un add-on de palabras adicionales en Followr y volvemos.",
+        },
+        {
+          id: "swap_avatars_for_ai_clips",
+          description:
+            "Same as the not-in-plan case: replace avatars with ai_generate video and fill copies manually.",
+          user_facing_description:
+            "Cambio los videos con avatar por clips AI sin voz, y los copies los escribo yo en el chat.",
         },
       ],
     });
@@ -6375,7 +6540,15 @@ async function runValidation(args: {
     }
   }
 
-  return { blockers, warnings, totals, budget_remaining: budgetRemaining };
+  return {
+    blockers,
+    warnings,
+    totals,
+    budget_remaining: budgetRemaining,
+    text_budget_remaining: textBudgetRemaining,
+    text_budget_total: textBudgetTotal,
+    text_dependent_count: textDependentCount,
+  };
 }
 
 // ── update_content_plan: apply individual changes to a working plan state ──

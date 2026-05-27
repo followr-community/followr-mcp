@@ -573,6 +573,8 @@ PIPELINE (internal):
 
 COST: imageCaption ~1-5 cr per image. Chat classifier ~2-5 cr. Total ~10-30 cr per detection (depending on how many signals are gathered).
 
+REQUIRES TEXT BUDGET. Both imageCaption (vision-to-text) and the chat classifier consume ai_text_budget words. If get_ai_budget shows ai_text_budget.total === 0 or ai_text_budget.remaining <= 0, this tool will fail with HTTP 402 entity="words" before producing any ranking. get_session_context._assistant_guidance.plan_capability_warnings already surfaces this gate at orient time; honor that. If the user's plan does not include text AI, fall back to list_visual_styles + propose_visual_style_options for manual selection (those tools are pure-catalog and consume zero words).
+
 LOW SIGNAL: when the company has no website OR no published posts AND no user uploads, the tool returns 'low_visual_signal: true' and a message_for_user asking for reference uploads. The agent should request 2-3 aspirational images from the user and re-call with include_uploads.
 
 USAGE FLOW:

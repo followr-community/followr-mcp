@@ -98,6 +98,8 @@ NEXT STEPS based on _assistant_guidance.next_step:
 - "ask_user_to_pick_company": multiple owned companies (or admin-scope token with no owned), present by name and wait for the user.
 - "no_companies_available": token is invalid or unprovisioned; surface and stop.
 
+PLAN CAPABILITY WARNINGS: _assistant_guidance.plan_capability_warnings is an array. EACH entry describes a modality that is currently unusable for this account (either the plan does not include the feature at all, or the cycle quota is exhausted). Before proposing ANY content plan or flow that depends on the affected modality, surface the warning to the user verbatim from the instruction field and let them decide whether to upgrade, wait for renewal, or reshape the plan. Honoring Rule 21 of the system prompt (no silent downgrades): if you were about to silently swap models, drop pieces, or pick a cheaper alternative because of a warning here, STOP and ask the user first. The warning array is empty when every modality is fine.
+
 OWNED VS ACCESSIBLE COMPANIES: the response field "companies" lists the companies the current user owns (where Company.user_id === user.id), matching how the Followr web UI presents them. Each company carries a relationship: "owner" marker. If the token has admin/superuser scope (cofounders, staff, platform admins), the response also includes "accessible_companies" with companies owned by OTHER users that the token can read, each marked relationship: "guest". Those guest companies are NOT presented by default in user_facing_options. Only consult accessible_companies when the user explicitly mentions a company by exact name or id that is not in the owned list. _assistant_guidance.has_admin_scope is true when this distinction applies.
 
 NAME COLLISIONS: there are two kinds of collisions, and the response surfaces both.
@@ -351,9 +353,72 @@ If creative work follows (post generation, scheduling), consider calling get_com
               plus_chat_enabled: balanceResult.plus_chat_enabled,
               white_label_enabled: balanceResult.white_label_enabled,
               _what_to_use_for_decisions:
-                "For any video or image generation cost decision, read ai_image_and_video_budget.remaining (not the deprecated 'credits' field that the underlying API still exposes).",
+                "For any video or image generation cost decision, read ai_image_and_video_budget.remaining (not the deprecated 'credits' field that the underlying API still exposes). For any tool that uses AI text or TTS audio (detect_brand_visual_style, generate_avatar_video, generate_avatar_lipsync_clip, generate_text, generate_audio, draft_content_plan copy fallback), also read ai_text_budget. plan_capability_warnings below flags the cases where a modality is feature-gated or quota-exhausted; honor those BEFORE proposing any plan that depends on the affected modality.",
             }
           : null;
+
+      // Plan capability warnings. Inspect each modality budget and emit a
+      // structured warning when the plan either does NOT include that
+      // modality at all (total === 0) or has the quota exhausted in the
+      // current cycle (remaining <= 0). The agent is required by Rule 21
+      // (system prompt) to surface these BEFORE proposing a plan that
+      // depends on the affected modality, never silently degrade the plan
+      // to dodge the limit.
+      //
+      // Why this matters: PipeLime 2026-05-26 session: words_allowed was
+      // 0 (the plan did not include AI text + TTS). The agent did NOT
+      // notice on session orient, drafted a 7-day plan with 6 avatar
+      // videos, the user approved 825 cr for day 1, and the backend 402'd
+      // on the first TTS call. Surfacing the capability gap up front
+      // would have prevented the wasted turn cycle.
+      const planCapabilityWarnings: Array<{
+        capability: string;
+        severity: "feature_not_in_plan" | "quota_exhausted_in_cycle";
+        impact: string;
+        instruction: string;
+      }> = [];
+      if (subscription) {
+        const t = subscription.ai_text_budget;
+        if (t.total === 0) {
+          planCapabilityWarnings.push({
+            capability: "ai_text_and_tts_audio",
+            severity: "feature_not_in_plan",
+            impact:
+              "Cualquier herramienta que use texto AI o voz narrada va a fallar con HTTP 402 entity=\"words\". Incluye: redacción AI de copies (path B del content plan), detección automática de estilo visual (detect_brand_visual_style), voces de avatar (generate_avatar_video, generate_avatar_lipsync_clip), narraciones de video, podcasts AI.",
+            instruction:
+              "ANTES de proponer cualquier plan o flow que dependa de texto AI o voz narrada, AVISALE AL USUARIO en plain language: \"Tu plan actual de Followr no incluye generación de texto AI y audio narrado. Eso afecta voces de avatar, copies auto-redactados y la detección automática de estilo visual. Para usar avatar con voz necesitás activar ese módulo en Followr, o armamos el plan sin esas piezas y con copies escritos manualmente.\" Esto sigue la Rule 21 del system prompt (no degradar silencioso por límites de plan). NUNCA armes silenciosamente un plan que dependa de words sabiendo que está bloqueado.",
+          });
+        } else if (t.remaining <= 0) {
+          planCapabilityWarnings.push({
+            capability: "ai_text_and_tts_audio",
+            severity: "quota_exhausted_in_cycle",
+            impact:
+              "Las palabras del ciclo actual están agotadas. Cualquier herramienta que use texto AI o voz narrada va a fallar hasta el renewal del plan.",
+            instruction:
+              "Avisale al usuario que el bucket de texto AI está agotado en este ciclo. Si necesita usar voz de avatar o copies AI urgente, las opciones son: esperar al renewal, activar un addon de palabras adicionales en Followr (página de Subscription), o armar el plan con copies escritos por vos en lugar de auto-generados. Honra Rule 21: no cambies silenciosamente la shape del plan.",
+          });
+        }
+        const iv = subscription.ai_image_and_video_budget;
+        if (iv.total === 0) {
+          planCapabilityWarnings.push({
+            capability: "ai_image_and_video_generation",
+            severity: "feature_not_in_plan",
+            impact:
+              "Cualquier herramienta que genere imágenes o videos AI va a fallar con HTTP 402.",
+            instruction:
+              "Avisale al usuario antes de proponer un plan que dependa de imagen/video AI: \"Tu plan no incluye generación de imágenes ni videos AI. ¿Querés que arme el plan reutilizando fotos de tu biblioteca o subiendo nuevas?\" Honra Rule 21.",
+          });
+        } else if (iv.remaining <= 0) {
+          planCapabilityWarnings.push({
+            capability: "ai_image_and_video_generation",
+            severity: "quota_exhausted_in_cycle",
+            impact:
+              "El bucket compartido de imagen y video AI está agotado en este ciclo. Tampoco se pueden generar avatares nuevos ni clips.",
+            instruction:
+              "Avisale al usuario que el bucket compartido de imagen/video AI está en 0. Opciones: esperar al renewal, activar más créditos en Followr, o reusar assets ya subidos en la biblioteca para construir el plan.",
+          });
+        }
+      }
       const response: Record<string, unknown> = {
         user: {
           id: me.id,
@@ -389,6 +454,7 @@ If creative work follows (post generation, scheduling), consider calling get_com
             : [],
           has_owned_name_collision: hasOwnedNameCollision,
           owned_name_collisions: ownedCollisionDetails,
+          plan_capability_warnings: planCapabilityWarnings,
         },
       };
       if (hasAdminScope) {

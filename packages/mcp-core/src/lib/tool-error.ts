@@ -19,6 +19,76 @@
 
 import { FollowrApiError } from "@followr-mcp/shared";
 
+/**
+ * Static map of HTTP 402 backend "entity" names to user-friendly Spanish
+ * descriptions.
+ *
+ * The Followr backend returns 402 with `{ entity: "<name>", message: "..." }`
+ * when a plan does not include a feature. The entity name is internal
+ * backend vocabulary ("words", "premium_images", "premium_videos") that
+ * is opaque to end users. Without a verified translation the agent must
+ * either (a) paraphrase wrong (the PipeLime 2026-05-26 "subtítulos
+ * burned-in" incident, where the agent invented a feature that was NOT
+ * actually missing) or (b) quote the slug verbatim ("necesita un crédito
+ * de 'words'") which the user cannot parse.
+ *
+ * This map gives static, empirically verified translations the agent can
+ * surface safely. The rule "do not paraphrase entity names" stays in
+ * effect: the translation is NOT a runtime LLM guess, it is a hardcoded
+ * mapping reviewed against the Followr backend behavior. New entries here
+ * MUST be verified against an actual 402 response from the platform; do
+ * NOT add speculative mappings.
+ *
+ * Source for "words": docs/followr-api/subscription-limits.md confirms
+ * words_allowed is consumed by POST /api/aiResults/chat (text) AND
+ * POST /api/aiResults/audio (TTS). When the plan has words_allowed=0 OR
+ * the feature is feature-gated server-side, both endpoints return 402
+ * with entity="words".
+ *
+ * Source for "premium_images" / "premium_videos": tool-error.ts pre-2026-
+ * 05-26 already documented these as the gating entities for Followr Plus
+ * premium model buckets.
+ */
+const KNOWN_ENTITY_MAPPINGS: Record<
+  string,
+  {
+    user_friendly_name: string;
+    affects: string;
+    typical_cause: string;
+    recovery_hint: string;
+  }
+> = {
+  words: {
+    user_friendly_name: "generación de texto AI y audio narrado (TTS)",
+    affects:
+      "cualquier paso que use chat AI (redacción automática de copies, scripts, detección de estilo visual a partir de imágenes) o voz narrada (audio de avatar talking-head, narraciones de video, podcasts AI)",
+    typical_cause:
+      "El plan actual no incluye este módulo, o las palabras del ciclo se agotaron y todavía no renovó",
+    recovery_hint:
+      "Activar el módulo en Followr (página de Subscription), esperar al renewal del ciclo, o armar el plan sin piezas que necesiten texto/voz AI",
+  },
+  premium_images: {
+    user_friendly_name:
+      "modelos premium de imagen (Nano Banana Pro, GPT Image 2, Imagen 4, Ideogram V3, Flux Pro, etc.)",
+    affects:
+      "solo esos modelos específicos; los modelos base (Nano Banana 2, Z-Image Turbo) siguen disponibles para imagen",
+    typical_cause:
+      "El add-on Followr Plus no está activado en la suscripción actual",
+    recovery_hint:
+      "Activar Followr Plus en la página de Subscription, o usar Nano Banana 2 como alternativa sin Plus",
+  },
+  premium_videos: {
+    user_friendly_name:
+      "modelos premium de video (Veo, Seedance, Hailuo, Sora, etc.)",
+    affects:
+      "solo esos modelos específicos; el modelo base Wan 2.2 sigue disponible para video AI",
+    typical_cause:
+      "El add-on Followr Plus no está activado en la suscripción actual",
+    recovery_hint:
+      "Activar Followr Plus en la página de Subscription, o usar Wan 2.2 como alternativa sin Plus",
+  },
+};
+
 export interface SuggestedAction {
   /** Optional tool name the agent could invoke to resolve the issue. */
   tool?: string;
@@ -194,15 +264,19 @@ function categorizeFollowrError(
     // empirically 2026-05-19 (POST /aiResults/image with gpt_image_2 on a plan
     // where premium_images_allowed === 0).
     //
-    // CRITICAL: the agent must NOT paraphrase or guess what the entity name
-    // maps to. PipeLime 2026-05-26: a 402 fired during generate_avatar_video
-    // and the agent told the user "tu plan no incluye subtítulos burned-in"
-    // when in reality the user's plan DID include subtitles. The actual
-    // failure was on a different step of the avatar flow (the entity name
-    // surfaced something else). The fix on this side is two-fold:
-    //   1) Emit the entity verbatim, never invent a friendly name.
-    //   2) Tell the agent to QUOTE the entity literally and verify with
-    //      get_ai_budget before claiming "your plan does not include X".
+    // CRITICAL: the agent must NOT invent a paraphrase of the entity name.
+    // PipeLime 2026-05-26: a 402 fired during generate_avatar_video and the
+    // agent told the user "tu plan no incluye subtítulos burned-in" when in
+    // reality the user's plan DID include subtitles. The actual failure was
+    // on a different step of the avatar flow.
+    //
+    // Two-pronged fix:
+    //   1) For KNOWN entities (KNOWN_ENTITY_MAPPINGS at module top), use the
+    //      verified static translation. This is NOT a runtime LLM guess; it is
+    //      a hardcoded mapping reviewed against the Followr backend. The agent
+    //      surfaces the translated description, NOT the entity slug.
+    //   2) For UNKNOWN entities, quote the slug verbatim and tell the agent
+    //      to escalate (the MCP cannot resolve which feature without help).
     const entity =
       body && typeof body === "object" && body !== null && typeof (body as Record<string, unknown>)["entity"] === "string"
         ? ((body as Record<string, unknown>)["entity"] as string)
@@ -212,25 +286,28 @@ function categorizeFollowrError(
         ? ((body as Record<string, unknown>)["message"] as string)
         : undefined;
     const messageClause = backendMessage ? ` Backend message: "${backendMessage}".` : "";
+    const mapping = entity ? KNOWN_ENTITY_MAPPINGS[entity] : undefined;
     return {
       reason: "plan_does_not_include_feature",
-      user_message_override: entity
-        ? `The Followr backend rejected this call with HTTP 402 and entity "${entity}". This typically means the current plan does not include a feature this call requires, but the exact feature is whatever "${entity}" maps to on the Followr side, NOT necessarily the feature the agent was trying to use last. Do NOT paraphrase the entity name into a different feature ("subtitles", "Creatomate", "premium video", etc.) unless you can confirm the mapping with get_ai_budget; quote "${entity}" verbatim to the user instead.${messageClause}`
-        : `The Followr backend rejected this call with HTTP 402 but did NOT specify which feature is missing (no "entity" field in the response). Do NOT tell the user a specific feature is missing; ask them to verify their plan on the Followr web (app.followr.ai > Subscription) or contact support. The MCP cannot resolve which feature without the entity name.${messageClause}`,
+      user_message_override: mapping
+        ? `The Followr backend rejected this call with HTTP 402 and entity "${entity}", which maps to a KNOWN gated feature: ${mapping.user_friendly_name}. Affected: ${mapping.affects}. Typical cause: ${mapping.typical_cause}. Recovery: ${mapping.recovery_hint}.
+
+WHAT TO TELL THE USER (plain Spanish, NO internal vocabulary): explain that their current Followr plan does not include "${mapping.user_friendly_name}", that this is what affects ${mapping.affects}, and offer the recovery path. Do NOT quote the entity slug "${entity}" to the user unless they explicitly ask for the technical code (Rule 6 / plain language). Do NOT paraphrase the feature into anything different from the mapping above; the mapping is empirically verified. If the user pushes back ("but my plan includes this!"), DO NOT argue: share the literal entity name "${entity}" and recommend contacting Followr support so they can verify which exact feature is gated.${messageClause}`
+        : entity
+          ? `The Followr backend rejected this call with HTTP 402 and entity "${entity}". This entity is NOT in the MCP's known-entity map (KNOWN_ENTITY_MAPPINGS in tool-error.ts), so DO NOT paraphrase it into a user-facing feature name. Tell the user verbatim: "Followr bloqueó esta operación con la etiqueta interna '${entity}'. Esa etiqueta no figura en mi diccionario de traducciones, así que para saber exactamente qué feature falta lo mejor es que escribas a soporte de Followr con esa etiqueta." Then offer to call get_ai_budget to share the plan name + active addons. The MCP cannot resolve which feature without the mapping.${messageClause}`
+          : `The Followr backend rejected this call with HTTP 402 but did NOT specify which feature is missing (no "entity" field in the response). Do NOT tell the user a specific feature is missing; ask them to verify their plan on the Followr web (app.followr.ai > Subscription) or contact support. The MCP cannot resolve which feature without the entity name.${messageClause}`,
       suggested_actions: [
         {
           tool: "get_ai_budget",
-          rationale: entity
-            ? `Read get_ai_budget and look for a quota or boolean flag matching "${entity}". If you find one with value 0 / false, the plan genuinely lacks that feature. If you do NOT find any matching field, the entity name may reference a backend feature not exposed in the budget; in that case tell the user the literal entity name and recommend contacting Followr support rather than guessing.`
-            : "Read get_ai_budget to surface the plan name + active addons + per-feature flags. Share that with the user so they can decide whether to upgrade or contact support.",
+          rationale: mapping
+            ? `Optional but recommended: read get_ai_budget to confirm the user's plan state (active addons, per-feature flags) before relaying the explanation. This adds a second source of truth when the user pushes back.`
+            : entity
+              ? `Read get_ai_budget to inspect the plan name + active addons + per-feature flags. The entity "${entity}" is not in the known map, so this is the only programmatic way to find a related field. If no matching field is found, escalate to Followr support with the literal entity name.`
+              : "Read get_ai_budget to surface the plan name + active addons + per-feature flags. Share that with the user so they can decide whether to upgrade or contact support.",
         },
         {
           rationale:
-            "If the user pushes back ('but my plan includes this!'), DO NOT argue. The entity from the backend is the source of truth for what failed; the user may be thinking of a related-but-distinct feature. Offer to share the literal backend response + ask the user to contact Followr support with the entity name.",
-        },
-        {
-          rationale:
-            "Common entities seen in practice: 'premium_images' (premium image models like gpt_image_2, nano_banana_pro), 'premium_videos' (premium video models like Veo / Seedance / Hailuo). If the entity matches one of these AND the user wants the cheaper alternative, retry with a non-premium model (nano_banana_2 for image, wan_2.2 for video). For ANY other entity name, do not invent a remediation; surface the literal entity and escalate.",
+            "Before swapping models or downgrading the plan to work around this gate, follow Rule 21 (system prompt): NEVER silently downgrade. Surface the trade-off to the user first and let them pick between (a) activating the missing feature in Followr, (b) reshaping the plan to avoid the feature, (c) using a cheaper alternative.",
         },
       ],
     };
