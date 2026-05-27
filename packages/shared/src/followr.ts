@@ -1126,6 +1126,7 @@ export class FollowrClient {
     include?: string;
     pageSize?: number;
     sort?: string;
+    createdAfterIso?: string;
   }): Promise<AiResult[]> {
     const query: Query = {
       "filter[company_id]": options.companyId,
@@ -1135,6 +1136,13 @@ export class FollowrClient {
     if (options.type) query["filter[type]"] = options.type;
     if (options.model) query["filter[model]"] = options.model;
     if (options.include) query["include"] = options.include;
+    // Followr filters are JSON:API style; the conventional spelling for
+    // "after a timestamp" is filter[created_at_gte] (server interprets it
+    // as inclusive >=). Status: 🔍 Descubierto, not in spec docs. If the
+    // backend rejects this we'll fall back to client-side filtering.
+    if (options.createdAfterIso) {
+      query["filter[created_at_gte]"] = options.createdAfterIso;
+    }
     const result = await this.request<ApiCollection<AiResult>>("GET", "/api/aiResults", { query });
     return result.data;
   }

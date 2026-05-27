@@ -447,6 +447,8 @@ PRECONDITION: company_id required. If multiple companies and the user hasn't nam
 
 URL REQUIREMENTS: each URL must be reachable and must serve raw video bytes (not a YouTube / Vimeo player page). Failing URLs are returned in a failures[] array; successful uploads are in assets[]. Partial success allowed.
 
+WORKS WITH FOLLOWR CDN URLs (verified 2026-05-27): URLs from ai_result.response (hosted at followrcdn-*.azurefd.net) ingest cleanly through this tool. The MCP fetches bytes locally and re-uploads to the asset library via the 3-step pattern (placeholder + presigned URL + PUT). The source URL is never proxied through Followr's backend, so self-CDN URLs are not a problem.
+
 NETWORK CONSTRAINTS: different networks have strict video specs (aspect ratio, duration, codec). Call validate_against_specs after upload and before scheduling, especially for Reels / TikTok / Stories.
 
 RETURNS: { assets: Asset[], failures: [{url, reason, http_status?}] }.`,

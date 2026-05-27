@@ -65,6 +65,7 @@ import {
   type IndustryId,
   type IndustryProfile,
 } from "../lib/industry-profiles/index.js";
+import { invalidateContextsForCompany } from "../lib/content-plan-state.js";
 import { detectSpa, type SpaDetectionResult } from "../lib/spa-detector.js";
 import { toolError, toolErrorFromException } from "../lib/tool-error.js";
 
@@ -1222,8 +1223,15 @@ WRITE: PUT /api/companies/{id} with description merged. Safe to call multiple ti
         const description = company.description ?? "";
         const suffix = buildCacheSuffix(industry_id as IndustryId, true);
         const newDescription = applyCacheSuffixToDescription(description, suffix);
+        let contextsEvicted = 0;
         if (newDescription !== description) {
           await client.updateCompany(company_id, { description: newDescription });
+          // Drop every cached content-plan context for this company: their
+          // snapshot froze cached_industry as unconfirmed and draft_content_plan
+          // would still reject with industry_confirmation_required despite the
+          // marker now reading :confirmed. Without this eviction, agents have
+          // to manually re-call prepare_content_plan_context to refresh.
+          contextsEvicted = invalidateContextsForCompany(company_id);
         }
         const profile = getProfile(industry_id as IndustryId);
 

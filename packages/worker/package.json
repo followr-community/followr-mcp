@@ -1,6 +1,6 @@
 {
   "name": "@followr-mcp/worker",
-  "version": "0.4.7",
+  "version": "0.6.0",
   "private": true,
   "description": "Cloudflare Worker for Followr MCP remote HTTP transport (v0.2 placeholder).",
   "type": "module",

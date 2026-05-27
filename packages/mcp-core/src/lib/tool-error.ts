@@ -142,7 +142,9 @@ export interface ToolErrorResult {
  * the same rich error shape as in-handler validation.
  */
 export class ToolErrorException extends Error {
-  override readonly name = "ToolErrorException";
+  // Widened to `string` (not the literal) so subclasses can re-tag .name
+  // for debug clarity. instanceof checks rely on the prototype chain.
+  override readonly name: string = "ToolErrorException";
   constructor(public readonly result: ToolErrorResult) {
     super(result.structuredContent.user_message);
   }

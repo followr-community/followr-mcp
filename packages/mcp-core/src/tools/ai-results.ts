@@ -5,8 +5,27 @@ import { z } from "zod";
 
 import type { RegisterOptions } from "../index.js";
 import { MUTATION_OPEN_WORLD, READ_ONLY } from "../lib/annotations.js";
+import {
+  estimateAvatarVideoSeconds,
+  executeAvatarVideoPipeline,
+  PipelineCancelledException,
+  PipelineFailedException,
+  type AvatarVideoPipelineParams,
+} from "../lib/avatar-video-pipeline.js";
 import { sanitizeImageModelPref } from "../lib/content-plan-catalog.js";
 import { resolveDriver } from "../lib/driver-resolver.js";
+import {
+  createPipeline,
+  getPipeline,
+  isCancellationRequested,
+  listPipelinesForCompany,
+  markPipelineCancelled,
+  markPipelineCompleted,
+  markPipelineFailed,
+  recordPipelineSubJobs,
+  requestPipelineCancellation,
+  updatePipelinePhase,
+} from "../lib/pipeline-state.js";
 import { getAiPreferences } from "../lib/preferences.js";
 import { toolError, toolErrorFromException } from "../lib/tool-error.js";
 
@@ -236,10 +255,16 @@ MODEL: hardcoded to fal + veed_fabric_1.0 (the only lipsync model verified to wo
         script: z.string().min(1).describe("Text the avatar will say in this scene. Typical 100-150 chars. May include ElevenLabs emotion tags like [excited] [confident] [whispers] [pause]."),
         aspect_ratio: z.enum(["16:9", "9:16"]).optional().describe("9:16 (vertical, default, for Reels/Shorts/TikTok) or 16:9 (landscape). Default 9:16."),
         audio_speed: z.number().min(0.5).max(2.0).optional().describe("TTS speed. Default 1.0."),
-        timeout_seconds: z.number().int().positive().max(900).optional().describe("Max seconds for video to complete. Default 600."),
+        timeout_seconds: z.number().int().positive().max(900).optional().describe("Max seconds for video to complete. Default 600. Only relevant when wait=true."),
+        wait: z
+          .boolean()
+          .optional()
+          .describe(
+            "If false (DEFAULT as of v0.6.0): returns immediately with a pipeline_id + ETA; the clip generates in the background. Use get_pipeline_status / wait_for_pipeline to track. If true: blocks until completion (legacy v0.5.x behavior). Use wait=true only for clients without transport timeouts.",
+          ),
       },
     },
-    async ({ company_id, avatar_id, script, aspect_ratio, audio_speed, timeout_seconds }) => {
+    async ({ company_id, avatar_id, script, aspect_ratio, audio_speed, timeout_seconds, wait }) => {
       try {
         const avatar: Avatar = await client.getAvatar(avatar_id, {
           include: "image,voice,voice.audio",
@@ -274,70 +299,189 @@ MODEL: hardcoded to fal + veed_fabric_1.0 (the only lipsync model verified to wo
             details: { avatar_id, avatar_name: avatar.name },
           });
         }
-        // Generate TTS audio with avatar's voice.
-        const audioInitial = await client.generateAudio({
-          q: script,
-          company_id,
-          type: "audio",
-          voice: voicePlatformId,
-          ...(audio_speed !== undefined ? { speed: audio_speed } : {}),
-          driver: "fal",
-          model: "elevenlabs_tts_3",
-        });
-        const audioFinal = await client.waitForAiResult(audioInitial.id, {
-          timeoutMs: (timeout_seconds ?? 600) * 1000,
-        });
-        const audioUrl = audioFinal.response ?? "";
-        if (audioFinal.status !== "completed" || !audioUrl) {
-          return toolError({
-            reason: "audio_generation_failed",
-            user_message: `TTS audio generation failed for avatar "${avatar.name}" (status=${audioFinal.status})${audioFinal.status_message ? `: ${audioFinal.status_message}` : ""}.`,
-            suggested_actions: [
+        // Closure: extract the pipeline body so both sync (wait:true) and
+        // async (wait:false, default) paths run the same code. Throws
+        // PipelineFailedException on backend failures; sync path catches
+        // via toolErrorFromException, async path via the runner wrapper.
+        const runLipsyncPipeline = async (
+          hooks: {
+            onPhase?: (info: { sub_phase: string; progress?: { completed: number; total: number } | null }) => void;
+            checkCancelled?: (sub_phase: string) => void;
+          } = {},
+        ): Promise<{ audioFinal: AiResult; videoFinal: AiResult; audioUrl: string }> => {
+          hooks.checkCancelled?.("tts");
+          hooks.onPhase?.({ sub_phase: "tts (0/1)", progress: { completed: 0, total: 1 } });
+          const audioInitial = await client.generateAudio({
+            q: script,
+            company_id,
+            type: "audio",
+            voice: voicePlatformId,
+            ...(audio_speed !== undefined ? { speed: audio_speed } : {}),
+            driver: "fal",
+            model: "elevenlabs_tts_3",
+          });
+          const audioFinal = await client.waitForAiResult(audioInitial.id, {
+            timeoutMs: (timeout_seconds ?? 600) * 1000,
+          });
+          const audioUrl = audioFinal.response ?? "";
+          if (audioFinal.status !== "completed" || !audioUrl) {
+            throw new PipelineFailedException(
+              "tts",
+              `TTS audio generation failed for avatar "${avatar.name}" (status=${audioFinal.status})${audioFinal.status_message ? `: ${audioFinal.status_message}` : ""}.`,
               {
-                tool: "get_credits_balance",
-                rationale:
-                  "Check credit balance. Audio generation can fail silently when credits are insufficient.",
+                avatar_id,
+                ai_result_id: audioFinal.id,
+                status: audioFinal.status,
+                status_message: audioFinal.status_message ?? null,
               },
+            );
+          }
+          hooks.onPhase?.({ sub_phase: "tts (1/1)", progress: { completed: 1, total: 1 } });
+          hooks.checkCancelled?.("lipsync");
+          hooks.onPhase?.({ sub_phase: "lipsync (0/1)", progress: { completed: 0, total: 1 } });
+          // Lipsync render. HARDCODED to fal + veed_fabric_1.0. See description
+          // for why we deliberately do NOT read ai_preferences here.
+          const videoInitial = await client.generateVideo({
+            type: "video",
+            q: script,
+            audio_url: audioUrl,
+            image_url: imageUrl,
+            aspect_ratio: aspect_ratio ?? "9:16",
+            driver: "fal",
+            model: "veed_fabric_1.0",
+            company_id,
+            chargeable: 1,
+          });
+          const videoFinal = await client.waitForAiResult(videoInitial.id, {
+            timeoutMs: (timeout_seconds ?? 600) * 1000,
+          });
+          if (videoFinal.status !== "completed") {
+            throw new PipelineFailedException(
+              "lipsync",
+              `Lipsync render failed for avatar "${avatar.name}" (status=${videoFinal.status})${videoFinal.status_message ? `: ${videoFinal.status_message}` : ""}.`,
               {
-                rationale:
-                  "Retry the call; audio jobs occasionally fail transiently.",
+                avatar_id,
+                ai_result_id: videoFinal.id,
+                status: videoFinal.status,
+                audio_url: audioUrl,
+              },
+            );
+          }
+          hooks.onPhase?.({ sub_phase: "lipsync (1/1)", progress: { completed: 1, total: 1 } });
+          return { audioFinal, videoFinal, audioUrl };
+        };
+
+        // === Sync mode (legacy opt-in via wait: true) ====================
+        if (wait === true) {
+          const result = await runLipsyncPipeline();
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    avatar_id,
+                    audio_ai_result_id: result.audioFinal.id,
+                    audio_url: result.audioUrl,
+                    image_url: imageUrl,
+                    video: sanitizeAiResult(result.videoFinal),
+                  },
+                  null,
+                  2,
+                ),
               },
             ],
-            details: {
-              avatar_id,
-              ai_result_id: audioFinal.id,
-              status: audioFinal.status,
-              status_message: audioFinal.status_message ?? null,
-            },
-          });
+          };
         }
-        // Lipsync render. HARDCODED to fal + veed_fabric_1.0. See description
-        // for why we deliberately do NOT read ai_preferences here.
-        const videoInitial = await client.generateVideo({
-          type: "video",
-          q: script,
-          audio_url: audioUrl,
-          image_url: imageUrl,
-          aspect_ratio: aspect_ratio ?? "9:16",
-          driver: "fal",
-          model: "veed_fabric_1.0",
+
+        // === Async mode (DEFAULT as of v0.6.0) ===========================
+        // Typical lipsync clip: ~60-180s. Async by default to avoid the
+        // claude.ai 4-min transport timeout on slow networks.
+        const estimate = 120;
+        const pipeline = createPipeline({
+          kind: "avatar_lipsync",
           company_id,
-          chargeable: 1,
+          params: { avatar_id, avatar_name: avatar.name, script, aspect_ratio: aspect_ratio ?? "9:16" },
+          estimated_total_seconds: estimate,
+          initial_sub_phase: "queued",
+          initial_progress: { completed: 0, total: 2 },
         });
-        const videoFinal = await client.waitForAiResult(videoInitial.id, {
-          timeoutMs: (timeout_seconds ?? 600) * 1000,
+        const pipelineId = pipeline.pipeline_id;
+
+        setImmediate(() => {
+          void (async () => {
+            try {
+              updatePipelinePhase(pipelineId, {
+                phase: "running",
+                sub_phase: "starting",
+              });
+              const result = await runLipsyncPipeline({
+                onPhase: (info) => {
+                  updatePipelinePhase(pipelineId, {
+                    sub_phase: info.sub_phase,
+                    ...(info.progress !== undefined ? { progress: info.progress } : {}),
+                  });
+                },
+                checkCancelled: (sub_phase) => {
+                  if (isCancellationRequested(pipelineId)) {
+                    throw new PipelineCancelledException(sub_phase);
+                  }
+                },
+              });
+              markPipelineCompleted(pipelineId, {
+                ai_result_id: result.videoFinal.id,
+                ...(result.videoFinal.response ? { asset_url: result.videoFinal.response } : {}),
+                metadata: {
+                  avatar_id,
+                  avatar_name: avatar.name,
+                  audio_ai_result_id: result.audioFinal.id,
+                  audio_url: result.audioUrl,
+                  image_url: imageUrl,
+                  video: sanitizeAiResult(result.videoFinal),
+                },
+              });
+            } catch (err) {
+              if (err instanceof PipelineCancelledException) {
+                markPipelineCancelled(pipelineId);
+                return;
+              }
+              if (err instanceof PipelineFailedException) {
+                markPipelineFailed(pipelineId, {
+                  sub_phase: err.sub_phase,
+                  reason: err.sub_phase,
+                  user_message: err.user_message,
+                  details: err.details,
+                });
+                return;
+              }
+              markPipelineFailed(pipelineId, {
+                sub_phase: "unknown",
+                reason: err instanceof Error ? err.name : "Error",
+                user_message: `Pipeline failed with an unexpected error: ${err instanceof Error ? err.message : String(err)}`,
+              });
+            }
+          })();
         });
+
         return {
           content: [
             {
               type: "text",
               text: JSON.stringify(
                 {
+                  pipeline_id: pipelineId,
+                  kind: "avatar_lipsync",
+                  company_id,
                   avatar_id,
-                  audio_ai_result_id: audioFinal.id,
-                  audio_url: audioUrl,
-                  image_url: imageUrl,
-                  video: sanitizeAiResult(videoFinal),
+                  avatar_name: avatar.name,
+                  aspect_ratio: aspect_ratio ?? "9:16",
+                  estimated_seconds: estimate,
+                  user_facing_summary: `Empecé el clip lipsync del avatar "${avatar.name}". Va a tardar entre 1 y 3 minutos. Decime "fijate" cuando quieras chequear estado.`,
+                  _assistant_guidance: {
+                    next_step: "tell_user_eta_then_wait_for_status_request",
+                    conversational_flow:
+                      "Mismo flow que generate_avatar_video: traducí el user_facing_summary al user, usá get_pipeline_status (instant) cuando pregunte estado o wait_for_pipeline (hasta 3 min) cuando diga 'esperá'. NO mencionés pipeline_id ni prometas 'te aviso'.",
+                  },
                 },
                 null,
                 2,
@@ -386,6 +530,8 @@ WHEN TO USE THE OTHER VIDEO TOOLS INSTEAD:
 
 OUTFIT PRESERVATION: when the avatar portrait shows a specific outfit that must appear in EVERY scene (fashion brand reels, product showcase with the avatar wearing the brand, lifestyle reels for a recurring look), pass outfit_description with a precise text of the clothing (e.g. "gray bomber jacket with black collar, white tee, dark jeans"). Without this, the AI may interpret clothing differently per scene based on script context (e.g. a "beach" script may put the avatar in swimwear even if the portrait shows winter wear).
 
+ASYNC BY DEFAULT (v0.5.0). This tool now returns immediately with a pipeline_id and an ETA; the video keeps generating in the background. The agent tracks progress via get_pipeline_status (instant) or wait_for_pipeline (bounded poll up to 3 min). This avoids the WebSocket transport timeout that breaks multi-min sync waits on claude.ai. Tell the user something like "Empecé tu reel, va a tardar X-Y min, decime 'fijate' cuando quieras chequear". NEVER promise "te aviso cuando termine" (no push notifications). To opt into legacy sync behavior (only on CLI / IDE clients without transport timeouts), pass wait:true.
+
 CRITICAL: heavy operation. Cost is per SECOND of total video duration (each lipsync scene uses veed_fabric_1.0 at 25 cr/seg; backgrounds add more). For a 3-scene 9:16 video without backgrounds at ~30s total = roughly 750 credits; with backgrounds enabled add 30-100 cr per scene. A 60s multi-scene piece can reach 2000+ cr. Always confirm with the user before proceeding and surface get_credits_balance first.
 
 REQUIRES TEXT BUDGET TOO. This flow internally calls Followr's TTS endpoint (ElevenLabs via Followr) for each scene's audio, which consumes ai_text_budget words on top of the image/video credits. When generate_backgrounds=true the per-scene visual prompt derivation also runs through Followr's chat AI (more words). If get_ai_budget shows ai_text_budget.total === 0 (plan does not include the text/audio module) or ai_text_budget.remaining <= 0 (cycle exhausted), this tool will fail with HTTP 402 entity="words" at the audio step BEFORE generating any video. get_session_context._assistant_guidance.plan_capability_warnings already surfaces this gate at orient time; honor that warning AND, per Rule 21 of the system prompt, NEVER silently downgrade to a no-voice alternative (generate_ai_video_clip) without surfacing the trade-off to the user first.
@@ -396,7 +542,7 @@ VISUAL OPTIONS:
 - generate_backgrounds=true (recommended for polished output): each scene gets a unique image-to-image background that depicts the avatar in a context matching the script. This mirrors Followr's UI default and produces the "real" avatar video look. Adds ~30-100 credits per scene + 30-60s latency.
 - generate_backgrounds=false (default, faster + cheaper): every scene uses the avatar's portrait directly as the lipsync image. Talking head with a static background. Faster + cheaper but less polished.
 
-LATENCY: typically 3-5 minutes without backgrounds, 5-8 minutes with. Configurable via timeout_seconds.
+LATENCY: typically 3-5 minutes without backgrounds, 5-15 minutes with. Async by default (see above) so latency does not block the agent's transport. timeout_seconds only applies when wait:true is passed.
 
 SUBTITLES: burned in by default with Followr's default style (Montserrat 700, 9.29 vmin font size, white text + #0095a6 highlight color, dark stroke, highlight effect, 14 char max per line, positioned at 82% from top). Override via subtitle_* params.
 
@@ -451,7 +597,13 @@ Shape detail: each transition is encoded as a video-element-scoped block inside 
         subtitle_highlight_color: z.string().optional().describe("Hex color for the active highlighted word. Default #0095a6 (Followr brand teal)."),
         subtitle_max_chars: z.number().int().min(8).max(40).optional().describe("Max characters shown at once in subtitles. Default 14."),
         subtitle_font: z.string().optional().describe("Font family. Default Montserrat. Other supported (per Followr UI): Inter, Poppins, Roboto, Open Sans, Playfair Display, Bebas Neue."),
-        timeout_seconds: z.number().int().positive().max(1200).optional().describe("Max seconds for the entire flow. Default 900 (15 min)."),
+        timeout_seconds: z.number().int().positive().max(2400).optional().describe("Max seconds for the entire pipeline. Default 1500 (25 min). Bumped from 900 in v0.5.0 to cover the realistic worst case of 10 scenes with backgrounds. Only relevant when wait=true; in async mode the pipeline runs to completion regardless (the timeout is hit only inside per-job waits)."),
+        wait: z
+          .boolean()
+          .optional()
+          .describe(
+            "If false (DEFAULT as of v0.5.0): returns immediately with a pipeline_id and an ETA; the video keeps generating in the background. Use get_avatar_video_pipeline_status / wait_for_avatar_video_pipeline to track. This is the safe default for clients with WebSocket transport timeouts (claude.ai cuts at ~4 min, avatar videos can take 5-15 min). If true: blocks until the pipeline completes (legacy v0.4.x behavior). Use wait=true only for clients that tolerate long-running tool calls (CLI / IDE plugins).",
+          ),
       },
     },
     async ({
@@ -472,6 +624,7 @@ Shape detail: each transition is encoded as a video-element-scoped block inside 
       subtitle_max_chars,
       subtitle_font,
       timeout_seconds,
+      wait,
     }) => {
       try {
         const avatar: Avatar = await client.getAvatar(avatar_id, {
@@ -503,391 +656,179 @@ Shape detail: each transition is encoded as a video-element-scoped block inside 
             details: { avatar_id, avatar_name: avatar.name },
           });
         }
-        const voicePlatformId = avatar.voice.platform_external_id;
-        const avatarImageUrl = avatar.image.url;
-        const totalTimeoutMs = (timeout_seconds ?? 900) * 1000;
-        // Per-job timeout: a quarter of the total, with 60s floor. Audio is
-        // fast (~10-15s) but lipsync renders can take 60-120s each in parallel.
-        const perJobTimeoutMs = Math.max(60_000, Math.floor(totalTimeoutMs / 4));
-        const finalAspectRatio = aspect_ratio ?? "9:16";
-
-        // === Phase 0 (optional): per-scene background generation. ===
-        // When generate_backgrounds=true: ask Followr's chat to turn each script
-        // into an image prompt, then image-to-image gen per scene using the
-        // avatar's portrait as the visual reference (image_url + image_urls).
-        // The resulting URLs replace avatar.image.url as the lipsync image,
-        // giving each scene its own contextual background while keeping the
-        // avatar visually consistent. When false (default): every scene
-        // reuses the avatar portrait directly (talking head).
-        let lipsyncImageUrls: string[] = scripts.map(() => avatarImageUrl);
-        let backgroundAiResultIds: number[] = [];
-        if (generate_backgrounds) {
-          const styleHint = background_style ? ` Style hint: ${background_style}.` : "";
-          // Character description: prefer explicit outfit_description (precise,
-          // takes precedence) over the avatar's stored description (looser).
-          // Either of them is injected as a hard constraint into the chat
-          // prompt so every scene's background respects the avatar's identity
-          // and clothing, instead of letting the script context drift the look.
-          const characterParts: string[] = [];
-          if (avatar.description) {
-            characterParts.push(`Character description: ${avatar.description}`);
-          }
-          if (outfit_description) {
-            characterParts.push(
-              `OUTFIT CONSTRAINT (every scene MUST preserve this exactly, do not change clothes between scenes even if the script implies a different setting): ${outfit_description}`,
-            );
-          }
-          const characterHint = characterParts.length > 0 ? `\n\n${characterParts.join("\n")}` : "";
-          const chatPrompt =
-            `For each of the ${scripts.length} short on-camera video scripts below, write ONE image generation prompt. Each prompt must describe a scene matching its script's tone and content, with the on-camera character (the avatar) visible from waist up in a portrait composition. Keep each prompt under 200 words. Return ONLY a JSON array of ${scripts.length} strings, no other text, no markdown code fences.${styleHint}${characterHint}\n\nScripts: ${JSON.stringify(scripts)}`;
-          const chatInitial = await client.generateChat({
-            q: chatPrompt,
-            company_id,
-            chargeable: 1,
-          });
-          const chatFinal = await client.waitForAiResult(chatInitial.id, {
-            timeoutMs: Math.max(60_000, Math.floor(perJobTimeoutMs / 2)),
-          });
-          if (chatFinal.status !== "completed" || !chatFinal.response) {
-            return toolError({
-              reason: "background_prompts_failed",
-              user_message: `Chat call to derive scene visual prompts failed (status=${chatFinal.status})${chatFinal.status_message ? `: ${chatFinal.status_message}` : ""}. You can retry with generate_backgrounds=false to skip this step and use the avatar's portrait as the background for every scene.`,
-              suggested_actions: [
-                {
-                  tool: "get_credits_balance",
-                  rationale: "Check credit balance.",
-                },
-              ],
-              details: { ai_result_id: chatFinal.id, status: chatFinal.status },
-            });
-          }
-          let imagePrompts: string[];
-          try {
-            const cleaned = chatFinal.response
-              .replace(/^\s*```(?:json)?\s*/m, "")
-              .replace(/\s*```\s*$/m, "")
-              .trim();
-            const parsed: unknown = JSON.parse(cleaned);
-            if (!Array.isArray(parsed) || parsed.length !== scripts.length) {
-              throw new Error(
-                `expected JSON array of ${scripts.length} strings, got ${Array.isArray(parsed) ? `${parsed.length} items` : typeof parsed}`,
-              );
-            }
-            imagePrompts = parsed.map((p) => String(p));
-          } catch {
-            // Fallback: build generic per-script prompts so the flow still works
-            // even if the chat model returned malformed output. Quality is lower
-            // but the user still gets a finished video.
-            imagePrompts = scripts.map(
-              (s) =>
-                `Professional photograph of the on-camera character in a scene matching this script: "${s.slice(0, 200)}". Portrait orientation, visible from waist up, soft cinematic lighting.${styleHint}`,
-            );
-          }
-          // Image-to-image gen per scene. Hardcoded fal + nano_banana_2 (the
-          // model Followr's UI uses for this step; image-to-image mode is
-          // activated by passing image_url + image_urls with references).
-          // Reference logic per scene:
-          //   1. avatar portrait is always included as visual anchor.
-          //   2. if scene_reference_images has an entry for this scene index,
-          //      those URLs are appended (per-scene override).
-          //   3. else if reference_image_urls is set, those are appended (global).
-          // This lets the caller put a product / logo / outfit in some or all
-          // scenes (e.g. scene 0 with a handbag, scene 1 with a mug+logo).
-          const imageInitials = await Promise.all(
-            imagePrompts.map((prompt, i) => {
-              const perSceneRefs = scene_reference_images?.[String(i)];
-              const sceneRefs = perSceneRefs ?? reference_image_urls ?? [];
-              const imageUrls = [avatarImageUrl, ...sceneRefs];
-              return client.generateImage({
-                q: prompt,
-                company_id,
-                n: 1,
-                chargeable: 1,
-                aspect_ratio: finalAspectRatio,
-                driver: "fal",
-                model: "nano_banana_2",
-                image_url: avatarImageUrl,
-                image_urls: imageUrls,
-                queue: true,
-              });
-            }),
-          );
-          const imageFinals = await Promise.all(
-            imageInitials.map((init) =>
-              client.waitForAiResult(init.id, { timeoutMs: perJobTimeoutMs }),
-            ),
-          );
-          const failedImageIdx = imageFinals.findIndex(
-            (img) => img.status !== "completed" || !img.response,
-          );
-          if (failedImageIdx >= 0) {
-            const failed = imageFinals[failedImageIdx]!;
-            return toolError({
-              reason: "background_generation_failed",
-              user_message: `Background image for scene ${failedImageIdx + 1} of ${scripts.length} failed (status=${failed.status})${failed.status_message ? `: ${failed.status_message}` : ""}. Retry with generate_backgrounds=false to skip the per-scene background step and use the avatar's portrait for all scenes.`,
-              suggested_actions: [
-                {
-                  tool: "get_credits_balance",
-                  rationale: "Check credit balance.",
-                },
-              ],
-              details: {
-                failed_scene_index: failedImageIdx,
-                ai_result_id: failed.id,
-                status: failed.status,
-                status_message: failed.status_message ?? null,
-              },
-            });
-          }
-          lipsyncImageUrls = imageFinals.map((img) => img.response!);
-          backgroundAiResultIds = imageFinals.map((img) => img.id);
-        }
-
-        // === Phase 1: TTS audio per scene (parallel submit + parallel wait). ===
-        const audioInitials = await Promise.all(
-          scripts.map((script) =>
-            client.generateAudio({
-              q: script,
-              company_id,
-              type: "audio",
-              voice: voicePlatformId,
-              ...(audio_speed !== undefined ? { speed: audio_speed } : {}),
-              driver: "fal",
-              model: "elevenlabs_tts_3",
-            }),
-          ),
-        );
-        const audioFinals = await Promise.all(
-          audioInitials.map((init) =>
-            client.waitForAiResult(init.id, { timeoutMs: perJobTimeoutMs }),
-          ),
-        );
-        const failedAudioIdx = audioFinals.findIndex(
-          (a) => a.status !== "completed" || !a.response,
-        );
-        if (failedAudioIdx >= 0) {
-          const failed = audioFinals[failedAudioIdx]!;
-          return toolError({
-            reason: "audio_generation_failed",
-            user_message: `Audio for scene ${failedAudioIdx + 1} of ${scripts.length} failed (status=${failed.status})${failed.status_message ? `: ${failed.status_message}` : ""}.`,
-            suggested_actions: [
-              {
-                tool: "get_credits_balance",
-                rationale: "Check credit balance.",
-              },
-            ],
-            details: {
-              failed_scene_index: failedAudioIdx,
-              failed_script: scripts[failedAudioIdx] ?? null,
-              ai_result_id: failed.id,
-              status: failed.status,
-              status_message: failed.status_message ?? null,
-            },
-          });
-        }
-        const audioUrls = audioFinals.map((a) => a.response!);
-
-        // === Phase 2: Lipsync render per scene (parallel). HARDCODE model. ===
-        // image_url is either the avatar portrait (default) or a per-scene
-        // image-to-image background (when generate_backgrounds=true).
-        const videoInitials = await Promise.all(
-          scripts.map((script, i) =>
-            client.generateVideo({
-              type: "video",
-              q: script,
-              audio_url: audioUrls[i]!,
-              image_url: lipsyncImageUrls[i]!,
-              aspect_ratio: finalAspectRatio,
-              driver: "fal",
-              model: "veed_fabric_1.0",
-              company_id,
-              chargeable: 1,
-            }),
-          ),
-        );
-        const videoFinals = await Promise.all(
-          videoInitials.map((init) =>
-            client.waitForAiResult(init.id, { timeoutMs: perJobTimeoutMs }),
-          ),
-        );
-        const failedVideoIdx = videoFinals.findIndex(
-          (v) => v.status !== "completed" || !v.response,
-        );
-        if (failedVideoIdx >= 0) {
-          const failed = videoFinals[failedVideoIdx]!;
-          return toolError({
-            reason: "lipsync_generation_failed",
-            user_message: `Lipsync for scene ${failedVideoIdx + 1} of ${scripts.length} failed (status=${failed.status})${failed.status_message ? `: ${failed.status_message}` : ""}. Audio jobs already completed successfully; you can retry the lipsync step or fall back to generate_avatar_lipsync_clip per scene.`,
-            suggested_actions: [
-              {
-                rationale: "Retry the call. Lipsync jobs occasionally fail transiently.",
-              },
-            ],
-            details: {
-              failed_scene_index: failedVideoIdx,
-              ai_result_id: failed.id,
-              status: failed.status,
-              audio_urls: audioUrls,
-            },
-          });
-        }
-        const lipsyncUrls = videoFinals.map((v) => v.response!);
-
-        // === Phase 3: Build Creatomate render_script and submit concat. ===
-        // Shape verified empirically 2026-05-19 (sesión 7). For each scene
-        // we emit two elements: a video (the lipsync clip) and a text overlay
-        // (subtitles generated by Creatomate from the video's embedded
-        // transcript via transcript_source linking by id). Tracks alternate
-        // so elements don't overlap on the timeline: scene 0 = tracks 1+2,
-        // scene 1 = tracks 3+4, ... Time and duration are intentionally
-        // omitted; Creatomate infers them from the source video.
-        const isPortrait = finalAspectRatio === "9:16";
-        const renderWidth = isPortrait ? 768 : 1376;
-        const renderHeight = isPortrait ? 1376 : 768;
-        // Estimate per-scene duration from script length. ElevenLabs tts_3 reads
-        // roughly 0.06-0.07s per character; add a small buffer for natural
-        // pauses. Used to set the `duration` of the scale animation so it spans
-        // the whole scene. If the estimate drifts, the animation ends slightly
-        // before or after the lipsync ends but the video still composes cleanly.
-        const estimateSceneDuration = (script: string): number => {
-          return Math.min(30, Math.max(2, script.length * 0.07 + 0.5));
-        };
-        const elements: Array<Record<string, unknown>> = [];
-        lipsyncUrls.forEach((url, i) => {
-          const videoId = `video-scene-${i + 1}`;
-          const sceneDuration = estimateSceneDuration(scripts[i]!);
-          // Build the animations array per video element based on options.
-          // Empirically verified shapes (2026-05-19, sesión 7):
-          //   - zoom_in / zoom_out: type="scale", scope="element", with
-          //     start_scale/end_scale percentages. easing="linear", fade=false.
-          //   - pan_*: type="pan", scope="element", with start_x/start_y/end_x/end_y
-          //     percentages. easing="linear".
-          //   - slide_*: type="slide", transition=true, direction in degrees,
-          //     time=0, duration=1.
-          //   - wipe_*: type="wipe", transition=true, x_anchor percentage,
-          //     easing="cubic-in-out", duration=1.
-          //
-          // Only zoom_in, pan_left, slide_left, wipe_left were verified by raw
-          // capture; the other directional siblings are derived by swapping
-          // coordinates (pan, zoom) or degrees (slide) on the verified pattern.
-          // First scene never gets a transition (no previous scene to enter from).
-          const animations: Array<Record<string, unknown>> = [];
-          if (scene_animation && scene_animation !== "none") {
-            if (scene_animation === "zoom_in") {
-              animations.push({ type: "scale", scope: "element", start_scale: "100%", end_scale: "110%", easing: "linear", fade: false, time: 0, duration: sceneDuration });
-            } else if (scene_animation === "zoom_out") {
-              animations.push({ type: "scale", scope: "element", start_scale: "110%", end_scale: "100%", easing: "linear", fade: false, time: 0, duration: sceneDuration });
-            } else if (scene_animation === "pan_left") {
-              animations.push({ type: "pan", scope: "element", start_x: "55%", start_y: "50%", end_x: "45%", end_y: "50%", easing: "linear", time: 0, duration: sceneDuration });
-            } else if (scene_animation === "pan_right") {
-              animations.push({ type: "pan", scope: "element", start_x: "45%", start_y: "50%", end_x: "55%", end_y: "50%", easing: "linear", time: 0, duration: sceneDuration });
-            } else if (scene_animation === "pan_up") {
-              animations.push({ type: "pan", scope: "element", start_x: "50%", start_y: "55%", end_x: "50%", end_y: "45%", easing: "linear", time: 0, duration: sceneDuration });
-            } else if (scene_animation === "pan_down") {
-              animations.push({ type: "pan", scope: "element", start_x: "50%", start_y: "45%", end_x: "50%", end_y: "55%", easing: "linear", time: 0, duration: sceneDuration });
-            }
-          }
-          if (scene_transition && scene_transition !== "none" && i > 0) {
-            if (scene_transition === "slide_left") {
-              animations.push({ type: "slide", transition: true, direction: "180°", time: 0, duration: 1 });
-            } else if (scene_transition === "slide_right") {
-              animations.push({ type: "slide", transition: true, direction: "0°", time: 0, duration: 1 });
-            } else if (scene_transition === "slide_up") {
-              animations.push({ type: "slide", transition: true, direction: "90°", time: 0, duration: 1 });
-            } else if (scene_transition === "slide_down") {
-              animations.push({ type: "slide", transition: true, direction: "270°", time: 0, duration: 1 });
-            } else if (scene_transition === "wipe_left") {
-              animations.push({ type: "wipe", transition: true, x_anchor: "100%", easing: "cubic-in-out", time: 0, duration: 1 });
-            } else if (scene_transition === "wipe_right") {
-              animations.push({ type: "wipe", transition: true, x_anchor: "0%", easing: "cubic-in-out", time: 0, duration: 1 });
-            }
-          }
-          elements.push({
-            type: "video",
-            id: videoId,
-            source: url,
-            track: i * 2 + 1,
-            ...(animations.length > 0 ? { animations } : {}),
-          });
-          elements.push({
-            type: "text",
-            transcript_source: videoId,
-            transcript_effect: "highlight",
-            transcript_maximum_length: subtitle_max_chars ?? 14,
-            y: "82%",
-            width: "81%",
-            height: "35%",
-            x_alignment: "50%",
-            y_alignment: "50%",
-            fill_color: subtitle_text_color ?? "#ffffff",
-            transcript_color: subtitle_highlight_color ?? "#0095a6",
-            stroke_color: "rgba(0,0,0,1)",
-            stroke_width: "1.6 vmin",
-            font_family: subtitle_font ?? "Montserrat",
-            font_weight: "700",
-            font_size: "9.29 vmin",
-            background_color: "rgba(216,216,216,0)",
-            background_x_padding: "31%",
-            background_y_padding: "10%",
-            background_border_radius: "27%",
-            track: i * 2 + 2,
-          });
-        });
-        const concatInitial = await client.generateVideoConcat({
-          type: "video",
-          q: "creatomate",
-          aspect_ratio: finalAspectRatio,
-          driver: "creatomate",
-          model: "creatomate_video",
-          render_script: {
-            output_format: "mp4",
-            width: renderWidth,
-            height: renderHeight,
-            elements,
-          },
+        const pipelineParams: AvatarVideoPipelineParams = {
           company_id,
-          chargeable: 1,
-        });
-        const concatFinal = await client.waitForAiResult(concatInitial.id, {
-          timeoutMs: perJobTimeoutMs,
-        });
-        if (concatFinal.status !== "completed" || !concatFinal.response) {
-          return toolError({
-            reason: "concat_failed",
-            user_message: `Final video concat failed (status=${concatFinal.status})${concatFinal.status_message ? `: ${concatFinal.status_message}` : ""}. Individual lipsync clips were generated successfully (URLs in details). You can either retry the concat by calling this tool again with the same scripts (lipsyncs will regenerate, costing credits) or build a final video manually from the individual URLs.`,
-            suggested_actions: [
+          avatar,
+          scripts,
+          ...(aspect_ratio !== undefined ? { aspect_ratio } : {}),
+          ...(audio_speed !== undefined ? { audio_speed } : {}),
+          ...(generate_backgrounds !== undefined ? { generate_backgrounds } : {}),
+          ...(background_style !== undefined ? { background_style } : {}),
+          ...(outfit_description !== undefined ? { outfit_description } : {}),
+          ...(reference_image_urls !== undefined ? { reference_image_urls } : {}),
+          ...(scene_reference_images !== undefined ? { scene_reference_images } : {}),
+          ...(scene_animation !== undefined ? { scene_animation } : {}),
+          ...(scene_transition !== undefined ? { scene_transition } : {}),
+          ...(subtitle_text_color !== undefined ? { subtitle_text_color } : {}),
+          ...(subtitle_highlight_color !== undefined ? { subtitle_highlight_color } : {}),
+          ...(subtitle_max_chars !== undefined ? { subtitle_max_chars } : {}),
+          ...(subtitle_font !== undefined ? { subtitle_font } : {}),
+          ...(timeout_seconds !== undefined ? { timeout_seconds } : {}),
+        };
+
+        // === Sync mode (legacy opt-in via wait: true) =====================
+        // Same shape as the v0.4.x return. Use for clients without WebSocket
+        // transport timeouts (CLI / IDE plugins). NOT recommended on
+        // claude.ai because it cuts the transport at ~4 min and avatar
+        // videos take 3-15 min.
+        if (wait === true) {
+          const result = await executeAvatarVideoPipeline(client, pipelineParams);
+          return {
+            content: [
               {
-                tool: "list_ai_results",
-                rationale: "Inspect the individual lipsync aiResults to confirm they're usable.",
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    avatar_id,
+                    avatar_name: result.avatar.name,
+                    scene_count: scripts.length,
+                    aspect_ratio: result.aspect_ratio,
+                    backgrounds_generated: result.backgroundsGenerated,
+                    background_ai_result_ids: result.backgroundAiResultIds,
+                    lipsync_image_urls: result.lipsyncImageUrls,
+                    scene_animation: scene_animation ?? "none",
+                    scene_transition: scene_transition ?? "none",
+                    audio_ai_result_ids: result.audioFinals.map((a) => a.id),
+                    lipsync_ai_result_ids: result.videoFinals.map((v) => v.id),
+                    individual_lipsync_urls: result.lipsyncUrls,
+                    final_video: sanitizeAiResult(result.finalVideo),
+                  },
+                  null,
+                  2,
+                ),
               },
             ],
-            details: {
-              concat_ai_result_id: concatFinal.id,
-              status: concatFinal.status,
-              scene_count: scripts.length,
-              individual_lipsync_urls: lipsyncUrls,
-            },
-          });
+          };
         }
+
+        // === Async mode (DEFAULT as of v0.5.0) ============================
+        // Create a PipelineState row, fire the executor as a background
+        // task, and return the pipeline_id + ETA immediately. The agent
+        // polls via get_avatar_video_pipeline_status (instant) or
+        // wait_for_avatar_video_pipeline (bounded poll up to 180s).
+        const estimate = estimateAvatarVideoSeconds(
+          scripts.length,
+          generate_backgrounds === true,
+        );
+        const pipeline = createPipeline({
+          kind: "avatar_video",
+          company_id,
+          params: {
+            avatar_id,
+            avatar_name: avatar.name,
+            scripts,
+            aspect_ratio: aspect_ratio ?? "9:16",
+            generate_backgrounds: generate_backgrounds === true,
+          },
+          estimated_total_seconds: estimate,
+          initial_sub_phase: "queued",
+          initial_progress: { completed: 0, total: scripts.length },
+        });
+        const pipelineId = pipeline.pipeline_id;
+
+        // Fire-and-forget runner. Uses setImmediate to escape the current
+        // tool-call event loop tick so the tool return is not blocked by
+        // any synchronous overhead in the executor. Errors are captured
+        // into the pipeline state; nothing is thrown out of the IIFE.
+        setImmediate(() => {
+          void (async () => {
+            try {
+              updatePipelinePhase(pipelineId, {
+                phase: "running",
+                sub_phase: "starting",
+              });
+              const result = await executeAvatarVideoPipeline(
+                client,
+                pipelineParams,
+                {
+                  onPhase: (info) => {
+                    updatePipelinePhase(pipelineId, {
+                      sub_phase: info.sub_phase,
+                      ...(info.progress !== undefined ? { progress: info.progress } : {}),
+                      ...(info.estimated_remaining_seconds !== undefined
+                        ? { estimated_remaining_seconds: info.estimated_remaining_seconds }
+                        : {}),
+                    });
+                  },
+                  onSubJobs: (patch) => recordPipelineSubJobs(pipelineId, patch),
+                  checkCancelled: (sub_phase) => {
+                    if (isCancellationRequested(pipelineId)) {
+                      throw new PipelineCancelledException(sub_phase);
+                    }
+                  },
+                },
+              );
+              markPipelineCompleted(pipelineId, {
+                ai_result_id: result.finalVideo.id,
+                ...(result.finalVideo.response ? { asset_url: result.finalVideo.response } : {}),
+                metadata: {
+                  avatar_id,
+                  avatar_name: result.avatar.name,
+                  scene_count: scripts.length,
+                  aspect_ratio: result.aspect_ratio,
+                  backgrounds_generated: result.backgroundsGenerated,
+                  background_ai_result_ids: result.backgroundAiResultIds,
+                  lipsync_image_urls: result.lipsyncImageUrls,
+                  audio_ai_result_ids: result.audioFinals.map((a) => a.id),
+                  lipsync_ai_result_ids: result.videoFinals.map((v) => v.id),
+                  individual_lipsync_urls: result.lipsyncUrls,
+                },
+              });
+            } catch (err) {
+              if (err instanceof PipelineCancelledException) {
+                markPipelineCancelled(pipelineId);
+                return;
+              }
+              if (err instanceof PipelineFailedException) {
+                markPipelineFailed(pipelineId, {
+                  sub_phase: err.sub_phase,
+                  reason: err.sub_phase,
+                  user_message: err.user_message,
+                  details: err.details,
+                });
+                return;
+              }
+              markPipelineFailed(pipelineId, {
+                sub_phase: "unknown",
+                reason: err instanceof Error ? err.name : "Error",
+                user_message: `Pipeline failed with an unexpected error: ${err instanceof Error ? err.message : String(err)}`,
+              });
+            }
+          })();
+        });
+
+        const minMinutes = Math.max(1, Math.round(estimate / 60));
+        const maxMinutes = Math.max(minMinutes + 1, Math.round((estimate * 1.5) / 60));
         return {
           content: [
             {
               type: "text",
               text: JSON.stringify(
                 {
+                  pipeline_id: pipelineId,
+                  kind: "avatar_video",
+                  company_id,
                   avatar_id,
                   avatar_name: avatar.name,
                   scene_count: scripts.length,
-                  aspect_ratio: finalAspectRatio,
-                  backgrounds_generated: generate_backgrounds === true,
-                  background_ai_result_ids: backgroundAiResultIds,
-                  lipsync_image_urls: lipsyncImageUrls,
-                  scene_animation: scene_animation ?? "none",
-                  scene_transition: scene_transition ?? "none",
-                  audio_ai_result_ids: audioFinals.map((a) => a.id),
-                  lipsync_ai_result_ids: videoFinals.map((v) => v.id),
-                  individual_lipsync_urls: lipsyncUrls,
-                  final_video: sanitizeAiResult(concatFinal),
+                  aspect_ratio: aspect_ratio ?? "9:16",
+                  estimated_seconds: estimate,
+                  user_facing_summary: `Empecé tu reel multi-escena (${scripts.length} scene${scripts.length === 1 ? "" : "s"}). Va a tardar entre ${minMinutes} y ${maxMinutes} minutos. Decime "fijate" cuando quieras chequear, o "esperá" si querés que pollée hasta 3 min sin freezar la conversación.`,
+                  _assistant_guidance: {
+                    next_step: "tell_user_eta_then_wait_for_status_request",
+                    conversational_flow:
+                      "1. Decile al user el user_facing_summary (tal cual o reformulado en castellano natural, lo mismo dará). 2. NO mencionés pipeline_id, ai_result_ids ni nada interno (son internos del MCP). 3. Cuando el user pregunte 'fijate' / 'ya está?' / 'cómo va', llamá get_avatar_video_pipeline_status(pipeline_id) (instantáneo) y traducí la phase a castellano humano (e.g. lipsync -> 'rendereando los videos del avatar', concat -> 'uniendo las escenas con subtítulos'). 4. Cuando el user diga 'esperá' / 'quédate ahí', llamá wait_for_avatar_video_pipeline(pipeline_id, max_wait_seconds=180) (hasta 3 min de polleo interno; suficiente bajo cualquier transport). 5. NUNCA prometas 'te aviso cuando termine'. claude.ai no soporta push notifications de MCP; el user siempre tiene que pedir el status. 6. Si el pipeline falla, surface el failure.user_message y preguntá si reintenta (sin auto-reintentar, evita gastar créditos).",
+                  },
                 },
                 null,
                 2,
@@ -1026,6 +967,8 @@ PRECONDITION: company_id required. If multiple companies and the user hasn't nam
 
 PRIMARY USE: recover prior generations and reference their URLs without paying credits to regenerate. Especially valuable for images/audio/video which are expensive.
 
+RECOVERY AFTER A TIMEOUT: when a generate_* tool times out from the client side but the backend keeps producing the result, pass created_after with the ISO timestamp from RIGHT BEFORE the generate call. That narrows the list to only jobs your call kicked off, so you can recover the result_id without guessing which row is yours (avoids picking up unrelated concurrent jobs in shared workspaces).
+
 INCLUDE: for images pass include="images,images.thumbnail" (PLURAL); for videos include="videos,videos.thumbnail". The base resource doesn't always hydrate file fields without an explicit include. NOTE: the API rejects the singular form "image,image.thumbnail" with HTTP 400; use plural even when filtering type=image.
 
 Sorted newest first by default.`,
@@ -1039,9 +982,16 @@ Sorted newest first by default.`,
         include: z.string().optional().describe("Comma-separated includes. e.g. 'images,images.thumbnail' for images (plural even for type=image), 'videos,videos.thumbnail' for videos. Singular 'image,image.thumbnail' is REJECTED by the API."),
         page_size: z.number().int().positive().max(100).optional(),
         sort: z.string().optional().describe("Default -created_at."),
+        created_after: z
+          .string()
+          .datetime({ offset: true })
+          .optional()
+          .describe(
+            "ISO-8601 timestamp. Returns only results created at-or-after this moment. Use to scope recovery queries to a single call: capture `new Date().toISOString()` BEFORE invoking a generate_* tool, then filter with that timestamp if you need to recover after a timeout. The server-side filter is best-effort (filter[created_at_gte]); a client-side fallback enforces the cutoff in case the backend ignores it.",
+          ),
       },
     },
-    async ({ company_id, type, model, include, page_size, sort }) => {
+    async ({ company_id, type, model, include, page_size, sort, created_after }) => {
       const results = await client.listAiResults({
         companyId: company_id,
         ...(type ? { type } : {}),
@@ -1049,12 +999,22 @@ Sorted newest first by default.`,
         ...(include ? { include } : {}),
         ...(page_size ? { pageSize: page_size } : {}),
         ...(sort ? { sort } : {}),
+        ...(created_after ? { createdAfterIso: created_after } : {}),
       });
+      // Client-side enforcement: if the backend silently ignored the
+      // filter[created_at_gte] param (it's not in the published spec, we
+      // discovered it empirically), drop rows older than the cutoff here.
+      const filtered = created_after
+        ? results.filter((r) => {
+            if (!r.created_at) return true;
+            return new Date(r.created_at).getTime() >= new Date(created_after).getTime();
+          })
+        : results;
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(results.map(sanitizeAiResult), null, 2),
+            text: JSON.stringify(filtered.map(sanitizeAiResult), null, 2),
           },
         ],
       };

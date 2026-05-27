@@ -50,6 +50,13 @@ import {
   toCreativeStudioAspectRatio,
 } from "../lib/aspect-ratio-translate.js";
 import { scrapeBrandSignalsFromWebsite } from "../lib/brand-website-scraper.js";
+import { invalidateContextsForCompany } from "../lib/content-plan-state.js";
+import {
+  createPipeline,
+  markPipelineCompleted,
+  markPipelineFailed,
+  updatePipelinePhase,
+} from "../lib/pipeline-state.js";
 import { toolError, toolErrorFromException } from "../lib/tool-error.js";
 import {
   appendVisualStyleMarker,
@@ -344,6 +351,12 @@ REGISTERS the asset in the company's Media Library. The user can then reference 
           .describe(
             "Required to be true when slide_count > 1 (multi-slide carousels). Single-slide generations don't need explicit confirm (cost is bounded and predictable). Pass after the user has approved the total cost.",
           ),
+        wait: z
+          .boolean()
+          .optional()
+          .describe(
+            "If omitted: smart default. Single-slide (slide_count=1) defaults to wait:true (returns the URL inline; typical 30-60s). Multi-slide carousels default to wait:false (returns a pipeline_id + ETA; carousels take 2-5+ min and risk the claude.ai transport timeout). To override: pass wait:true to always block, wait:false to always async.",
+          ),
       },
     },
     async ({
@@ -359,6 +372,7 @@ REGISTERS the asset in the company's Media Library. The user can then reference 
       reference_images,
       save_to_media_library,
       confirm,
+      wait,
     }) => {
       try {
         // ── Validation ──────────────────────────────────────────────
@@ -430,29 +444,8 @@ REGISTERS the asset in the company's Media Library. The user can then reference 
         // ── Translate aspect_ratio ──────────────────────────────────
         const csAspectRatio = toCreativeStudioAspectRatio(aspect_ratio as StandardAspectRatio);
 
-        // ── POST /api/companies/{id}/creative ───────────────────────
-        const creative = await client.createCreative(company_id, {
-          content_type,
-          style_key: resolvedStyleKey,
-          prompt,
-          aspect_ratio: csAspectRatio,
-          slide_count,
-          model,
-          brand_context: brandContext,
-          include_brand_logo,
-          use_brand_colors,
-          image_urls: reference_images && reference_images.length > 0 ? reference_images : null,
-          carousel_format: null,
-        });
-
-        // ── Poll until completed ────────────────────────────────────
-        const final = await client.waitForCreative(creative.id, {
-          expectedSlides: slide_count,
-          intervalMs: 3000,
-          timeoutMs: Math.max(60_000, slide_count * 60_000), // ~1 min per slide as a max
-        });
-
-        // ── Extract slide URLs and save to library ──────────────────
+        // Closure: extract the generation body so both sync (wait:true) and
+        // async (wait:false) paths share the same code.
         interface SlideOutput {
           slide_number: number;
           ai_result_id: number;
@@ -461,83 +454,193 @@ REGISTERS the asset in the company's Media Library. The user can then reference 
           asset_id: number | null;
           asset_save_error: string | null;
         }
-
-        const slides: SlideOutput[] = [];
-        for (let i = 0; i < final.ai_results.length; i++) {
-          const result = final.ai_results[i];
-          if (!result) continue;
-          const firstImage = result.images?.[0];
-          if (!firstImage?.url) {
+        const runCreativePipeline = async (
+          opts: {
+            onPhase?: (info: { sub_phase: string; progress?: { completed: number; total: number } | null }) => void;
+          } = {},
+        ): Promise<Record<string, unknown>> => {
+          opts.onPhase?.({ sub_phase: `submitting (0/${slide_count})`, progress: { completed: 0, total: slide_count } });
+          const creative = await client.createCreative(company_id, {
+            content_type,
+            style_key: resolvedStyleKey,
+            prompt,
+            aspect_ratio: csAspectRatio,
+            slide_count,
+            model,
+            brand_context: brandContext,
+            include_brand_logo,
+            use_brand_colors,
+            image_urls: reference_images && reference_images.length > 0 ? reference_images : null,
+            carousel_format: null,
+          });
+          opts.onPhase?.({ sub_phase: `rendering slides (0/${slide_count})`, progress: { completed: 0, total: slide_count } });
+          const final = await client.waitForCreative(creative.id, {
+            expectedSlides: slide_count,
+            intervalMs: 3000,
+            timeoutMs: Math.max(60_000, slide_count * 60_000),
+          });
+          opts.onPhase?.({ sub_phase: `uploading slides (0/${final.ai_results.length})`, progress: { completed: 0, total: final.ai_results.length } });
+          const slides: SlideOutput[] = [];
+          for (let i = 0; i < final.ai_results.length; i++) {
+            const result = final.ai_results[i];
+            if (!result) continue;
+            const firstImage = result.images?.[0];
+            if (!firstImage?.url) {
+              slides.push({
+                slide_number: i + 1,
+                ai_result_id: result.id,
+                image_url: "",
+                image_thumbnail_url: null,
+                asset_id: null,
+                asset_save_error: "ai_result completed but had no image URL",
+              });
+              continue;
+            }
+            let asset_id: number | null = null;
+            let asset_save_error: string | null = null;
+            if (save_to_media_library) {
+              try {
+                const asset = await uploadFromUrl(client, {
+                  companyId: company_id,
+                  url: firstImage.url,
+                  type: "image",
+                  name: `creative-${creative.id}-slide-${i + 1}.jpg`,
+                });
+                asset_id = asset.id;
+              } catch (uploadErr) {
+                asset_save_error =
+                  uploadErr instanceof Error ? uploadErr.message : String(uploadErr);
+              }
+            }
             slides.push({
               slide_number: i + 1,
               ai_result_id: result.id,
-              image_url: "",
-              image_thumbnail_url: null,
-              asset_id: null,
-              asset_save_error: "ai_result completed but had no image URL",
+              image_url: firstImage.url,
+              image_thumbnail_url: firstImage.thumbnail?.url ?? null,
+              asset_id,
+              asset_save_error,
             });
-            continue;
+            opts.onPhase?.({ sub_phase: `uploading slides (${i + 1}/${final.ai_results.length})`, progress: { completed: i + 1, total: final.ai_results.length } });
           }
-          let asset_id: number | null = null;
-          let asset_save_error: string | null = null;
-          if (save_to_media_library) {
-            try {
-              const asset = await uploadFromUrl(client, {
-                companyId: company_id,
-                url: firstImage.url,
-                type: "image",
-                name: `creative-${creative.id}-slide-${i + 1}.jpg`,
-              });
-              asset_id = asset.id;
-            } catch (uploadErr) {
-              asset_save_error =
-                uploadErr instanceof Error ? uploadErr.message : String(uploadErr);
-            }
-          }
-          slides.push({
-            slide_number: i + 1,
-            ai_result_id: result.id,
-            image_url: firstImage.url,
-            image_thumbnail_url: firstImage.thumbnail?.url ?? null,
-            asset_id,
-            asset_save_error,
-          });
+          const slidesSavedCount = slides.filter((s) => s.asset_id !== null).length;
+          const slidesFailedCount = slides.filter((s) => s.asset_save_error !== null).length;
+          return {
+            creative_id: creative.id,
+            title: creative.title,
+            used_style: {
+              slug: resolvedStyleKey,
+              display_name: styleDisplay,
+              source: styleSource,
+            },
+            content_type,
+            slide_count,
+            aspect_ratio_requested: aspect_ratio,
+            aspect_ratio_sent: csAspectRatio,
+            model,
+            cost_credits: totalCost,
+            slides,
+            slides_saved_to_library: slidesSavedCount,
+            slides_save_failed: slidesFailedCount,
+            brand_context_warnings:
+              brandContext.length > 100
+                ? null
+                : "La descripción de la empresa está casi vacía. La generación se hizo pero el design system puede no reflejar la marca con precisión. Pedile al user que complete description + colors + logo en Followr UI antes de hacer más generaciones.",
+            user_facing_summary: `Listo. Generé ${slides.length} ${slides.length === 1 ? "imagen" : "imágenes"} con tu template ${styleDisplay}. ${slidesSavedCount > 0 ? `${slidesSavedCount} ${slidesSavedCount === 1 ? "guardada" : "guardadas"} en tu Media Library.` : ""}`,
+            _assistant_guidance: {
+              next_step: "show_images_inline_then_ask_user",
+              instructions:
+                "Mostrá las imágenes inline en tu próxima respuesta (cada slide.image_url). Pregunta al user: '¿te gustan? ¿las uso en un post o querés iterar?'. NUNCA muestres el creative_id, asset_id ni ai_result_id al user (eso es interno). Si el user dice 'usalas en un post' tenés los asset_ids para pasar a create_post. Si dice 'cambiá X' podés llamar generate_brand_creative de nuevo con un prompt ajustado (gastando otros créditos).",
+            },
+          };
+        };
+
+        // Smart wait default: single-slide defaults to sync (URL inline,
+        // 30-60s, well below any transport limit). Multi-slide defaults to
+        // async (carousels can run 2-5+ min and risk the claude.ai
+        // 4-min cap). Explicit wait param overrides the default.
+        const effectiveWait = wait !== undefined ? wait : slide_count <= 1;
+
+        // === Sync mode =================================================
+        if (effectiveWait) {
+          const responseBody = await runCreativePipeline();
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(responseBody, null, 2),
+              },
+            ],
+          };
         }
 
-        const slidesSavedCount = slides.filter((s) => s.asset_id !== null).length;
-        const slidesFailedCount = slides.filter((s) => s.asset_save_error !== null).length;
+        // === Async mode (default for multi-slide) ======================
+        const estimate = Math.max(60, slide_count * 60);
+        const pipeline = createPipeline({
+          kind: "brand_creative",
+          company_id,
+          params: {
+            prompt,
+            style_key: resolvedStyleKey,
+            content_type,
+            slide_count,
+            aspect_ratio,
+            model,
+          },
+          estimated_total_seconds: estimate,
+          initial_sub_phase: `queued (0/${slide_count})`,
+          initial_progress: { completed: 0, total: slide_count },
+        });
+        const pipelineId = pipeline.pipeline_id;
 
+        setImmediate(() => {
+          void (async () => {
+            try {
+              updatePipelinePhase(pipelineId, {
+                phase: "running",
+                sub_phase: `starting (0/${slide_count})`,
+              });
+              const responseBody = await runCreativePipeline({
+                onPhase: (info) => {
+                  updatePipelinePhase(pipelineId, {
+                    sub_phase: info.sub_phase,
+                    ...(info.progress !== undefined ? { progress: info.progress } : {}),
+                  });
+                },
+              });
+              markPipelineCompleted(pipelineId, {
+                metadata: responseBody,
+              });
+            } catch (err) {
+              markPipelineFailed(pipelineId, {
+                sub_phase: "generation",
+                reason: err instanceof Error ? err.name : "Error",
+                user_message: err instanceof Error ? err.message : String(err),
+              });
+            }
+          })();
+        });
+
+        const minMinutes = Math.max(1, Math.round(estimate / 60));
+        const maxMinutes = Math.max(minMinutes + 1, Math.round((estimate * 1.5) / 60));
         return {
           content: [
             {
               type: "text" as const,
               text: JSON.stringify(
                 {
-                  creative_id: creative.id,
-                  title: creative.title,
-                  used_style: {
-                    slug: resolvedStyleKey,
-                    display_name: styleDisplay,
-                    source: styleSource,
-                  },
-                  content_type,
+                  pipeline_id: pipelineId,
+                  kind: "brand_creative",
+                  company_id,
                   slide_count,
-                  aspect_ratio_requested: aspect_ratio,
-                  aspect_ratio_sent: csAspectRatio,
-                  model,
+                  content_type,
+                  style: { slug: resolvedStyleKey, display_name: styleDisplay, source: styleSource },
                   cost_credits: totalCost,
-                  slides,
-                  slides_saved_to_library: slidesSavedCount,
-                  slides_save_failed: slidesFailedCount,
-                  brand_context_warnings:
-                    brandContext.length > 100
-                      ? null
-                      : "La descripción de la empresa está casi vacía. La generación se hizo pero el design system puede no reflejar la marca con precisión. Pedile al user que complete description + colors + logo en Followr UI antes de hacer más generaciones.",
-                  user_facing_summary: `Listo. Generé ${slides.length} ${slides.length === 1 ? "imagen" : "imágenes"} con tu template ${styleDisplay}. ${slidesSavedCount > 0 ? `${slidesSavedCount} ${slidesSavedCount === 1 ? "guardada" : "guardadas"} en tu Media Library.` : ""}`,
+                  estimated_seconds: estimate,
+                  user_facing_summary: `Empecé tu ${content_type === "carousel" ? "carrusel" : "imagen"} de ${slide_count} ${slide_count === 1 ? "slide" : "slides"} con template ${styleDisplay}. Va a tardar entre ${minMinutes} y ${maxMinutes} minutos. Decime "fijate" cuando quieras chequear.`,
                   _assistant_guidance: {
-                    next_step: "show_images_inline_then_ask_user",
-                    instructions:
-                      "Mostrá las imágenes inline en tu próxima respuesta (cada slide.image_url). Pregunta al user: '¿te gustan? ¿las uso en un post o querés iterar?'. NUNCA muestres el creative_id, asset_id ni ai_result_id al user (eso es interno). Si el user dice 'usalas en un post' tenés los asset_ids para pasar a create_post. Si dice 'cambiá X' podés llamar generate_brand_creative de nuevo con un prompt ajustado (gastando otros créditos).",
+                    next_step: "tell_user_eta_then_wait_for_status_request",
+                    conversational_flow:
+                      "Mismo patrón que generate_avatar_video: get_pipeline_status (instant) cuando user pregunte, wait_for_pipeline (hasta 3 min) cuando diga 'esperá'. Cuando el pipeline complete, el field result.metadata trae el responseBody con las URLs e IDs de cada slide; mostrá las image_url inline al user.",
                   },
                 },
                 null,
@@ -571,9 +674,9 @@ PIPELINE (internal):
 3. Build a classifier prompt with the captions + the 32 styles + their descriptions and ask the chat AI to rank top 3.
 4. Parse structured JSON response (with fallback for partial matches).
 
-COST: imageCaption ~1-5 cr per image. Chat classifier ~2-5 cr. Total ~10-30 cr per detection (depending on how many signals are gathered).
+COST (estimated, surface to the user BEFORE calling): consumes ai_text_budget words for both vision captions and the classifier. Estimated total = 150 * max_signals + 250 words (default max_signals=6 → ~1150 words). Per-image credit cost adds ~1-5 cr per signal. Before calling, tell the user the estimate so they decide.
 
-REQUIRES TEXT BUDGET. Both imageCaption (vision-to-text) and the chat classifier consume ai_text_budget words. If get_ai_budget shows ai_text_budget.total === 0 or ai_text_budget.remaining <= 0, this tool will fail with HTTP 402 entity="words" before producing any ranking. get_session_context._assistant_guidance.plan_capability_warnings already surfaces this gate at orient time; honor that. If the user's plan does not include text AI, fall back to list_visual_styles + propose_visual_style_options for manual selection (those tools are pure-catalog and consume zero words).
+PRE-FLIGHT BUDGET CHECK. The tool now verifies ai_text_budget before spending any credits. If the plan has no text module (words_allowed === 0) it refuses with reason=feature_gated_no_text_module and suggests propose_visual_style_options / list_visual_styles as zero-cost alternatives. If the cycle budget is exhausted (remaining < estimated_words) it refuses with reason=text_budget_exhausted including the exact words required vs words remaining. Both error paths surface to the user up front, no silent HTTP 402 from the backend. Lower max_signals to fit a tighter budget (each signal removed = 150 fewer words).
 
 LOW SIGNAL: when the company has no website OR no published posts AND no user uploads, the tool returns 'low_visual_signal: true' and a message_for_user asking for reference uploads. The agent should request 2-3 aspirational images from the user and re-call with include_uploads.
 
@@ -618,7 +721,7 @@ INTEGRATION WITH generate_brand_creative: once confirmed, generate_brand_creativ
         const description = company.description ?? "";
         const cachedMarker = parseVisualStyleMarker(description);
 
-        // Return cached if exists and not forced
+        // Return cached if exists and not forced (zero-cost path)
         if (!force_refresh && cachedMarker && isValidStyleSlug(cachedMarker.slug)) {
           const primaryStyle = getStyleBySlug(cachedMarker.slug);
           return {
@@ -650,6 +753,53 @@ INTEGRATION WITH generate_brand_creative: once confirmed, generate_brand_creativ
               },
             ],
           };
+        }
+
+        // ── Pre-flight budget check ─────────────────────────────────
+        // Vision (imageCaption) + chat (style ranker) both consume
+        // ai_text_budget. Estimate ~150 words/caption + ~250 words for
+        // the classifier = ~150 * maxSignals + 250 words total. Refuse
+        // early with cost preview so the agent can fall back to
+        // propose_visual_style_options / list_visual_styles without
+        // burning credits on an HTTP 402 round-trip.
+        const estimatedWords = Math.round(150 * maxSignals + 250);
+        try {
+          const balance = await client.getSubscriptionBalance();
+          const wordsTotal = balance.words_allowed ?? 0;
+          const wordsRemaining = wordsTotal - (balance.words_spent ?? 0);
+          if (wordsTotal === 0) {
+            return toolError({
+              reason: "feature_gated_no_text_module",
+              user_message: `This tool needs the AI text module (your plan doesn't include it). It would have consumed ~${estimatedWords} words for vision captions + the style classifier. Free alternatives: propose_visual_style_options (curated 3-4 for your industry) or list_visual_styles (full 32-style catalog).`,
+              suggested_actions: [
+                { tool: "propose_visual_style_options", rationale: "Curated 3-4 styles per industry, zero text-budget cost." },
+                { tool: "list_visual_styles", rationale: "Full catalog (32 styles). User picks manually, zero cost." },
+              ],
+              details: {
+                estimated_words_required: estimatedWords,
+                words_total_on_plan: wordsTotal,
+                max_signals: maxSignals,
+              },
+            });
+          }
+          if (wordsRemaining < estimatedWords) {
+            return toolError({
+              reason: "text_budget_exhausted",
+              user_message: `This tool needs ~${estimatedWords} words but you have ${wordsRemaining} left this cycle. Either wait for the next cycle reset, or use propose_visual_style_options / list_visual_styles as zero-cost alternatives. You can also lower max_signals (current ${maxSignals}, down to 1) to fit in budget; estimated cost = 150 * max_signals + 250.`,
+              suggested_actions: [
+                { tool: "propose_visual_style_options", rationale: "Curated 3-4 styles, zero cost." },
+                { tool: "list_visual_styles", rationale: "Full catalog, zero cost." },
+              ],
+              details: {
+                estimated_words_required: estimatedWords,
+                words_remaining: wordsRemaining,
+                max_signals: maxSignals,
+              },
+            });
+          }
+        } catch {
+          // If budget endpoint fails, fall through and let the AI calls
+          // surface the 402 themselves. Don't block on a budget probe.
         }
 
         // ── Gather visual signals ───────────────────────────────────
@@ -997,6 +1147,11 @@ DO NOT USE THIS for one-off overrides. If the user just wants this particular cr
 
         const newDescription = appendVisualStyleMarker(description, primary_slug);
         await client.updateCompany(company_id, { description: newDescription });
+        // Drop cached content-plan contexts for this company: their
+        // has_visual_style_marker snapshot was false and downstream tools
+        // (draft_content_plan, brand_visual_identity_setup_proposal) would
+        // still rely on the stale value.
+        invalidateContextsForCompany(company_id);
 
         const styleInfo = getStyleBySlug(primary_slug);
         const displayName =

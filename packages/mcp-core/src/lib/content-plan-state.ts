@@ -370,6 +370,24 @@ export function getContext(context_id: string): ContextSnapshot | null {
   return contexts.get(context_id) ?? null;
 }
 
+// Invalidate every cached context tied to a given company. Called after
+// mutations that change anything the snapshot freezes (industry, visual
+// style, brand voice, connected networks). Without this, draft_content_plan
+// would reject the user with industry_confirmation_required even though
+// confirm_industry already wrote the :confirmed marker, because the snapshot
+// captured the pre-mutation state and still says confirmed=false.
+// Returns the number of contexts evicted (useful for logging/telemetry).
+export function invalidateContextsForCompany(company_id: number): number {
+  let evicted = 0;
+  for (const [id, c] of contexts) {
+    if (c.company_id === company_id) {
+      contexts.delete(id);
+      evicted += 1;
+    }
+  }
+  return evicted;
+}
+
 export function createPlan(
   init: Omit<ContentPlan, "plan_id" | "created_at_ms" | "expires_at_ms" | "status">,
 ): ContentPlan {

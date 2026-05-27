@@ -87,6 +87,15 @@ import {
   getPlan,
   updatePlan as updatePlanInState,
 } from "../lib/content-plan-state.js";
+import {
+  createPipeline,
+  isCancellationRequested,
+  markPipelineCancelled,
+  markPipelineCompleted,
+  markPipelineFailed,
+  updatePipelinePhase,
+} from "../lib/pipeline-state.js";
+import { PipelineCancelledException } from "../lib/avatar-video-pipeline.js";
 import { toolError, toolErrorFromException } from "../lib/tool-error.js";
 import { uploadFromUrl } from "./assets.js";
 
@@ -1918,11 +1927,11 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
         return toolError({
           reason: "context_id_invalid_or_expired",
           user_message:
-            "El context de planning expiró o no es válido. Llamá a prepare_content_plan_context de nuevo para refrescar el contexto y reintentá.",
+            "El context de planning expiró o no es válido. Re-llamá prepare_content_plan_context y reintentá. CAUSA COMÚN: una mutation sobre la company (confirm_industry, confirm_visual_style, create_brand_voice_for_company, etc.) invalida los contexts vigentes para esa company porque su snapshot pasó a estar stale.",
           suggested_actions: [
             {
               tool: "prepare_content_plan_context",
-              rationale: "Re-load context with current budget and network state.",
+              rationale: "Re-load context with current budget and post-mutation company state. The new context_id reflects the just-confirmed industry / visual style / brand voice and unblocks draft_content_plan.",
             },
           ],
           blocking: true,
@@ -2618,9 +2627,15 @@ ITEM-BY-ITEM CONFIRMATION FLOW: when the user asks to advance one item at a time
           .describe(
             "Optional subset of plan_item slugs to execute. When set, only matching items run; the rest stay in the plan untouched and can be executed in a later call. When omitted, every item in the plan runs. Use this for confirm-each-item flows ('arranca con el primero', 'andá pidiendo confirmación') - it is the supported alternative to removing items via update_content_plan and re-adding them later.",
           ),
+        wait: z
+          .boolean()
+          .optional()
+          .describe(
+            "If false (DEFAULT as of v0.6.0): returns immediately with an execution_id (pipeline_id) + ETA; the plan executes in the background. Use get_pipeline_status / wait_for_pipeline to track per-item progress. This is the safe default for clients with WebSocket transport timeouts (claude.ai cuts at ~4 min; large plans with N items can take 5-30+ min). If true: blocks until the entire execution completes (legacy v0.5.x behavior). Use wait=true only for clients without transport timeouts (CLI / IDE plugins).",
+          ),
       },
     },
-    async ({ plan_id, confirm, plan_item_slugs }) => {
+    async ({ plan_id, confirm, plan_item_slugs, wait }) => {
       if (confirm !== true) {
         return toolError({
           reason: "confirmation_required",
@@ -2700,192 +2715,314 @@ ITEM-BY-ITEM CONFIRMATION FLOW: when the user asks to advance one item at a time
         });
       }
 
-      updatePlanInState(plan_id, { status: "executing", execution_started_at_ms: Date.now() });
+      // === Closure ======================================================
+      // Wraps the execution body so both sync (wait:true) and async
+      // (wait:false, default) paths reuse the same code without
+      // duplication. Captures plan_id, plan, ctx, itemsToRun,
+      // isPartialExecution, unknownSlugs, client from outer scope.
+      // Optional reportProgress callback fires every 2s during the parallel
+      // executions to push updates to the pipeline state in async mode; the
+      // sync path passes no opts and the callback never fires.
+      const runExecution = async (
+        opts: {
+          reportProgress?: (completed: number, total: number) => void;
+        } = {},
+      ): Promise<Record<string, unknown>> => {
+        updatePlanInState(plan_id, { status: "executing", execution_started_at_ms: Date.now() });
 
-      // Load company AI preferences ONCE for the whole execution. We propagate
-      // them down to executePlanItem and resolveSubPostAssets so each call
-      // can pick the right driver per modality without repeating the
-      // getCompany roundtrip per sub_post.
-      // Load the Company too: we need its language + tones + audience to
-      // synthesize copy_draft fallbacks when a sub_post lacks one.
-      // Also load the BrandContext (parsed BrandVisualIdentity block +
-      // asset_id->url lookup) so the AI image resolver can auto-inject
-      // brand grounding (F3).
-      // Also list connected social networks: if the company has any network
-      // connected AND the plan items carry a publish time, we schedule the
-      // PostGroup (draft:false + publish_at + auto_publish:true) so it lands
-      // on the user's calendar. Without networks we keep the legacy draft
-      // behavior. Fetched in parallel to keep latency flat.
-      // Tolerant: failures degrade gracefully (no brand grounding when the
-      // company has no identity block; no copy_draft fallback when getCompany
-      // fails; no scheduling when listSocialNetworks fails).
-      const [prefs, companyForCopy, brandContext, socialNetworksR] = await Promise.all([
-        getAiPreferences(client, plan.company_id),
-        client.getCompany(plan.company_id).catch(() => null),
-        loadBrandContext(client, plan.company_id),
-        client.listSocialNetworks(plan.company_id).catch(() => [] as unknown[]),
-      ]);
-      const hasConnectedNetworks =
-        Array.isArray(socialNetworksR) && socialNetworksR.length > 0;
-      // Timezone fallback chain: explicit plan-level auto_publish_schedule >
-      // company timezone > UTC. Each PlanItem carries publish_at_time_local
-      // as "HH:MM"; we combine with item.date + this timezone to compute UTC.
-      const scheduleTimezone = resolveTimezone(
-        plan.auto_publish_schedule?.timezone,
-        (companyForCopy as (Company & { timezone?: string | null }) | null)?.timezone,
-        "UTC",
-      );
-      const copyCtx: CopyResolutionContext = {
-        companyName: companyForCopy?.name ?? "the company",
-        companyDescription: companyForCopy?.description ?? null,
-        companyLanguage:
-          (companyForCopy as (Company & { language?: string | null }) | null)?.language ??
-          (companyForCopy as (Company & { language_iso_code?: string | null }) | null)?.language_iso_code ??
-          null,
-        tones: (companyForCopy as (Company & { tones?: string[] | null }) | null)?.tones ?? null,
-        audience:
-          (companyForCopy as (Company & { audience_types?: string[] | null }) | null)?.audience_types ?? null,
-        planLanguage: plan.user_answers.language ?? null,
-        hashtagsPolicy: plan.user_answers.hashtags_policy ?? "auto",
-      };
+        // Load company AI preferences ONCE for the whole execution. We propagate
+        // them down to executePlanItem and resolveSubPostAssets so each call
+        // can pick the right driver per modality without repeating the
+        // getCompany roundtrip per sub_post.
+        // Load the Company too: we need its language + tones + audience to
+        // synthesize copy_draft fallbacks when a sub_post lacks one.
+        // Also load the BrandContext (parsed BrandVisualIdentity block +
+        // asset_id->url lookup) so the AI image resolver can auto-inject
+        // brand grounding (F3).
+        // Also list connected social networks: if the company has any network
+        // connected AND the plan items carry a publish time, we schedule the
+        // PostGroup (draft:false + publish_at + auto_publish:true) so it lands
+        // on the user's calendar. Without networks we keep the legacy draft
+        // behavior. Fetched in parallel to keep latency flat.
+        // Tolerant: failures degrade gracefully (no brand grounding when the
+        // company has no identity block; no copy_draft fallback when getCompany
+        // fails; no scheduling when listSocialNetworks fails).
+        const [prefs, companyForCopy, brandContext, socialNetworksR] = await Promise.all([
+          getAiPreferences(client, plan.company_id),
+          client.getCompany(plan.company_id).catch(() => null),
+          loadBrandContext(client, plan.company_id),
+          client.listSocialNetworks(plan.company_id).catch(() => [] as unknown[]),
+        ]);
+        const hasConnectedNetworks =
+          Array.isArray(socialNetworksR) && socialNetworksR.length > 0;
+        // Timezone fallback chain: explicit plan-level auto_publish_schedule >
+        // company timezone > UTC. Each PlanItem carries publish_at_time_local
+        // as "HH:MM"; we combine with item.date + this timezone to compute UTC.
+        const scheduleTimezone = resolveTimezone(
+          plan.auto_publish_schedule?.timezone,
+          (companyForCopy as (Company & { timezone?: string | null }) | null)?.timezone,
+          "UTC",
+        );
+        const copyCtx: CopyResolutionContext = {
+          companyName: companyForCopy?.name ?? "the company",
+          companyDescription: companyForCopy?.description ?? null,
+          companyLanguage:
+            (companyForCopy as (Company & { language?: string | null }) | null)?.language ??
+            (companyForCopy as (Company & { language_iso_code?: string | null }) | null)?.language_iso_code ??
+            null,
+          tones: (companyForCopy as (Company & { tones?: string[] | null }) | null)?.tones ?? null,
+          audience:
+            (companyForCopy as (Company & { audience_types?: string[] | null }) | null)?.audience_types ?? null,
+          planLanguage: plan.user_answers.language ?? null,
+          hashtagsPolicy: plan.user_answers.hashtags_policy ?? "auto",
+        };
 
-      const itemResults: Array<Record<string, unknown>> = [];
-      const executions = itemsToRun.map(async (item) => {
+        const itemResults: Array<Record<string, unknown>> = [];
+        const executions = itemsToRun.map(async (item) => {
+          try {
+            const result = await executePlanItem(
+              client,
+              plan.company_id,
+              item,
+              prefs,
+              copyCtx,
+              brandContext,
+              { hasConnectedNetworks, scheduleTimezone },
+            );
+            itemResults.push(result);
+            return result;
+          } catch (e) {
+            const result = {
+              slug: item.slug,
+              date: item.date,
+              status: "failed_unexpected" as const,
+              error_message: e instanceof Error ? e.message : String(e),
+              credits_consumed_estimate: 0,
+              recovery_suggestion:
+                "Unexpected failure outside the per-sub_post pipeline. Inspect details. If transient (network blip, 5xx), retry execute_content_plan.",
+            };
+            itemResults.push(result);
+            return result;
+          }
+        });
+        // Periodic progress polling for the async path. Fires every 2s with
+        // a coarse (items completed / total) snapshot. Sync path passes no
+        // opts and the interval is never set up.
+        const progressInterval = opts.reportProgress
+          ? setInterval(() => {
+              opts.reportProgress!(itemResults.length, itemsToRun.length);
+            }, 2000)
+          : null;
         try {
-          const result = await executePlanItem(
-            client,
-            plan.company_id,
-            item,
-            prefs,
-            copyCtx,
-            brandContext,
-            { hasConnectedNetworks, scheduleTimezone },
-          );
-          itemResults.push(result);
-          return result;
-        } catch (e) {
-          const result = {
-            slug: item.slug,
-            date: item.date,
-            status: "failed_unexpected" as const,
-            error_message: e instanceof Error ? e.message : String(e),
-            credits_consumed_estimate: 0,
-            recovery_suggestion:
-              "Unexpected failure outside the per-sub_post pipeline. Inspect details. If transient (network blip, 5xx), retry execute_content_plan.",
-          };
-          itemResults.push(result);
-          return result;
+          await Promise.all(executions);
+        } finally {
+          if (progressInterval) clearInterval(progressInterval);
         }
-      });
-      await Promise.all(executions);
+        // Final progress snapshot so the pipeline state catches up to the
+        // last item before the runner marks the pipeline completed.
+        opts.reportProgress?.(itemResults.length, itemsToRun.length);
 
-      // Totals.
-      const succeeded = itemResults.filter((r) => r["status"] === "created").length;
-      const failed = itemResults.length - succeeded;
-      const overallStatus =
-        succeeded === itemResults.length
-          ? "succeeded"
-          : succeeded === 0
-            ? "failed_all"
-            : "completed_with_partial_failures";
+        // Totals.
+        const succeeded = itemResults.filter((r) => r["status"] === "created").length;
+        const failed = itemResults.length - succeeded;
+        const overallStatus =
+          succeeded === itemResults.length
+            ? "succeeded"
+            : succeeded === 0
+              ? "failed_all"
+              : "completed_with_partial_failures";
 
-      // Refresh budget for the report.
-      let budgetAfter: number | null = null;
-      try {
-        const b = await loadBudgets(client);
-        budgetAfter = b?.ai_image_and_video_budget.remaining ?? null;
-      } catch {
-        budgetAfter = null;
-      }
+        // Refresh budget for the report.
+        let budgetAfter: number | null = null;
+        try {
+          const b = await loadBudgets(client);
+          budgetAfter = b?.ai_image_and_video_budget.remaining ?? null;
+        } catch {
+          budgetAfter = null;
+        }
 
-      // Compute remaining slugs (items that were not part of this run). On a
-      // partial run the plan stays in 'draft' so the caller can keep going
-      // item by item; on a full run we transition to 'executed' (or 'failed'
-      // when nothing succeeded).
-      const ranSlugs = new Set(itemsToRun.map((it) => it.slug));
-      const remainingSlugs = plan.plan_items.filter((it) => !ranSlugs.has(it.slug)).map((it) => it.slug);
+        // Compute remaining slugs (items that were not part of this run). On a
+        // partial run the plan stays in 'draft' so the caller can keep going
+        // item by item; on a full run we transition to 'executed' (or 'failed'
+        // when nothing succeeded).
+        const ranSlugs = new Set(itemsToRun.map((it) => it.slug));
+        const remainingSlugs = plan.plan_items.filter((it) => !ranSlugs.has(it.slug)).map((it) => it.slug);
 
-      let nextStatus: ContentPlan["status"];
-      if (isPartialExecution) {
-        nextStatus = "draft";
-      } else if (overallStatus === "failed_all") {
-        nextStatus = "failed";
-      } else {
-        nextStatus = "executed";
-      }
-      updatePlanInState(plan_id, {
-        status: nextStatus,
-        execution_finished_at_ms: Date.now(),
-      });
+        let nextStatus: ContentPlan["status"];
+        if (isPartialExecution) {
+          nextStatus = "draft";
+        } else if (overallStatus === "failed_all") {
+          nextStatus = "failed";
+        } else {
+          nextStatus = "executed";
+        }
+        updatePlanInState(plan_id, {
+          status: nextStatus,
+          execution_finished_at_ms: Date.now(),
+        });
 
-      const consumedEstimate = itemResults.reduce(
-        (a, r) => a + (typeof r["credits_consumed_estimate"] === "number" ? (r["credits_consumed_estimate"] as number) : 0),
-        0,
-      );
+        const consumedEstimate = itemResults.reduce(
+          (a, r) => a + (typeof r["credits_consumed_estimate"] === "number" ? (r["credits_consumed_estimate"] as number) : 0),
+          0,
+        );
 
-      // Branch next-actions by whether items were scheduled or left as drafts.
-      // Mixed runs (some scheduled, some draft) describe both states. The
-      // helper checks each result for the `scheduled` flag set by
-      // executePlanItem.
-      const scheduledCount = itemResults.filter((r) => r["scheduled"] === true).length;
-      const draftCount = itemResults.filter(
-        (r) => r["status"] === "created" && r["scheduled"] !== true,
-      ).length;
-      const calendarLine =
-        scheduledCount > 0
-          ? `Revisar los posteos que quedaron calendarizados (${scheduledCount}) en el calendario de Followr; se publican automáticamente en la fecha y hora indicadas.`
-          : null;
-      const draftLine =
-        draftCount > 0
-          ? `Revisar los borradores (${draftCount}) en la vista de drafts de Followr; podés programarlos a mano desde la app o publicarlos directo.`
-          : null;
-      const successLines = [calendarLine, draftLine].filter((l): l is string => l !== null);
-      const nextActions =
-        overallStatus === "succeeded"
-          ? isPartialExecution
-            ? [
-                `Quedan ${remainingSlugs.length} items pendientes en el plan: ${remainingSlugs.join(", ")}. Pasalos a execute_content_plan con plan_item_slugs cuando el usuario apruebe avanzar.`,
-                ...successLines,
-              ]
-            : successLines
-          : overallStatus === "completed_with_partial_failures"
-            ? [
-                ...successLines,
-                "Mirar el campo error_message de los items que fallaron para entender la causa.",
-                "Para reintentar solo los fallidos: usar update_content_plan para ajustar ese sub_post y volver a llamar execute_content_plan con plan_item_slugs apuntando solo a los slugs fallidos.",
-                ...(remainingSlugs.length > 0
-                  ? [`Quedan ${remainingSlugs.length} items que ni siquiera se intentaron en este call (${remainingSlugs.join(", ")}). Pasalos en una llamada posterior con plan_item_slugs.`]
-                  : []),
-              ]
-            : [
-                "Ningún item se creó. Revisar el error_message de cada fila para entender la causa raíz.",
-                "Si fue por modelo bloqueado por plan (followr_plus_enabled=false): cambiá el video a wan_2.2 (único video regular) con update_content_plan y reintentá. En cuentas con Plus, el ID equivocado es la causa más común: confirmá que el model_id viene verbatim del catálogo (veo_3.1_fast con punto, no veo_3_1_fast con underscore).",
-                "Si fue por quota: cambiar modelos a alternativas más baratas con update_content_plan y reintentar.",
-                "Si fue por un asset URL que ya no existe: corregir la URL con update_content_plan y reintentar.",
-              ];
+        // Branch next-actions by whether items were scheduled or left as drafts.
+        // Mixed runs (some scheduled, some draft) describe both states. The
+        // helper checks each result for the `scheduled` flag set by
+        // executePlanItem.
+        const scheduledCount = itemResults.filter((r) => r["scheduled"] === true).length;
+        const draftCount = itemResults.filter(
+          (r) => r["status"] === "created" && r["scheduled"] !== true,
+        ).length;
+        const calendarLine =
+          scheduledCount > 0
+            ? `Revisar los posteos que quedaron calendarizados (${scheduledCount}) en el calendario de Followr; se publican automáticamente en la fecha y hora indicadas.`
+            : null;
+        const draftLine =
+          draftCount > 0
+            ? `Revisar los borradores (${draftCount}) en la vista de drafts de Followr; podés programarlos a mano desde la app o publicarlos directo.`
+            : null;
+        const successLines = [calendarLine, draftLine].filter((l): l is string => l !== null);
+        const nextActions =
+          overallStatus === "succeeded"
+            ? isPartialExecution
+              ? [
+                  `Quedan ${remainingSlugs.length} items pendientes en el plan: ${remainingSlugs.join(", ")}. Pasalos a execute_content_plan con plan_item_slugs cuando el usuario apruebe avanzar.`,
+                  ...successLines,
+                ]
+              : successLines
+            : overallStatus === "completed_with_partial_failures"
+              ? [
+                  ...successLines,
+                  "Mirar el campo error_message de los items que fallaron para entender la causa.",
+                  "Para reintentar solo los fallidos: usar update_content_plan para ajustar ese sub_post y volver a llamar execute_content_plan con plan_item_slugs apuntando solo a los slugs fallidos.",
+                  ...(remainingSlugs.length > 0
+                    ? [`Quedan ${remainingSlugs.length} items que ni siquiera se intentaron en este call (${remainingSlugs.join(", ")}). Pasalos en una llamada posterior con plan_item_slugs.`]
+                    : []),
+                ]
+              : [
+                  "Ningún item se creó. Revisar el error_message de cada fila para entender la causa raíz.",
+                  "Si fue por modelo bloqueado por plan (followr_plus_enabled=false): cambiá el video a wan_2.2 (único video regular) con update_content_plan y reintentá. En cuentas con Plus, el ID equivocado es la causa más común: confirmá que el model_id viene verbatim del catálogo (veo_3.1_fast con punto, no veo_3_1_fast con underscore).",
+                  "Si fue por quota: cambiar modelos a alternativas más baratas con update_content_plan y reintentar.",
+                  "Si fue por un asset URL que ya no existe: corregir la URL con update_content_plan y reintentar.",
+                ];
 
-      const responseBody: Record<string, unknown> = {
-        plan_id,
-        status: overallStatus,
-        partial_execution: isPartialExecution,
-        executed_slugs: itemsToRun.map((it) => it.slug),
-        remaining_slugs: remainingSlugs,
-        results: itemResults,
-        totals: {
-          plan_items_attempted: itemResults.length,
-          succeeded,
-          failed,
-          estimated_credits_consumed: consumedEstimate,
-          ai_image_and_video_budget_remaining: budgetAfter,
-        },
-        next_actions: nextActions,
+        const responseBody: Record<string, unknown> = {
+          plan_id,
+          status: overallStatus,
+          partial_execution: isPartialExecution,
+          executed_slugs: itemsToRun.map((it) => it.slug),
+          remaining_slugs: remainingSlugs,
+          results: itemResults,
+          totals: {
+            plan_items_attempted: itemResults.length,
+            succeeded,
+            failed,
+            estimated_credits_consumed: consumedEstimate,
+            ai_image_and_video_budget_remaining: budgetAfter,
+          },
+          next_actions: nextActions,
+        };
+        if (unknownSlugs.length > 0) {
+          responseBody["unknown_slugs_skipped"] = unknownSlugs;
+          responseBody["unknown_slugs_note"] =
+            "Algunos plan_item_slugs solicitados no existen en el plan y fueron ignorados. Llamá get_content_plan para ver los slugs reales.";
+        }
+        return responseBody;
       };
-      if (unknownSlugs.length > 0) {
-        responseBody["unknown_slugs_skipped"] = unknownSlugs;
-        responseBody["unknown_slugs_note"] =
-          "Algunos plan_item_slugs solicitados no existen en el plan y fueron ignorados. Llamá get_content_plan para ver los slugs reales.";
+
+      // === Async branch (DEFAULT as of v0.6.0) =========================
+      if (wait !== true) {
+        // Coarse estimate: assume 90s per item average (image gens + post
+        // creation). Tunes for the typical plan; big-video plans should
+        // pass wait:true on tolerant clients or pre-materialize avatars.
+        const estimate = Math.max(60, itemsToRun.length * 90);
+        const pipeline = createPipeline({
+          kind: "content_plan_execution",
+          company_id: plan.company_id,
+          params: {
+            plan_id,
+            plan_item_slugs: plan_item_slugs ?? null,
+            total_items: itemsToRun.length,
+          },
+          estimated_total_seconds: estimate,
+          initial_sub_phase: `queued (0/${itemsToRun.length})`,
+          initial_progress: { completed: 0, total: itemsToRun.length },
+        });
+        const pipelineId = pipeline.pipeline_id;
+
+        setImmediate(() => {
+          void (async () => {
+            try {
+              updatePipelinePhase(pipelineId, {
+                phase: "running",
+                sub_phase: `executing (0/${itemsToRun.length})`,
+              });
+              if (isCancellationRequested(pipelineId)) {
+                throw new PipelineCancelledException("execution");
+              }
+              const responseBody = await runExecution({
+                reportProgress: (completed, total) => {
+                  updatePipelinePhase(pipelineId, {
+                    sub_phase: `executing (${completed}/${total})`,
+                    progress: { completed, total },
+                  });
+                },
+              });
+              markPipelineCompleted(pipelineId, {
+                metadata: responseBody,
+              });
+            } catch (err) {
+              if (err instanceof PipelineCancelledException) {
+                markPipelineCancelled(pipelineId);
+                return;
+              }
+              markPipelineFailed(pipelineId, {
+                sub_phase: "execution",
+                reason: err instanceof Error ? err.name : "Error",
+                user_message: err instanceof Error ? err.message : String(err),
+              });
+            }
+          })();
+        });
+
+        const minMinutes = Math.max(1, Math.round(estimate / 60));
+        const maxMinutes = Math.max(minMinutes + 1, Math.round((estimate * 1.5) / 60));
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(
+                {
+                  pipeline_id: pipelineId,
+                  execution_id: pipelineId,
+                  kind: "content_plan_execution",
+                  plan_id,
+                  items_to_run: itemsToRun.length,
+                  total_items: plan.plan_items.length,
+                  partial_execution: isPartialExecution,
+                  ...(unknownSlugs.length > 0 ? { unknown_slugs_skipped: unknownSlugs } : {}),
+                  estimated_seconds: estimate,
+                  user_facing_summary: `Empecé la ejecución del plan (${itemsToRun.length} item${itemsToRun.length === 1 ? "" : "s"}${isPartialExecution ? ` de ${plan.plan_items.length} totales` : ""}). Va a tardar entre ${minMinutes} y ${maxMinutes} minutos. Decime "cómo va el plan" cuando quieras chequear progreso.`,
+                  _assistant_guidance: {
+                    next_step: "tell_user_eta_then_wait_for_status_request",
+                    conversational_flow:
+                      "1. Decile al user el user_facing_summary (tal cual o reformulado en castellano natural). 2. NO mencionés pipeline_id ni execution_id (son internos). 3. Cuando el user pregunte 'cómo va el plan' / 'fijate' / 'ya está?', llamá get_pipeline_status(pipeline_id) (instantáneo) y leele el user_facing_summary que viene en la respuesta. 4. Cuando el user diga 'esperá' / 'quédate ahí', llamá wait_for_pipeline(pipeline_id, max_wait_seconds=180). 5. NUNCA prometas 'te aviso cuando termine'. claude.ai no soporta push notifications de MCP. 6. Cuando termine, el field result.metadata trae el responseBody completo (executed_slugs, results, totals, next_actions); usalo para resumir al user lo que se hizo.",
+                  },
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
       }
 
+      // === Sync branch (legacy wait:true) ===============================
+      // Same shape as the v0.5.x return. Use for clients without WebSocket
+      // transport timeouts. NOT recommended on claude.ai because large
+      // plans can take 5-30+ min and the transport cuts at ~4 min.
+      const responseBody = await runExecution();
       return {
         content: [
           {

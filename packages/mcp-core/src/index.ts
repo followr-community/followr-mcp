@@ -29,6 +29,7 @@ import { registerCompanyTools } from "./tools/companies.js";
 import { registerContentPlanTools } from "./tools/content-plan.js";
 import { registerContextTools } from "./tools/context.js";
 import { registerFolderTools } from "./tools/folders.js";
+import { registerPipelineTools } from "./tools/pipelines.js";
 import { registerPostGroupTools } from "./tools/post-groups.js";
 import { registerPostTools } from "./tools/posts.js";
 import { registerPromptTools } from "./tools/prompts.js";
@@ -62,6 +63,7 @@ export function registerFollowrTools(
   registerValidateTools(server, client, options);
   registerTagTools(server, client, options);
   registerAiResultsTools(server, client, options);
+  registerPipelineTools(server, client, options);
   registerAvatarTools(server, client, options);
   registerVoiceTools(server, client, options);
   registerSocialHubTools(server, client, options);
