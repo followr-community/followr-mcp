@@ -2057,6 +2057,7 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
       // 4. Build summary table for the user.
       const summaryRows = buildSummaryTable(plan);
 
+      const manualMaterialization = collectManualMaterializationSteps(planItemsArr);
       const response = {
         plan_id: plan.plan_id,
         status: v.blockers.length > 0 ? "needs_revision" : "ready_for_execution",
@@ -2074,6 +2075,7 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
             v.budget_remaining !== null ? v.budget_remaining - v.totals.total_ai_cost : null,
         },
         upfront_decisions_required: extractUpfrontDecisions(v.warnings),
+        manual_materialization_required: manualMaterialization,
         warnings: filterUserFacingWarnings(v.warnings),
         _internal_warning_signals: extractInternalOnlyWarnings(v.warnings),
         _internal_corrections_applied:
@@ -2088,7 +2090,7 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
         next_step_instructions:
           v.blockers.length > 0
             ? "There are blockers (listed above). Surface them to the user with the resolution_options for each, then call update_content_plan(plan_id, changes) with the chosen fixes. Do NOT call execute_content_plan until status is ready_for_execution."
-            : "FIRST handle upfront_decisions_required if not empty: each entry has a user_facing_message phrased as a question. Surface it BEFORE the plan summary, ask the user how to proceed (typical: 'la armamos ahora / avanzamos sin'), and ONLY after that decision is resolved continue to the summary. Do NOT bury these in a 'PD' at the end of the plan: by then the user has mentally approved the plan and won't pause to add the missing piece. THEN show summary_for_user to the user (translate display_name fields, never expose ids) AND tell them the cost in natural language: read totals.estimated_total_credits_cost and totals.budget_remaining_after_execution and say something like 'el plan consume aprox N créditos de imagen y video, te quedarían M después de ejecutarlo'. NEVER omit the cost just because summary_for_user does not include it; the user is paying for these credits and needs to know upfront. Surface ONLY warnings array (each has a user_facing_message safe to surface verbatim). Do NOT mention _internal_warning_signals; those are debug-only and you must obey USER-FACING LANGUAGE LOCK when speaking to the user. Ask for explicit approval ('lo ejecuto?' / 'cambio algo?'). When the user confirms, call execute_content_plan(plan_id, confirm: true). If the user wants to change a specific item, call update_content_plan(plan_id, changes) internally without naming the tool to the user. DO NOT propose your own prose version of the plan; summary_for_user is the canonical view.",
+            : `FIRST handle upfront_decisions_required if not empty: each entry has a user_facing_message phrased as a question. Surface it BEFORE the plan summary, ask the user how to proceed (typical: 'la armamos ahora / avanzamos sin'), and ONLY after that decision is resolved continue to the summary. Do NOT bury these in a 'PD' at the end of the plan: by then the user has mentally approved the plan and won't pause to add the missing piece.${manualMaterialization ? " SECOND, BEFORE the cost summary, surface manual_materialization_required.user_message to the user (see instructions_for_agent in that block for the post-approval execution dance: generate avatar -> update_content_plan replace_sub_post -> execute_content_plan with plan_item_slugs). NEVER call execute_content_plan on any slug in manual_materialization_required.affected_plan_item_slugs without first materializing the avatar asset and swapping video_source to asset_id." : ""} THEN show summary_for_user to the user (translate display_name fields, never expose ids) AND tell them the cost in natural language: read totals.estimated_total_credits_cost and totals.budget_remaining_after_execution and say something like 'el plan consume aprox N créditos de imagen y video, te quedarían M después de ejecutarlo'. NEVER omit the cost just because summary_for_user does not include it; the user is paying for these credits and needs to know upfront. Surface ONLY warnings array (each has a user_facing_message safe to surface verbatim). Do NOT mention _internal_warning_signals; those are debug-only and you must obey USER-FACING LANGUAGE LOCK when speaking to the user. Ask for explicit approval ('lo ejecuto?' / 'cambio algo?'). When the user confirms, call execute_content_plan(plan_id, confirm: true). If the user wants to change a specific item, call update_content_plan(plan_id, changes) internally without naming the tool to the user. DO NOT propose your own prose version of the plan; summary_for_user is the canonical view.`,
       };
 
       return { content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }] };
@@ -2302,6 +2304,9 @@ AFTER THIS: same flow as draft. Show the updated table, await explicit approval,
       });
 
       const summaryRows = buildSummaryTable(updatedPlan);
+      const manualMaterialization = collectManualMaterializationSteps(
+        updatedPlan.plan_items,
+      );
       const response = {
         plan_id,
         status: v.blockers.length > 0 ? "needs_revision" : "ready_for_execution",
@@ -2321,13 +2326,14 @@ AFTER THIS: same flow as draft. Show the updated table, await explicit approval,
             v.budget_remaining !== null ? v.budget_remaining - v.totals.total_ai_cost : null,
         },
         upfront_decisions_required: extractUpfrontDecisions(v.warnings),
+        manual_materialization_required: manualMaterialization,
         warnings: filterUserFacingWarnings(v.warnings),
         _internal_warning_signals: extractInternalOnlyWarnings(v.warnings),
         blockers: v.blockers,
         next_step_instructions:
           v.blockers.length > 0
             ? "Plan still has blockers. Surface to the user, then iterate. Obey USER-FACING LANGUAGE LOCK: do not name tools or internal fields when explaining changes."
-            : "FIRST handle upfront_decisions_required if non-empty (same rule as draft_content_plan: surface BEFORE the plan summary, never as a trailing PD). Plan is valid. Surface summary_for_user verbatim AND mention the updated cost in natural language using totals.estimated_total_credits_cost and totals.budget_remaining_after_execution. Ask the user for explicit approval before executing. Surface ONLY warnings array (already filtered to user-safe); never mention _internal_warning_signals to the user. DO NOT replace summary_for_user with your own prose table.",
+            : `FIRST handle upfront_decisions_required if non-empty (same rule as draft_content_plan: surface BEFORE the plan summary, never as a trailing PD).${manualMaterialization ? " SECOND, if manual_materialization_required is non-null, follow its instructions_for_agent: surface the user_message BEFORE the cost summary, then handle the avatar materialization dance (generate -> replace_sub_post -> execute_content_plan with plan_item_slugs) when the user approves." : ""} Plan is valid. Surface summary_for_user verbatim AND mention the updated cost in natural language using totals.estimated_total_credits_cost and totals.budget_remaining_after_execution. Ask the user for explicit approval before executing. Surface ONLY warnings array (already filtered to user-safe); never mention _internal_warning_signals to the user. DO NOT replace summary_for_user with your own prose table.`,
       };
       return { content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }] };
     },
@@ -2442,7 +2448,22 @@ NO MUTATION. Pure read of in-memory plan state.`,
         followrPlusEnabled = null;
       }
       const preview = buildItemPreview(plan, item, followrPlusEnabled);
-      return { content: [{ type: "text" as const, text: JSON.stringify(preview, null, 2) }] };
+      // Surface manual materialization for THIS single item (subset of full
+      // plan's block). Lets the agent know upfront when going item-by-item
+      // whether to do the avatar dance for this slug.
+      const manualMaterialization = collectManualMaterializationSteps([item]);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              { ...preview, manual_materialization_required: manualMaterialization },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
     },
   );
 
@@ -2511,6 +2532,9 @@ PRESENTING TO THE USER: do NOT dump all 5 rendered_markdown blocks one after ano
         total_uploads: previews.reduce((acc, p) => acc + p.totals.upload_count, 0),
         total_reuses: previews.reduce((acc, p) => acc + p.totals.reuse_count, 0),
       };
+      // Surface manual materialization steps only for the items requested
+      // here (when slugs is provided we already filtered items above).
+      const manualMaterialization = collectManualMaterializationSteps(items);
       return {
         content: [
           {
@@ -2520,6 +2544,7 @@ PRESENTING TO THE USER: do NOT dump all 5 rendered_markdown blocks one after ano
                 plan_id: plan.plan_id,
                 previews,
                 summary,
+                manual_materialization_required: manualMaterialization,
               },
               null,
               2,
@@ -2556,7 +2581,7 @@ ASSET STRATEGIES SUPPORTED IN v1:
 - asset_id: pass through.
 - ai_generate image: POST /api/aiResults/image, poll until completed, re-upload to asset library, attach asset id.
 - ai_generate video: POST /api/aiResults/video (text-to-video), poll until completed (~10-15 min for Veo), re-upload, attach.
-- ai_avatar_lipsync, ai_avatar_video: NOT supported in v1. Generate them manually with generate_avatar_lipsync_clip / generate_avatar_video first and pass asset_id back into the plan.
+- ai_avatar_lipsync, ai_avatar_video: NOT supported in v1. The executor throws "Asset strategy ai_avatar_* is not supported" when it encounters one. draft_content_plan / update_content_plan / preview_content_plan all surface a manual_materialization_required block listing the affected slugs upfront with the exact dance: (1) call generate_avatar_video or generate_avatar_lipsync_clip for each fingerprint, (2) update_content_plan with replace_sub_post swapping video_source to { type: "asset_id", id: <resulting_asset_id> } for every consumer, (3) execute_content_plan with plan_item_slugs covering the now-materialized items. Read manual_materialization_required BEFORE calling execute on any avatar plan_item.
 
 OUTPUT: { plan_id, status (succeeded / completed_with_partial_failures / failed_all), results (per plan_item: status, post_group_id when created, asset_ids per sub_post, credits_consumed, error and recovery_suggestion when failed), totals (count succeeded / failed, total credits consumed, budget remaining after). next_actions guides what the user can do next.
 
@@ -4804,6 +4829,122 @@ function estimateTtsSeconds(script: string): number {
   const chars = script.trim().length;
   if (chars === 0) return AVATAR_TTS_FLOOR_SECONDS;
   return Math.max(AVATAR_TTS_FLOOR_SECONDS, Math.round(chars / AVATAR_TTS_CHARS_PER_SECOND));
+}
+
+// ── Manual materialization detector (P4 fix, 2026-05-26) ──────────────────
+//
+// execute_content_plan v1 does NOT run avatar tools (generate_avatar_video,
+// generate_avatar_lipsync_clip) end-to-end. When a plan_item.sub_post has
+// video_source.type === "ai_avatar_video" or "ai_avatar_lipsync", the
+// executor throws "Asset strategy ai_avatar_* is not supported" at item
+// resolution time.
+//
+// Pre 2026-05-26 the agent discovered this at execute time and improvised
+// (PipeLime session: agent had to back out, generate the avatar manually,
+// then re-route). This helper surfaces the same information UPFRONT at
+// draft / update / preview time so the agent can plan the dance.
+
+interface ManualMaterializationStep {
+  fingerprint: string;
+  source_type: "ai_avatar_lipsync" | "ai_avatar_video";
+  suggested_tool: "generate_avatar_lipsync_clip" | "generate_avatar_video";
+  avatar_id: number;
+  scripts_count: number;
+  generate_backgrounds: boolean;
+  estimated_total_seconds: number;
+  estimated_credits: number;
+  shape_note: string;
+  consumed_by: Array<{
+    slug: string;
+    sub_post_index: number;
+    network_display: string;
+  }>;
+  next_action_for_agent: string;
+}
+
+interface ManualMaterializationBlock {
+  count: number;
+  total_estimated_credits: number;
+  affected_plan_item_slugs: string[];
+  steps: ManualMaterializationStep[];
+  user_message: string;
+  instructions_for_agent: string;
+}
+
+function collectManualMaterializationSteps(
+  plan_items: PlanItem[],
+): ManualMaterializationBlock | null {
+  const byFingerprint = new Map<string, ManualMaterializationStep>();
+
+  for (const item of plan_items) {
+    for (let idx = 0; idx < item.sub_posts.length; idx++) {
+      const sp = item.sub_posts[idx]!;
+      const vs = sp.assets_strategy.video_source;
+      if (!vs) continue;
+      if (vs.type !== "ai_avatar_lipsync" && vs.type !== "ai_avatar_video") continue;
+      const fp = fingerprintAssetSource({ src: vs, mode: "video" });
+      const consumer = {
+        slug: item.slug,
+        sub_post_index: idx,
+        network_display: displayNetworkName(sp.social_network),
+      };
+      const existing = byFingerprint.get(fp);
+      if (existing) {
+        existing.consumed_by.push(consumer);
+        continue;
+      }
+      const isMulti = vs.type === "ai_avatar_video";
+      const scripts = isMulti ? vs.scripts : [vs.script];
+      const totalSeconds = scripts
+        .map((s) => estimateTtsSeconds(s))
+        .reduce((a, b) => a + b, 0);
+      const generateBackgrounds = isMulti ? vs.generate_backgrounds ?? false : false;
+      const speechCost = AVATAR_TTS_COST_PER_SECOND * totalSeconds;
+      const bgCost = generateBackgrounds
+        ? AVATAR_BACKGROUND_COST_PER_SCENE * scripts.length
+        : 0;
+      const totalCost = speechCost + bgCost;
+      const suggestedTool: ManualMaterializationStep["suggested_tool"] = isMulti
+        ? "generate_avatar_video"
+        : "generate_avatar_lipsync_clip";
+      const shapeNote = isMulti
+        ? "Multi-scene reel con burned-in subtitles, transitions y per-scene backgrounds. NO substituir por generate_avatar_lipsync_clip aunque parezca más barato: es un output distinto."
+        : "Single-scene talking head, sin subtitles, sin concat. Es la SHAPE elegida en draft; no upgradear a generate_avatar_video sin re-confirmar con el user.";
+      const callHint = isMulti
+        ? `scripts=[${scripts.length} item(s)]${generateBackgrounds ? ", generate_backgrounds=true" : ""}`
+        : "script=<el único script del plan>";
+      byFingerprint.set(fp, {
+        fingerprint: fp,
+        source_type: vs.type,
+        suggested_tool: suggestedTool,
+        avatar_id: vs.avatar_id,
+        scripts_count: scripts.length,
+        generate_backgrounds: generateBackgrounds,
+        estimated_total_seconds: totalSeconds,
+        estimated_credits: totalCost,
+        shape_note: shapeNote,
+        consumed_by: [consumer],
+        next_action_for_agent: `Llamá ${suggestedTool}(company_id, avatar_id=${vs.avatar_id}, ${callHint}), esperá el video resultante, después llamá update_content_plan con un replace_sub_post por cada entry de consumed_by (swap video_source a { type: "asset_id", id: <asset_id_resultante> }), y finalmente execute_content_plan(plan_id, plan_item_slugs=[<los slugs cubiertos>], confirm=true).`,
+      });
+    }
+  }
+
+  if (byFingerprint.size === 0) return null;
+
+  const steps = Array.from(byFingerprint.values());
+  const totalCredits = steps.reduce((a, s) => a + s.estimated_credits, 0);
+  const affectedSlugs = Array.from(
+    new Set(steps.flatMap((s) => s.consumed_by.map((c) => c.slug))),
+  );
+
+  return {
+    count: steps.length,
+    total_estimated_credits: totalCredits,
+    affected_plan_item_slugs: affectedSlugs,
+    steps,
+    user_message: `Aviso importante: el plan tiene ${steps.length} pieza(s) con avatar (${affectedSlugs.length} día(s) afectado(s)) que no se generan automáticamente en el flujo de execute. Las voy a generar manualmente antes de publicar, aprox ${totalCredits} créditos en total. Una vez generadas las attacheo al plan y recién ahí se publica. Los días sin avatar se publican normalmente.`,
+    instructions_for_agent: `ANTES del cost summary y de pedir aprobación final, surface manual_materialization_required.user_message al usuario. Después, cuando el user apruebe el plan, el flujo correcto es: (1) para cada step, llamar suggested_tool y esperar el asset, (2) llamar update_content_plan con replace_sub_post para cada entry de consumed_by swappeando video_source a { type: "asset_id", id: <asset_id> }, (3) execute_content_plan con plan_item_slugs cubriendo los slugs afectados. Los plan_items NO afectados (sin avatar) se ejecutan con execute_content_plan normalmente sin esa danza. NUNCA llamar execute_content_plan sobre los slugs en affected_plan_item_slugs sin antes completar (1) y (2): el executor tira "Asset strategy ai_avatar_* is not supported by execute_content_plan in v1" y aborta el item. Cuando el user pide "arrancá con los primeros 2 posteos" y uno de esos 2 está en affected_plan_item_slugs, hacer la danza para ese antes de publicar.`,
+  };
 }
 
 function describeAssetSource(

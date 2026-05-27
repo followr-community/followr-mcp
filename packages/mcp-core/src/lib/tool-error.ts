@@ -193,26 +193,44 @@ function categorizeFollowrError(
     // when the action requires a plan feature the user does not have. Verified
     // empirically 2026-05-19 (POST /aiResults/image with gpt_image_2 on a plan
     // where premium_images_allowed === 0).
+    //
+    // CRITICAL: the agent must NOT paraphrase or guess what the entity name
+    // maps to. PipeLime 2026-05-26: a 402 fired during generate_avatar_video
+    // and the agent told the user "tu plan no incluye subtítulos burned-in"
+    // when in reality the user's plan DID include subtitles. The actual
+    // failure was on a different step of the avatar flow (the entity name
+    // surfaced something else). The fix on this side is two-fold:
+    //   1) Emit the entity verbatim, never invent a friendly name.
+    //   2) Tell the agent to QUOTE the entity literally and verify with
+    //      get_ai_budget before claiming "your plan does not include X".
     const entity =
       body && typeof body === "object" && body !== null && typeof (body as Record<string, unknown>)["entity"] === "string"
         ? ((body as Record<string, unknown>)["entity"] as string)
         : undefined;
-    const friendlyEntity = entity
-      ? entity.replace(/_/g, " ")
-      : "this feature";
+    const backendMessage =
+      body && typeof body === "object" && body !== null && typeof (body as Record<string, unknown>)["message"] === "string"
+        ? ((body as Record<string, unknown>)["message"] as string)
+        : undefined;
+    const messageClause = backendMessage ? ` Backend message: "${backendMessage}".` : "";
     return {
       reason: "plan_does_not_include_feature",
       user_message_override: entity
-        ? `Your Followr plan does not include the feature this call requires (entity: ${entity}). The backend rejected the request before consuming credits.`
-        : `Your Followr plan does not include the feature this call requires. The backend rejected the request.`,
+        ? `The Followr backend rejected this call with HTTP 402 and entity "${entity}". This typically means the current plan does not include a feature this call requires, but the exact feature is whatever "${entity}" maps to on the Followr side, NOT necessarily the feature the agent was trying to use last. Do NOT paraphrase the entity name into a different feature ("subtitles", "Creatomate", "premium video", etc.) unless you can confirm the mapping with get_ai_budget; quote "${entity}" verbatim to the user instead.${messageClause}`
+        : `The Followr backend rejected this call with HTTP 402 but did NOT specify which feature is missing (no "entity" field in the response). Do NOT tell the user a specific feature is missing; ask them to verify their plan on the Followr web (app.followr.ai > Subscription) or contact support. The MCP cannot resolve which feature without the entity name.${messageClause}`,
       suggested_actions: [
         {
-          tool: "get_credits_balance",
-          rationale: `Inspect the plan's quotas. If ${friendlyEntity}_allowed is 0, the user does not have access. Suggest a non-${friendlyEntity} model (regular image models tire against images_allowed, premium image models tire against premium_images_allowed).`,
+          tool: "get_ai_budget",
+          rationale: entity
+            ? `Read get_ai_budget and look for a quota or boolean flag matching "${entity}". If you find one with value 0 / false, the plan genuinely lacks that feature. If you do NOT find any matching field, the entity name may reference a backend feature not exposed in the budget; in that case tell the user the literal entity name and recommend contacting Followr support rather than guessing.`
+            : "Read get_ai_budget to surface the plan name + active addons + per-feature flags. Share that with the user so they can decide whether to upgrade or contact support.",
         },
         {
           rationale:
-            "If the user explicitly asked for a premium model and has no access, tell them their plan does not include it and offer a regular alternative (e.g. nano_banana_2 for image, gpt-4.1-mini for text, Wan 2 for video).",
+            "If the user pushes back ('but my plan includes this!'), DO NOT argue. The entity from the backend is the source of truth for what failed; the user may be thinking of a related-but-distinct feature. Offer to share the literal backend response + ask the user to contact Followr support with the entity name.",
+        },
+        {
+          rationale:
+            "Common entities seen in practice: 'premium_images' (premium image models like gpt_image_2, nano_banana_pro), 'premium_videos' (premium video models like Veo / Seedance / Hailuo). If the entity matches one of these AND the user wants the cheaper alternative, retry with a non-premium model (nano_banana_2 for image, wan_2.2 for video). For ANY other entity name, do not invent a remediation; surface the literal entity and escalate.",
         },
       ],
     };

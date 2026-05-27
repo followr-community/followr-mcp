@@ -1211,6 +1211,72 @@ WRITE: PUT /api/companies/{id} with description merged. Safe to call multiple ti
           await client.updateCompany(company_id, { description: newDescription });
         }
         const profile = getProfile(industry_id as IndustryId);
+
+        // ── Refreshed planning policy (inlined, eliminates round-trip) ─────
+        //
+        // Pre 2026-05-26 flow: agent calls confirm_industry, then has to
+        // re-call prepare_content_plan_context to get recommended_video_strategy
+        // and avatar_setup_proposal recomputed with the confirmed industry.
+        // That extra round-trip is the source of latency surfaced in the
+        // PipeLime session.
+        //
+        // Now: we compute the industry-driven defaults inline and surface them
+        // here. The agent does NOT need to re-call prepare_content_plan_context
+        // unless something else in the brand context changed (a network was
+        // connected, brand voice was added, etc.). Those are unrelated to the
+        // industry marker and the agent already has them from the earlier
+        // prepare_content_plan_context call that exposed industry_setup_proposal
+        // in the first place.
+        const recommendedVideoStrategy = {
+          industry_id: profile.id,
+          display_name: profile.display_name,
+          default_video_kind: profile.video_strategy.default_video_kind,
+          rationale_short: profile.video_strategy.rationale_short,
+          flip_concepts: profile.video_strategy.flip_concepts,
+          is_ambiguous: profile.video_strategy.is_ambiguous === true,
+        };
+
+        // Best-effort avatar inventory check. When the industry recommends
+        // avatar as default video kind AND the company has zero avatars,
+        // the planner cannot fulfill the recommendation. Surface the gap
+        // upfront so the agent resolves it BEFORE phase_2 scope questions.
+        let availableAvatarsCount: number | null = null;
+        let needsAvatarProposal = false;
+        if (
+          recommendedVideoStrategy.default_video_kind === "ai_avatar_video" &&
+          !recommendedVideoStrategy.is_ambiguous
+        ) {
+          try {
+            const avatars = await client.listAvatars(company_id, { pageSize: 10 });
+            availableAvatarsCount = avatars.length;
+            needsAvatarProposal = availableAvatarsCount === 0;
+          } catch {
+            // Non-fatal: the agent can still re-call prepare_content_plan_context
+            // if it needs a deterministic avatar count.
+            availableAvatarsCount = null;
+          }
+        }
+
+        const avatarSetupProposal = needsAvatarProposal
+          ? {
+              severity: "clarification_required_before_draft",
+              user_message: `La industria ${profile.display_name} recomienda usar avatar talking-head como default de video, pero esta empresa todavía no tiene ningún avatar cargado. ¿Querés crear uno ahora (con create_avatar_full_flow, ~30-60s) o avanzar con AI clips sin avatar (más genérico para esta vertical)?`,
+              resolution_options: [
+                {
+                  id: "create_avatar_now",
+                  description:
+                    "Llamá create_avatar_full_flow (genera avatar a partir de una foto o prompt + voice). Después seguí con phase_2.",
+                  tool: "create_avatar_full_flow",
+                },
+                {
+                  id: "proceed_with_ai_clips",
+                  description:
+                    "Saltea el avatar. El plan va a usar AI clips silenciosos / con audio nativo según el modelo. Para SaaS / B2B esto reduce conversión, pero es válido si el user no quiere invertir en avatar.",
+                },
+              ],
+            }
+          : null;
+
         return ok({
           ok: true,
           industry_id,
@@ -1218,10 +1284,19 @@ WRITE: PUT /api/companies/{id} with description merged. Safe to call multiple ti
           marker_written: suffix,
           marker_already_current: newDescription === description,
           user_facing_summary: `Listo, guardé la industria de la marca como ${profile.display_name}. Ahora puedo armar el plan ajustado a este tipo de negocio (recomendación de avatar vs AI clip, formatos preferidos, etc.).`,
+          refreshed_planning_policy: {
+            recommended_video_strategy: recommendedVideoStrategy,
+            available_avatars_count: availableAvatarsCount,
+            needs_avatar_proposal: needsAvatarProposal,
+            avatar_setup_proposal: avatarSetupProposal,
+          },
           _assistant_guidance: {
-            next_step: "recall_prepare_content_plan_context_then_draft",
-            instructions:
-              "Volvé a llamar prepare_content_plan_context para refrescar recommended_video_strategy y avatar_setup_proposal con la industry confirmada. Después seguí con phase_1 / phase_2 questions y draft_content_plan normalmente.",
+            next_step: needsAvatarProposal
+              ? "resolve_avatar_setup_proposal_then_phase_2"
+              : "phase_2_scope_questions",
+            instructions: needsAvatarProposal
+              ? `La industria confirmada recomienda avatar como default de video pero la empresa tiene 0 avatares. PRIMERO resolvé el avatar_setup_proposal arriba (mostrar al user, elegir create_avatar_now vs proceed_with_ai_clips), DESPUÉS pasá a phase_2 scope questions (window, frequency, theme, promo) y draft_content_plan. NO necesitás re-llamar prepare_content_plan_context: los industry-driven defaults que cambiaron al confirmar la industria ya están en refreshed_planning_policy de esta misma response. Solo re-llamá prepare_content_plan_context si algo NO relacionado a la industry cambió en la sesión (e.g. el user conectó una red social nueva o cargó una brand voice nueva).`
+              : `Industria confirmada y los industry-driven defaults ya están en refreshed_planning_policy de esta misma response. NO necesitás re-llamar prepare_content_plan_context salvo que algo NO relacionado a la industry haya cambiado (e.g. el user conectó una red social nueva o cargó una brand voice nueva). Pasá directo a phase_2 scope questions (window, frequency, theme, promo) y después draft_content_plan.`,
           },
         });
       } catch (err) {
