@@ -289,6 +289,13 @@ export interface ContextSnapshot {
   // industry-aware policies (recommended_video_strategy, format biases) have a
   // valid value to dispatch on.
   cached_industry_id: string | null;
+  // True only when the industry marker carries the `:confirmed` flag, i.e. the
+  // user explicitly approved the industry via confirm_industry (and did not
+  // just accept the heuristic / deep_research auto-detection). draft_content_plan
+  // blocks when this is false, even if cached_industry_id is set, so the agent
+  // cannot accidentally draft on top of an unconfirmed auto-detection. Default
+  // false for safety when callers omit the field.
+  cached_industry_confirmed: boolean;
   // Visual style marker presence parsed from Company.description at bootstrap
   // time (the `[visual_style:slug@date]` suffix written by confirm_visual_style).
   // true when the company already fixed a default template, false when it

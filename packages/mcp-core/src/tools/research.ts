@@ -35,7 +35,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 
 import type { RegisterOptions } from "../index.js";
-import { READ_ONLY } from "../lib/annotations.js";
+import { MUTATION_OPEN_WORLD, READ_ONLY } from "../lib/annotations.js";
 import {
   bodyTextExcerpt,
   detectEcommercePlatform,
@@ -177,20 +177,29 @@ function containsWord(haystack: string, needle: string): boolean {
 
 // ── Cache helpers ──────────────────────────────────────────────────────────
 
-const CACHE_SUFFIX_RE = /\[industry:([a-z_]+)@(\d{4}-\d{2}-\d{2})\]/i;
+// Marker shape on Company.description:
+//   [industry:<id>@<YYYY-MM-DD>]            auto-detected (default, heuristic or deep_research)
+//   [industry:<id>@<YYYY-MM-DD>:confirmed]  user confirmed (after presenting the auto result)
+//
+// Group 3 captures any colon-prefixed flag so callers can branch on confirmation
+// state. Legacy markers (no flag) are treated as auto / not confirmed; that is
+// intentional, so cached values written before 2026-05-26 get re-confirmed by
+// the user the next time prepare_content_plan_context runs.
+export const CACHE_SUFFIX_RE = /\[industry:([a-z_]+)@(\d{4}-\d{2}-\d{2})(?::([a-z_]+))?\]/i;
+export const CONFIRMED_FLAG = "confirmed";
 // Bump 2026-05-25: 30 → 90 días. La industria de una marca cambia rara vez;
 // si cambia el user puede forzar refresh con force_refresh: true.
 const CACHE_TTL_DAYS = 90;
 
 /**
  * Append (or replace) the `[industry:<id>@<date>]` marker on a company
- * description. Used by deep_research to persist the cache itself instead
- * of asking the agent to call update_company (the agent has no exposed
- * update_company tool, so leaving this to the agent created a structural
- * dead-end where downstream planning tools blocked on a missing cache the
- * agent could not write).
+ * description. Used by deep_research and confirm_industry to persist the
+ * cache itself instead of asking the agent to call update_company (the
+ * agent has no exposed update_company tool, so leaving this to the agent
+ * created a structural dead-end where downstream planning tools blocked
+ * on a missing cache the agent could not write).
  */
-function applyCacheSuffixToDescription(currentDescription: string | null, suffix: string): string {
+export function applyCacheSuffixToDescription(currentDescription: string | null, suffix: string): string {
   const desc = currentDescription ?? "";
   if (CACHE_SUFFIX_RE.test(desc)) {
     return desc.replace(CACHE_SUFFIX_RE, suffix);
@@ -198,19 +207,27 @@ function applyCacheSuffixToDescription(currentDescription: string | null, suffix
   return desc.length > 0 ? `${desc.trimEnd()}\n\n${suffix}` : suffix;
 }
 
-interface CachedIndustry {
+export interface CachedIndustry {
   id: IndustryId;
   cached_at: string;
   age_days: number;
   fresh: boolean;
+  /**
+   * True only when the marker carries the `:confirmed` flag, which means the
+   * user (not just the heuristic / deep_research) approved this industry.
+   * Auto-detected and legacy markers come back with confirmed: false; the
+   * planning tools treat them as "needs confirmation before drafting".
+   */
+  confirmed: boolean;
 }
 
-function readCachedIndustry(description: string | null | undefined): CachedIndustry | null {
+export function readCachedIndustry(description: string | null | undefined): CachedIndustry | null {
   if (!description) return null;
   const m = description.match(CACHE_SUFFIX_RE);
   if (!m) return null;
   const id = m[1] as IndustryId;
   const cachedAt = m[2];
+  const flag = m[3] ?? null;
   if (!cachedAt || !ALL_INDUSTRY_IDS.includes(id)) return null;
   const cachedMs = Date.parse(cachedAt);
   if (Number.isNaN(cachedMs)) return null;
@@ -220,12 +237,15 @@ function readCachedIndustry(description: string | null | undefined): CachedIndus
     cached_at: cachedAt,
     age_days: ageDays,
     fresh: ageDays <= CACHE_TTL_DAYS,
+    confirmed: flag === CONFIRMED_FLAG,
   };
 }
 
-function buildCacheSuffix(id: IndustryId): string {
+export function buildCacheSuffix(id: IndustryId, confirmed: boolean = false): string {
   const today = new Date().toISOString().slice(0, 10);
-  return `[industry:${id}@${today}]`;
+  return confirmed
+    ? `[industry:${id}@${today}:${CONFIRMED_FLAG}]`
+    : `[industry:${id}@${today}]`;
 }
 
 // ── Fetch with budget ──────────────────────────────────────────────────────
@@ -736,7 +756,7 @@ export function registerResearchTools(
 
 WHEN TO CALL: al inicio de cualquier tarea de contenido no trivial (a week of posts, a campaign, a launch, a series). Una llamada por conversación por compañía alcanza; cacheá el resultado con el cache_suggestion. Llamar SIEMPRE antes de armar un plan si la marca tiene catálogo visual (moda, comida, retail, real estate) para que los assets generados se parezcan a la marca real y no a fashion-genérico-AI.
 
-NOTE (2026-05-24): prepare_content_plan_context now auto-classifies the industry on cache miss via a fast (~3-8s) home-page fetch. That covers the unblock-the-draft case without requiring you to call deep_research. Call deep_research EXPLICITLY when (a) the auto pass failed (industry_auto_classification.classified is false on the context response), OR (b) the brand is catalog-rich and you want product image URLs, menu items, articles or properties to ground the plan. Skip deep_research when industry_auto_classification.classification_performed is true AND the brand is service / SaaS / general (no catalog to grab).
+NOTE (2026-05-26): prepare_content_plan_context no longer auto-classifies on cache miss. The keyword heuristic was wrong too often for minimalist B2B SaaS landings, and it then poisoned the cache. The new flow is explicit: (1) when industry_setup_proposal is present on the context response, call deep_research; (2) it writes an auto marker [industry:<id>@<date>] to Company.description; (3) present the detected_industry to the user with the catalog of available industries and ask for confirmation; (4) call confirm_industry({ company_id, industry_id }) with the user's final pick. Only after that final call does draft_content_plan accept the plan. The user can override the auto-detection (free-text like "es Software B2C") and the agent should map their response to the closest available industry before calling confirm_industry.
 
 EXTRACTION STRATEGY (in priority order):
 1. Ecommerce platform fast-path. Detects Shopify (cdn.shopify.com header, _shopify_* cookie), WooCommerce (meta generator, /wp-json/wc/), VTEX (vtexassets.com, vtexcommerce.com). When matched, hits the platform's documented JSON catalog API (/products.json, /wp-json/wc/store/v1/products, /api/catalog_system/pub/products/search/) for full product data with image arrays in one request.
@@ -1109,6 +1129,104 @@ OUTPUT: candidates[] sorted by score, recommended { id, confidence }, reasoning.
         fetched_from: fetchedFrom,
         ...(parsedOg ? { signals: { title: parsedOg.title, description: parsedOg.description, og_type: parsedOg.og_type } } : {}),
       });
+    },
+  );
+
+  // ────────────────────────────────────────────────────────────────────────
+  // confirm_industry
+  // ────────────────────────────────────────────────────────────────────────
+  //
+  // Persist the user's confirmed industry choice. Writes the `:confirmed`
+  // flag onto the marker so prepare_content_plan_context and
+  // draft_content_plan recognise the value as user-approved (not just
+  // heuristic / deep_research auto-detected) and unblock the planning path.
+  //
+  // Typical flow:
+  //   1. prepare_content_plan_context returns industry_setup_proposal or
+  //      industry_confirmation_required.
+  //   2. The agent calls deep_research (when no marker existed) or just
+  //      reads the auto marker (when industry_confirmation_required fired).
+  //   3. The agent presents the detected industry to the user along with
+  //      the available_industries catalog and asks for confirmation /
+  //      override.
+  //   4. The agent calls confirm_industry({ company_id, industry_id })
+  //      with the user's final pick.
+  //
+  // industry_id must be a valid IndustryId from the catalog. Free-text user
+  // answers ("es Software B2C", "soy un consultor") need to be mapped by
+  // the LLM to the closest entry before calling this tool. The tool itself
+  // rejects unknown ids with a structured error.
+  server.registerTool(
+    "confirm_industry",
+    {
+      annotations: MUTATION_OPEN_WORLD,
+      title: "Persist the user's confirmed industry pick on Company.description",
+      description: `Persists the user's confirmed industry pick on Company.description by writing the marker [industry:<id>@<date>:confirmed]. Required step between deep_research (auto-detection) and draft_content_plan (which now blocks until the marker carries the :confirmed flag).
+
+USE THIS when:
+- The user explicitly confirmed the industry detected by deep_research (e.g. "sí, es SaaS").
+- The user overrode the auto-detection ("no, es restaurant"). Map the user's wording to the closest industry_id from the catalog (the available_industries array returned by prepare_content_plan_context lists every valid id).
+- The agent gathered the industry directly from the user without running deep_research (e.g. the user volunteered the answer up-front).
+
+The marker is idempotent: re-calling with a different industry_id replaces the previous value and updates the date. Use this for corrections too ("ah, en realidad somos B2B service, no SaaS").
+
+DO NOT USE THIS to silently accept the auto-detection. The whole point of this gate is the user's explicit confirmation. If the user has not yet weighed in, present the detection to them first and wait for their answer.
+
+VALIDATION: industry_id must be one of the catalog ids in lib/industry-profiles (saas, ecommerce_fashion, ecommerce_general, restaurant, service_b2b, education, real_estate, healthcare, creative_agency, local_business, personal_brand, news_media, hotel_hospitality, fitness_wellness, events_organizer, ngo_nonprofit, generic_business). Unknown ids return a structured error and the marker is left untouched.
+
+WRITE: PUT /api/companies/{id} with description merged. Safe to call multiple times; same-day re-confirmations are no-ops.`,
+      inputSchema: {
+        company_id: z.number().int().positive(),
+        industry_id: z
+          .string()
+          .min(1)
+          .describe(
+            "The industry id the user confirmed. Must be one of the catalog ids in lib/industry-profiles. Map free-text user answers ('es Software B2C', 'soy consultor', 'tengo una panadería') to the closest catalog entry before calling.",
+          ),
+      },
+    },
+    async ({ company_id, industry_id }) => {
+      try {
+        if (!ALL_INDUSTRY_IDS.includes(industry_id as IndustryId)) {
+          return toolError({
+            reason: "unknown_industry_id",
+            user_message: `"${industry_id}" no es una industria válida del catálogo de Followr. Las opciones son: ${ALL_INDUSTRY_IDS.filter((id) => id !== "generic_business").join(", ")}. Generic_business existe como fallback pero no es elegible para confirmación.`,
+            blocking: true,
+            details: { received: industry_id, available: ALL_INDUSTRY_IDS },
+          });
+        }
+        if (industry_id === "generic_business") {
+          return toolError({
+            reason: "generic_business_not_confirmable",
+            user_message:
+              "generic_business es un fallback interno; no es una industria que el usuario pueda elegir como suya. Pedile al usuario una industria más específica del catálogo.",
+            blocking: true,
+          });
+        }
+        const company = await client.getCompany(company_id);
+        const description = company.description ?? "";
+        const suffix = buildCacheSuffix(industry_id as IndustryId, true);
+        const newDescription = applyCacheSuffixToDescription(description, suffix);
+        if (newDescription !== description) {
+          await client.updateCompany(company_id, { description: newDescription });
+        }
+        const profile = getProfile(industry_id as IndustryId);
+        return ok({
+          ok: true,
+          industry_id,
+          display_name: profile.display_name,
+          marker_written: suffix,
+          marker_already_current: newDescription === description,
+          user_facing_summary: `Listo, guardé la industria de la marca como ${profile.display_name}. Ahora puedo armar el plan ajustado a este tipo de negocio (recomendación de avatar vs AI clip, formatos preferidos, etc.).`,
+          _assistant_guidance: {
+            next_step: "recall_prepare_content_plan_context_then_draft",
+            instructions:
+              "Volvé a llamar prepare_content_plan_context para refrescar recommended_video_strategy y avatar_setup_proposal con la industry confirmada. Después seguí con phase_1 / phase_2 questions y draft_content_plan normalmente.",
+          },
+        });
+      } catch (err) {
+        return toolErrorFromException(err);
+      }
     },
   );
 }

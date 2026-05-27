@@ -63,16 +63,14 @@ import {
 } from "../lib/aspect-ratio-translate.js";
 import { resolveDriver } from "../lib/driver-resolver.js";
 import {
+  ALL_INDUSTRY_IDS,
   type IndustryId,
   type VideoStrategy,
   getProfile,
 } from "../lib/industry-profiles/index.js";
 import { normalizePreferences } from "../lib/normalize-preferences.js";
 import { getAiPreferences } from "../lib/preferences.js";
-import {
-  ensureIndustryClassified,
-  type EnsureIndustryClassifiedResult,
-} from "./research.js";
+import { readCachedIndustry } from "./research.js";
 import { localDateTimeToUtcIso, resolveTimezone } from "../lib/timezone.js";
 import {
   type AssetLayout,
@@ -478,7 +476,7 @@ USE THIS at the start of any content-planning task (a week of posts, a campaign,
 
 OUTPUT: a context_id you pass to draft_content_plan. The context expires after 2 hours; re-call if you come back later.
 
-MUTATION: minimal. Read-only EXCEPT for one defensive write: when auto_classify_industry is true (default) and the company has no cached industry classification on Company.description, this tool runs a fast home-page fetch + heuristic classify + persists the [industry:<id>@<date>] suffix. That single write lifts the hard block on draft_content_plan without requiring an extra deep_research round-trip. Set auto_classify_industry: false to opt out of that behaviour. Safe to call multiple times: a fresh cache short-circuits the classify in ~1ms.
+MUTATION: none. As of 2026-05-26 this tool is fully read-only. Earlier versions auto-classified the industry via a keyword heuristic and persisted the result, but that wrote bad data for minimalist B2B SaaS landings and downstream tools then trusted the wrong cache. Industry classification now goes through two explicit steps: (1) deep_research(company_id) does the actual detection and writes an auto marker, (2) confirm_industry(company_id, industry_id) accepts the user's final pick and writes the :confirmed marker that unblocks draft_content_plan. The proposals industry_setup_proposal and industry_confirmation_required in this response tell the agent which step is missing.
 
 IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. After receiving this context: (1) identify what user intent is still ambiguous (window, posts per day, networks, theme, promo, brand voice creation); (2) ask the user ONE multi-decision question; (3) ONLY THEN call draft_content_plan with your crafted plan_items array. Do not skip to drafting in the same turn.`,
       inputSchema: {
@@ -499,7 +497,7 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
           .optional()
           .default(true)
           .describe(
-            "Default true. When no [industry:<id>@<date>] suffix is present on Company.description, this tool runs a fast classification pass (fetch home page + heuristic classifier + persist suffix) BEFORE returning, so the context comes back with cached_industry already populated and downstream draft_content_plan does not hard-block on a missing cache. The fast pass takes ~3-8 seconds and intentionally skips the deep_research extractors (no product catalog crawl). Set false when you want to control the classification flow manually (e.g. you plan to call deep_research with depth=thorough yourself right after). Cache hits short-circuit immediately regardless of this flag; this only controls behaviour on cache miss.",
+            "Default true. Historical name (kept for backwards compatibility). When true, the response includes industry_setup_proposal / industry_confirmation_required to guide the agent through the deep_research → confirm_industry flow. When false, those proposals are suppressed: use this only if the agent is driving industry classification manually and does not want the proposal hints surfaced. The hard block in draft_content_plan still requires a :confirmed marker regardless of this flag.",
           ),
       },
     },
@@ -727,37 +725,75 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
           }
         : null;
 
-      // Detect deep_research cache marker on description. deep_research
-      // suggests appending "[industry:<id>@<YYYY-MM-DD>]" to Company.description
-      // via update_company so subsequent sessions can read the cached
-      // classification without re-fetching. When present, we surface the
-      // cached industry directly. When missing, we used to emit a warning
-      // and let the agent decide; that produced a multi-round-trip flow
-      // (draft_content_plan would hard-block on the missing cache, the
-      // agent would call deep_research, then re-call this tool to get a
-      // fresh context_id). To collapse that, when auto_classify_industry
-      // is true (default) AND no cache exists, we run a fast in-tool
-      // classification + persistence cycle here. The agent still has the
-      // option to call deep_research afterwards if it wants the full
-      // catalog data (product images, menu items, etc.); ensureIndustry
-      // ClassifiedHelper deliberately stays minimal (industry id only).
+      // Industry cache + confirmation gate (rewritten 2026-05-26).
+      //
+      // Previous behavior: when no marker existed we called the fast keyword
+      // heuristic (ensureIndustryClassified) and PERSISTED its guess. That
+      // wrote bad data for minimalist landings (PipeLime SaaS misclassified
+      // as local_business by keyword frequency), and downstream tools then
+      // trusted the bad cache because the deep_research gate at
+      // content-plan.ts:1917 only fires when no marker exists at all.
+      //
+      // New behavior: we ONLY use the cache when the marker carries the
+      // :confirmed suffix (set by confirm_industry after the user agreed).
+      // First-time companies get an industry_setup_proposal that tells the
+      // agent to call deep_research first. Auto-detected markers (written
+      // by deep_research without explicit confirmation) get an
+      // industry_confirmation_required proposal that tells the agent to
+      // present the auto result to the user before drafting.
+      //
+      // The auto_classify_industry input parameter is retained for backwards
+      // compatibility but is now a no-op when true (default). When set to
+      // false, the agent is signalling "I will drive industry myself, do not
+      // emit proposals"; in that case we skip both proposals and let the
+      // hard gate in draft_content_plan handle the unconfirmed state.
       const description = companyResolved.description ?? "";
-      const cacheRe = /\[industry:([a-z_]+)@(\d{4}-\d{2}-\d{2})\]/i;
-      const cacheMatch = cacheRe.exec(description);
-      let cachedIndustry: { industry_id: string; cached_at: string } | null =
-        cacheMatch && cacheMatch[1] && cacheMatch[2]
-          ? { industry_id: cacheMatch[1], cached_at: cacheMatch[2] }
+      const cacheReadResult = readCachedIndustry(description);
+      const cachedIndustry: {
+        industry_id: string;
+        cached_at: string;
+        confirmed: boolean;
+      } | null = cacheReadResult
+        ? {
+            industry_id: cacheReadResult.id,
+            cached_at: cacheReadResult.cached_at,
+            confirmed: cacheReadResult.confirmed,
+          }
+        : null;
+      const emitIndustryProposals = auto_classify_industry !== false;
+      const industrySetupProposal =
+        emitIndustryProposals && cachedIndustry === null
+          ? {
+              severity: "clarification_required_before_draft" as const,
+              instruction:
+                "Antes de armar el plan, llamá deep_research(company_id) UNA SOLA VEZ. Esta llamada NO es solo para clasificar la industria: además extrae productos, fotos de catálogo, menu items, artículos, pillars de contenido, contactos y social links del sitio. Esa data se usa después para que las imágenes generadas se parezcan al catálogo real y los copies se anclen en lo que la marca realmente vende. Saltearla porque 'el usuario ya dijo SaaS' es un error: el usuario te dio la industria, pero te falta TODO el resto del contexto del sitio (productos, fotos reales, pillars, contactos). Una vez que deep_research vuelva, PRESENTALE al usuario el detected_industry junto con la lista de industrias disponibles y pedile confirmación. Si el usuario confirma o nombra exactamente la misma industria detectada, llamá confirm_industry con ese industry_id. Si el usuario dice otra cosa (ej: 'no, es Software B2C'), mapealo a la mejor industria del catálogo y llamá confirm_industry con ese id. NO empieces a draftear hasta tener un marker `:confirmed` en Company.description.",
+              user_message:
+                "Para armar un plan ajustado a tu marca voy a investigar tu sitio (saca productos, fotos de catálogo y ángulos de contenido reales, no inventados). Tarda 30 seg a 2 min, sin cargo. Después te muestro la industria detectada y vos confirmás antes de seguir.",
+              available_industries: ALL_INDUSTRY_IDS.filter((id) => id !== "generic_business"),
+              option_actions: [
+                {
+                  id: "run_deep_research",
+                  label: "Investigar sitio y confirmar (única ruta recomendada)",
+                  description:
+                    "Llamá deep_research(company_id). Detecta industria + extrae catálogo / productos / artículos / menu / pillars del sitio. Cuando vuelva, presentale al user la industry detectada junto con available_industries y pedile confirmación. Luego confirm_industry({ company_id, industry_id }).",
+                  next_tool: "deep_research",
+                },
+              ],
+              skip_path_intentionally_omitted:
+                "No existe una opción 'saltar deep_research y preguntar la industria directamente'. Esa puerta fue removida 2026-05-26 (real session PipeLime) porque agentes la tomaban cuando el usuario mencionaba la industria al pasar, perdiendo así la extracción del catálogo (productos, fotos, pillars) que es el VALOR principal de deep_research, no la clasificación. Si el usuario explícitamente dice 'no investigues el sitio, hacé algo genérico', el agente puede llamar prepare_content_plan_context con auto_classify_industry=false para suprimir este bloque y luego confirm_industry a mano. Esa es la única vía explícita de salida.",
+            }
           : null;
-      let autoIndustryResult: EnsureIndustryClassifiedResult | null = null;
-      if (cachedIndustry === null && auto_classify_industry !== false) {
-        autoIndustryResult = await ensureIndustryClassified(client, company_id);
-        if (autoIndustryResult.classified && autoIndustryResult.industry_id !== null) {
-          cachedIndustry = {
-            industry_id: autoIndustryResult.industry_id,
-            cached_at: new Date().toISOString().slice(0, 10),
-          };
-        }
-      }
+      const industryConfirmationRequired =
+        emitIndustryProposals && cachedIndustry !== null && cachedIndustry.confirmed === false
+          ? {
+              severity: "clarification_required_before_draft" as const,
+              instruction: `Hay una industria cacheada en Company.description (${cachedIndustry.industry_id}, ${cachedIndustry.cached_at}) pero todavía no fue confirmada por el usuario. PRESENTALE al usuario qué industria fue detectada y pedile que confirme o corrija. Si el usuario confirma, llamá confirm_industry({ company_id, industry_id: "${cachedIndustry.industry_id}" }). Si el usuario menciona otra industria (texto libre, ej: 'no, es Software B2C'), mapealo a la mejor opción de available_industries y llamá confirm_industry con ese id. NO drafftees el plan hasta resolver esto.`,
+              user_message: `Detecté que tu industria es "${cachedIndustry.industry_id}". ¿Es correcto o tu marca cae en otra categoría?`,
+              detected_industry_id: cachedIndustry.industry_id,
+              detected_at: cachedIndustry.cached_at,
+              available_industries: ALL_INDUSTRY_IDS.filter((id) => id !== "generic_business"),
+            }
+          : null;
 
       // Derive recommended_video_strategy from the cached industry profile.
       // When the agent knows the industry, the profile.video_strategy block
@@ -783,7 +819,15 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
             is_ambiguous: boolean;
           }
         | null = null;
-      if (cachedIndustry && KNOWN_INDUSTRY_IDS.has(cachedIndustry.industry_id as IndustryId)) {
+      // Only derive the strategy when the industry is USER-CONFIRMED. An auto
+      // marker without confirmation is treated as "not yet trusted": the
+      // industry_confirmation_required proposal will force the agent to ask
+      // the user before we let the planner dispatch on this profile.
+      if (
+        cachedIndustry &&
+        cachedIndustry.confirmed &&
+        KNOWN_INDUSTRY_IDS.has(cachedIndustry.industry_id as IndustryId)
+      ) {
         const profile = getProfile(cachedIndustry.industry_id as IndustryId);
         recommendedVideoStrategy = {
           industry_id: profile.id,
@@ -818,6 +862,7 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
         networks_connected: connectedNetworks,
         brand_has_voice_prompt: hasBrandVoice,
         cached_industry_id: cachedIndustry ? cachedIndustry.industry_id : null,
+        cached_industry_confirmed: cachedIndustry ? cachedIndustry.confirmed : false,
         has_visual_style_marker: hasVisualStyleMarker,
       });
 
@@ -1118,7 +1163,7 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
       const clarifyingFlowInstructions = [
         "EXECUTION ORDER (read carefully):",
         "0. PRECONDITION CHECK. If you did NOT call get_company_creative_brief earlier in this conversation for this company, do that FIRST and then re-call prepare_content_plan_context. The brief carries the brand voice prompts per network, audience_types, tones, language and existing tags that you need to ground every plan_item. Without it you end up improvising audience and tone from the company description scrape, which silently overrides the user's explicit brand voice. Real failure mode (PostApprove 2026-05-23): the agent skipped get_company_creative_brief and ad-libbed 'audience: agencies, social media managers' from the description; it happened to match but only by luck.",
-        "1. INDUSTRY CHECK. Read industry_auto_classification. When industry_auto_classification.classification_performed is true and resolved_industry_id is non-null, this tool already detected and persisted the industry for you (cheap fast pass, ~3-8s, no credits charged). Surface the recommended_user_message to the user one line and PROCEED without calling deep_research. Only call deep_research separately when industry_auto_classification.classified is false (the auto pass could not resolve the brand, e.g. no website on file or fetch failed) OR when the brand benefits from rich catalog data (fashion / food / retail / real estate) and you want product image URLs to ground the visuals. Do NOT call deep_research reflexively when the auto pass succeeded; that's the round-trip we explicitly designed away from. If next_step starts with 'call_deep_research_first', that means even auto-classification failed and the agent must escalate to deep_research.",
+        "1. INDUSTRY CHECK. Inspect brand_context.cached_industry and brand_context.industry_setup_proposal / industry_confirmation_required. When cached_industry is non-null AND cached_industry.confirmed === true, proceed without any industry work. When industry_setup_proposal is present, call deep_research(company_id) first, then present its detected industry to the user with the available_industries list, then call confirm_industry({ company_id, industry_id }) with the user's choice (which can be the detected one OR a different one they prefer; map free-text answers like 'es Software B2C' to the closest entry in available_industries). When industry_confirmation_required is present (auto marker exists but not user-confirmed yet), skip deep_research, present the detected industry to the user with available_industries, and call confirm_industry with their choice. NEVER bypass these proposals: draft_content_plan rejects any plan attempt while the industry is unconfirmed.",
         "2. If phase_1_foundational has questions, ask THOSE in a SINGLE AskUserQuestion call this turn. NEVER mix phase_1 with phase_2 in the same turn. The phase_1 questions are blockers: the user picking 'avanzar sin' is acceptable, but you cannot skip the question itself.",
         "3. For each phase_1 question the user picks 'call_setup_tool' on, invoke option_actions[i].setup_tool with the suggested args (resolve the *_from references against the matching proposal block in this same _assistant_guidance). After every setup tool completes, re-call prepare_content_plan_context to refresh state, then continue.",
         "4. When phase_1 is empty OR fully resolved, ask phase_2_plan_scope in ONE AskUserQuestion call. There are 4 questions; AskUserQuestion supports up to 4, so submit them together.",
@@ -1188,38 +1233,14 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
             : "This company has no brand voice prompt loaded. Generated copies will use Followr default voice. Strongly consider creating one with create_prompt (preferably derived from the company's best-performing posts) BEFORE drafting a multi-post plan; the quality improvement is large.",
           default_brand_voice_prompts_by_network: defaultsByNetwork,
           cached_industry: cachedIndustry,
-          industry_cache_warning: cachedIndustry
-            ? null
-            : "No industry classification cached on this company and the auto-classification attempt did not produce a result (likely because the company has no website URL on Company.website or the home page fetch failed). Per instructions Rule 19 (INDUSTRY-AWARE PLANNING), call deep_research(company_id) ONCE BEFORE drafting a non-trivial content plan. It returns detected_industry, industry_specific.data (products, menu items, articles, properties, etc. depending on industry), content_pillars_inferred, and reference assets like product image URLs that you should pass as reference_image_url on each ai_generate source. deep_research persists the [industry:<id>@<date>] marker on Company.description automatically before returning. You do NOT need to call any follow-up tool to apply the cache.",
-          industry_auto_classification: autoIndustryResult
-            ? {
-                attempted: true,
-                from_cache: autoIndustryResult.from_cache,
-                classification_performed: autoIndustryResult.classification_performed,
-                resolved_industry_id: autoIndustryResult.industry_id,
-                persistence_ok: autoIndustryResult.persistence_ok,
-                duration_ms: autoIndustryResult.duration_ms,
-                reason: autoIndustryResult.reason,
-                recommended_user_message: autoIndustryResult.classification_performed && autoIndustryResult.classified
-                  ? `Auto-detecté la industria de la marca como "${autoIndustryResult.industry_id}" (~${Math.round(autoIndustryResult.duration_ms / 100) / 10}s, sin costo de créditos para el usuario). Si querés data más rica (catálogo de productos, fotos reales del sitio para usar como referencia en el plan), podés llamar deep_research aparte ahora; si no, sigo con el plan así.`
-                  : null,
-                follow_up_hint: autoIndustryResult.classified
-                  ? "The hard block on draft_content_plan is lifted. If the brand benefits from catalog grounding (fashion, food, retail, real estate), CONSIDER calling deep_research explicitly for product images. Otherwise proceed directly to draft_content_plan."
-                  : "Auto-classification did not produce a result. Either call deep_research (which has fuller fetch + extraction logic and may succeed where this faster pass failed) or proceed without industry context (the plan quality drops slightly).",
-              }
-            : {
-                attempted: false,
-                from_cache: cachedIndustry !== null,
-                classification_performed: false,
-                resolved_industry_id: cachedIndustry ? cachedIndustry.industry_id : null,
-                persistence_ok: true,
-                duration_ms: 0,
-                reason: cachedIndustry
-                  ? "fresh cache hit on Company.description; no classification attempt was needed"
-                  : "auto_classify_industry: false was passed by the caller; classification skipped",
-                recommended_user_message: null,
-                follow_up_hint: null,
-              },
+          industry_cache_warning:
+            cachedIndustry === null
+              ? "No industry classification cached on this company. Resolve the industry_setup_proposal below: call deep_research(company_id), present its detected_industry to the user along with available_industries, and persist the user's confirmed choice via confirm_industry. draft_content_plan will reject any attempt to build a plan while industry is unconfirmed."
+              : cachedIndustry.confirmed === false
+                ? `Industry "${cachedIndustry.industry_id}" is cached but not user-confirmed yet (marker written ${cachedIndustry.cached_at}). Resolve the industry_confirmation_required block below before drafting: present the detected industry to the user and call confirm_industry with the final id.`
+                : null,
+          industry_setup_proposal: industrySetupProposal,
+          industry_confirmation_required: industryConfirmationRequired,
         },
         ai_budgets: budgets ?? {
           _error: "Could not load subscription balance. Budget gating below may be unreliable.",
@@ -1559,9 +1580,9 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
                   "ESTA NO ES UNA SUGERENCIA, ES LA POLICY DE LA INDUSTRIA. Cuando construyas plan_items[] para draft_content_plan, cada video sub_post debe respetar default_video_kind a menos que el concepto matchee uno de los flip_concepts listados arriba. Si construís un plan con 6 AI clips para una industria con default avatar (o viceversa), estás INVIRTIENDO la policy. El validador de draft_content_plan emite warning video_strategy_inverted en ese caso y ofrece resolution_options al user. Anti-pattern observado 2026-05-25 en PipeLime (local_business, default avatar): el agente armó 6 AI clips + 1 avatar cuando debió ser ~6 avatars + 1 AI clip basado en flip_concepts.",
               }
             : {
-                status: "industry_not_classified_yet",
+                status: "industry_not_confirmed_yet",
                 policy_summary:
-                  "No hay industry cacheada en Company.description y el auto-classify no resolvió la marca (ver industry_auto_classification.reason para el motivo concreto). Para destrabar, llamá deep_research(company_id) que tiene una pipeline de fetch + extracción más robusta. Sin la industry, el sistema no puede recomendar avatar vs AI clip por default.",
+                  "La industria todavía no está user-confirmada en Company.description. Resolvé primero industry_setup_proposal (si no hay marker) o industry_confirmation_required (si hay marker auto sin confirmar) antes de pensar en formats. El flujo es: deep_research → presentar al user con la lista available_industries → confirm_industry({ company_id, industry_id }) → re-llamar prepare_content_plan_context.",
               },
           recommended_video_model_policy:
             "available_video_models is pre-sorted: the FIRST entry is the recommended default for this company. ALWAYS pick the first entry, and ALWAYS use the model_id verbatim from the catalog. Do NOT invent model IDs from memory: Followr's canonical format uses dots for major.minor versions (veo_3.1_fast, veo_3.1, wan_2.2, seedance_1.1_light, seedance_2.0_fast, etc.) and no separator for hailuo (hailuo_02_standard, hailuo_02_premium). Underscored variants like veo_3_1_fast or hailuo_0_2_premium do NOT exist in Followr; the backend rejects them with HTTP 422 'selected model is invalid'. The sort accounts for company ai_preferences.video_model (rank 0 when set, with is_company_default: true) and for plan gating (when followr_plus_enabled is false, wan_2.2 is promoted to rank 0 with is_plan_fallback_default: true and every premium-bucket model is marked blocked_by_plan: true and affordable_at_default_duration: false). On accounts WITHOUT Followr Plus the ONLY accepted video model is wan_2.2; never recommend a premium-bucket model on those accounts. If the user explicitly asks for a premium model and followr_plus_enabled is false, explain the limitation and point them to followr.ai to activate the Followr Plus add-on.",
@@ -1572,7 +1593,7 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
           per_item_preview_strategy:
             "Plan size playbook for confirmation flows. NEVER decide the detail level alone: always ASK the user first which view they want, presenting 2-3 options sized to the plan. Then act on the answer. Plan-size defaults to offer:\n(1) 1-3 items: surface summary_for_user, then ask 'Te muestro el detalle completo de cada uno (copy + descripción de cada imagen y video), o te alcanza con el resumen y avanzamos?'. If user picks detail, call preview_plan_item per item.\n(2) 4-7 items: surface summary_for_user, then ask 'Querés (a) ver el detalle completo de los 5, (b) que te muestre solo uno representativo y aprobás todos juntos, o (c) avanzamos con el resumen?'. Use preview_plan_item only on the chosen subset.\n(3) 8-15 items: surface summary_for_user, then ask 'Es un plan grande. Te lo (a) agrupo por día y vamos día por día, (b) te muestro 2-3 representativos (uno por concept type) y aprobás todo de una, (c) te dejo el resumen y avanzamos?'. Group by date or by concept_shared keyword.\n(4) 16+ items: surface summary_for_user, then ask 'Plan extenso. Para no abrumarte, te propongo (a) spot-check de 2-3 representativos antes de aprobar todo, (b) agrupar por semana y aprobar por semana, (c) avanzar con el resumen tal cual?'. Default recommendation: option (a) for product-heavy industries, (b) for cadence-based plans.\nNEVER dump 30 detailed previews in a row - it is unusable. NEVER pick the view yourself without asking.",
           industry_grounding_strategy:
-            "brand_context.cached_industry should normally be non-null when you read this response, because prepare_content_plan_context auto-classifies (via a fast home-page fetch) on cache miss. Check industry_auto_classification.classification_performed to know whether the classification just happened or was already cached. The auto pass is FAST (3-8s) and FREE (no credits charged) but INTENTIONALLY MINIMAL: it sets the industry id and unblocks draft_content_plan, nothing else. It does NOT fetch the product catalog, menu items, article archive, or property listings. For brands with rich catalogs you want to ground on (fashion, beauty, food, retail, real estate), call deep_research(company_id) explicitly AFTER the auto pass to get product image URLs and structured catalog data; pass those URLs as reference_image_url on each ai_generate source. If cached_industry IS null when you read this, it means the auto pass failed (no website on file, fetch error, etc.). Read industry_auto_classification.reason for the cause; the typical recovery is to call deep_research(company_id) which has more aggressive fetch and extraction logic.",
+            "brand_context.cached_industry is only TRUSTED for planning when cached_industry.confirmed === true (a user explicitly confirmed the industry via confirm_industry). When cached_industry is null OR confirmed=false, resolve the corresponding proposal (industry_setup_proposal or industry_confirmation_required) BEFORE you draft anything. The proposals carry available_industries (the full catalog) so you can present the options to the user if they want to override the auto-detection. Once industry is :confirmed, the recommended_video_strategy and avatar_setup_proposal will populate accordingly on the NEXT call to this tool. For brands with rich catalogs you want to ground on (fashion, beauty, food, retail, real estate), deep_research(company_id) already returns product image URLs and structured catalog data; pass those URLs as reference_image_url on each ai_generate source so the generated assets resemble the actual brand catalog instead of generic AI imaginings.",
           autolist_reasoning_strategy:
             "publishing_rule_groups contains every Autopilot autolist with rich signals. Before proposing a content plan, REASON over each autolist using these inputs (NO regex, NO keyword matching: use full LLM judgment):\n" +
             "- tags[].name + history.recent_posts[].topic + history.recent_posts[].title → infer the theme of the autolist in 1-2 sentences. If history is empty, infer from tag names + brand voice (lower confidence).\n" +
@@ -1603,11 +1624,14 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
           // PostApprove plan). Surfaces when at least one of those is
           // connected; null otherwise.
           video_only_networks_strategy: videoOnlyNetworksStrategy,
-          next_step: !cachedIndustry
-            ? "call_deep_research_first_then_recheck"
-            : hasMandatoryPhase1
-              ? "ask_phase_1_foundational_only_this_turn"
-              : "ask_phase_2_plan_scope_then_draft_directly",
+          next_step:
+            industrySetupProposal !== null
+              ? "resolve_industry_setup_proposal_first"
+              : industryConfirmationRequired !== null
+                ? "resolve_industry_confirmation_required_first"
+                : hasMandatoryPhase1
+                  ? "ask_phase_1_foundational_only_this_turn"
+                  : "ask_phase_2_plan_scope_then_draft_directly",
           // DEPRECATED (2026-05-23): kept for backwards compatibility with
           // agents that read the old fields. New agents should consume
           // clarifying_questions_v2 above. These two will be removed in a
@@ -1905,25 +1929,39 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
         });
       }
 
-      // 1b. Industry classification gate. Without a cached_industry on the
-      // Company, the planner cannot dispatch on the recommended_video_strategy
-      // (which lives per-industry in src/lib/industry-profiles/<id>.ts) and
-      // ends up defaulting to AI clip for SaaS / personal_brand / healthcare /
-      // and the other avatar-first industries even when an avatar would
-      // outperform. This blocker forces the agent to run deep_research first
-      // and cache the classification on Company.description, then retry.
-      // Plan is NOT persisted; the agent receives a soft error with a single
-      // resolution path.
+      // 1b. Industry classification gate. Two stages:
+      //   (i)  No marker at all on Company.description → run deep_research,
+      //        ask user, then confirm_industry.
+      //   (ii) Marker present but not :confirmed (heuristic or deep_research
+      //        auto-detection) → present the detected industry to the user
+      //        and call confirm_industry with their answer (which can be the
+      //        detected industry OR a different one they prefer).
+      //
+      // Plan is NOT persisted in either case; the agent receives a soft
+      // error with the right resolution path.
       if (!ctx.cached_industry_id) {
         return toolError({
           reason: "industry_classification_required",
           user_message:
-            "Antes de armar el plan necesito clasificar la industria de la empresa: la recomendación de tipo de video (avatar vs animación) depende de eso. Voy a investigar el sitio (toma 30 segundos a 2 minutos) y después vuelvo con el plan.",
+            "Antes de armar el plan necesito clasificar la industria de la empresa: la recomendación de tipo de video (avatar vs animación) depende de eso. Voy a investigar el sitio (toma 30 segundos a 2 minutos) y después te pido que confirmes lo que detecté antes de seguir.",
           suggested_actions: [
             {
               tool: "deep_research",
               rationale:
-                "Llamá deep_research(company_id) UNA SOLA VEZ. Detecta la industria, trae productos / menú / properties / etc. (según el perfil), y persiste automáticamente el cache en Company.description (NO hace falta llamar update_company después, deep_research lo hace solo). Cuando termine, re-llamá prepare_content_plan_context (para refrescar recommended_video_strategy + avatar_setup_proposal) y después retry draft_content_plan.",
+                "Llamá deep_research(company_id) UNA SOLA VEZ. Detecta la industria, trae productos / menú / properties / etc. (según el perfil), y persiste un marker auto en Company.description. Cuando termine, PRESENTALE al usuario el detected_industry junto con la lista de industrias disponibles (industry_setup_proposal.available_industries en la respuesta de prepare_content_plan_context). Esperá la respuesta del usuario y llamá confirm_industry({ company_id, industry_id }) con su elección. Recién después re-llamá prepare_content_plan_context y retry draft_content_plan.",
+            },
+          ],
+          blocking: true,
+        });
+      }
+      if (!ctx.cached_industry_confirmed) {
+        return toolError({
+          reason: "industry_confirmation_required",
+          user_message: `Detecté que la marca es "${ctx.cached_industry_id}" pero todavía no me confirmaste si es correcto. ¿Es esta tu industria o tu marca cae en otra categoría?`,
+          suggested_actions: [
+            {
+              tool: "confirm_industry",
+              rationale: `La industria está cacheada como "${ctx.cached_industry_id}" pero el marker no tiene el flag :confirmed. PRESENTALE al usuario qué industria fue detectada y pedile que confirme o corrija (mostrale la lista available_industries de prepare_content_plan_context). Si el usuario confirma, llamá confirm_industry({ company_id, industry_id: "${ctx.cached_industry_id}" }). Si el usuario menciona otra (free-text como "es Software B2C"), mapealo a la mejor opción del catálogo y llamá confirm_industry con ese id. NO drafftees hasta resolver esto.`,
             },
           ],
           blocking: true,

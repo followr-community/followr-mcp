@@ -1,6 +1,6 @@
 {
   "name": "@followr-mcp/worker",
-  "version": "0.4.4",
+  "version": "0.4.5",
   "private": true,
   "description": "Cloudflare Worker for Followr MCP remote HTTP transport (v0.2 placeholder).",
   "type": "module",
@@ -9,8 +9,8 @@
     "clean": "rm -rf dist tsconfig.tsbuildinfo"
   },
   "dependencies": {
-    "@followr-mcp/mcp-core": "0.4.4",
-    "@followr-mcp/shared": "0.4.4",
+    "@followr-mcp/mcp-core": "0.4.5",
+    "@followr-mcp/shared": "0.4.5",
     "@modelcontextprotocol/sdk": "^1.0.0"
   },
   "devDependencies": {
