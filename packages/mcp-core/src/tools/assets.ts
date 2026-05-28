@@ -69,10 +69,20 @@ function sleepMs(ms: number): Promise<void> {
 }
 
 // Wrap a step with exponential backoff retries for transient errors.
-// Default: 2 retries with delays of 2s then 8s. Total worst case = 3 attempts
-// over ~10s before giving up. Suitable for the once-per-asset upload path.
+// Production: 4 retries with delays of 2s, 8s, 30s, 90s. Total worst case =
+// 5 attempts over ~130s before giving up. The long tail (30s + 90s) is what
+// lets the retry survive a multi-minute backend hiccup window. Real case:
+// PipeLime 2026-05-28 saw ~5-10 min where presigned_request returned 500
+// deterministically; the old [2s, 8s] (~10s total) gave up well inside the
+// outage and the user had to retry by hand once the backend healed.
+// Test runs (process.env.VITEST set by vitest) use tiny delays so the suite
+// stays in sub-second range without changing test assertions.
+const UPLOAD_RETRY_BACKOFFS_MS_PROD: ReadonlyArray<number> = [2000, 8000, 30_000, 90_000];
+const UPLOAD_RETRY_BACKOFFS_MS_TEST: ReadonlyArray<number> = [5, 10, 15, 20];
+
 async function withUploadRetry<T>(fn: () => Promise<T>): Promise<T> {
-  const backoffsMs = [2000, 8000];
+  const backoffsMs =
+    process.env["VITEST"] === "true" ? UPLOAD_RETRY_BACKOFFS_MS_TEST : UPLOAD_RETRY_BACKOFFS_MS_PROD;
   const maxAttempts = backoffsMs.length + 1;
   let lastError: unknown;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
@@ -142,7 +152,15 @@ function wrapStepFailure(err: unknown, ctx: StepFailureContext): ToolErrorExcept
       "Your Followr API token appears to be expired or invalid. Generate a fresh one in Followr Settings > API Keys and retry.";
     reason = `upload_failed_at_${ctx.step}_auth`;
   } else if (httpStatus !== null && httpStatus >= 500) {
-    hint = `The Followr backend returned ${httpStatus} on the "${ctx.step}" step even after retrying with backoff. Likely a transient backend hiccup. Wait a minute and retry the upload.`;
+    // Surface the backend's response body (when present) so the agent and
+    // the user know WHY the upload failed instead of seeing a generic
+    // "transient hiccup". Real case: PipeLime 2026-05-28 hit a multi-minute
+    // outage where presigned_request returned 500; the prior generic hint
+    // told the user "wait a minute and retry" while the backend could have
+    // been telling us "queue saturated, try in 5 min" or "presigned service
+    // unavailable". We never knew because we discarded the body.
+    const trimmedBackend = backendMessage.length > 400 ? `${backendMessage.slice(0, 400)}...` : backendMessage;
+    hint = `The Followr backend returned ${httpStatus} on the "${ctx.step}" step even after retrying with backoff (~2 min total across 5 attempts). Backend said: "${trimmedBackend}". If the message describes a permanent issue (bad input, missing permission), retrying as-is will not help; if it looks transient (queue saturation, gateway hiccup, brief deploy window), wait a few minutes and retry.`;
     reason = `upload_failed_at_${ctx.step}_5xx`;
   } else if (httpStatus !== null && httpStatus >= 400) {
     hint = `The request was rejected (HTTP ${httpStatus}) on the "${ctx.step}" step. The backend message is "${backendMessage}". This is usually a permanent issue (bad input, missing permission, invalid asset state); retrying as-is will not help.`;

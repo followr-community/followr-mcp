@@ -102,6 +102,57 @@ describe("uploadFromUrl step 2 (presigned_request) failure", () => {
     expect(deleteAsset).toHaveBeenCalledWith(777);
   }, 15_000);
 
+  it("surfaces the backend's response body inside the 5xx hint", async () => {
+    // Regression: prior versions of wrapStepFailure threw the backend
+    // message away for 5xx and surfaced only a generic "transient hiccup"
+    // hint. Real case (PipeLime 2026-05-28): backend likely told us WHY
+    // the upload failed but the agent only saw "wait a minute and retry".
+    // The hint now carries the backend body so the agent can decide whether
+    // to retry or change something.
+    const backendBody =
+      "Queue saturated: presigned URL service unavailable. Try again in ~5 min.";
+    const client = makeFakeClient({
+      createAsset: async () => makeAsset(7771),
+      requestAssetUpload: async () => {
+        throw new FollowrApiError(backendBody, 500, "https://api/assets/7771/video");
+      },
+    });
+
+    try {
+      await uploadFromUrl(client, { companyId: 42, url: "https://cdn/x.mp4", type: "video" });
+      throw new Error("should have thrown");
+    } catch (err) {
+      const result = (err as ToolErrorException).result;
+      // user_message embeds the hint; the backend body must appear in it.
+      const userMessage = (result.structuredContent.user_message as string) ?? "";
+      expect(userMessage).toContain(backendBody);
+      // Structured details still keep the message verbatim too.
+      const details = result.structuredContent.details as Record<string, unknown>;
+      expect(details["backend_message"]).toBe(backendBody);
+    }
+  }, 15_000);
+
+  it("attempts 5 total tries before giving up on persistent 5xx (escalated backoff)", async () => {
+    // Regression: prior versions retried only 3 times (~10s total) which
+    // was not enough to outlast multi-minute backend hiccups. The bumped
+    // backoffs (2s+8s+30s+90s with test overrides for fast suite) now do
+    // up to 5 attempts. The exact count is asserted here so a future
+    // refactor doesn't silently shrink it.
+    let attempts = 0;
+    const client = makeFakeClient({
+      createAsset: async () => makeAsset(7772),
+      requestAssetUpload: async () => {
+        attempts += 1;
+        throw new FollowrApiError("Server Error", 500, "https://api/assets/7772/video");
+      },
+    });
+
+    await expect(
+      uploadFromUrl(client, { companyId: 42, url: "https://cdn/x.mp4", type: "video" }),
+    ).rejects.toBeDefined();
+    expect(attempts).toBe(5);
+  }, 15_000);
+
   it("surfaces 401 with a token-expired hint and still cleans up", async () => {
     const deleteAsset = vi.fn(async () => {});
     const client = makeFakeClient({

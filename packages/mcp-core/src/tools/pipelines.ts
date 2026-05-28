@@ -142,7 +142,14 @@ function describePipelineKind(kind: PipelineState["kind"]): string {
   }
 }
 
-function buildPendingPipelineIntro(
+/**
+ * Build the natural-Spanish intro the agent surfaces when reporting a
+ * finished pipeline to the user via list_pending_pipelines. Exported so
+ * tests can exercise the partial_publish branch directly without spinning
+ * up the whole listPendingPipelines path. The runtime caller is
+ * listPendingPipelines below.
+ */
+export function buildPendingPipelineIntro(
   state: PipelineState,
   completedHoursAgo: number,
 ): string {
@@ -150,6 +157,56 @@ function buildPendingPipelineIntro(
   const ageLabel = describeRelativeAge(completedHoursAgo);
   const phaseLabel = state.phase;
   if (phaseLabel === "completed") {
+    // content_plan_execution: when the run is a partial publish (some
+    // sub_posts were skipped manually via skip_networks, OR auto-skipped
+    // because skip_failed_networks downgraded a failure), the agent must
+    // mention it on the first message instead of a generic "terminó".
+    // Without this, the user comes back, the agent says "tu plan terminó",
+    // and the user has no idea TikTok never went out until they check
+    // their feed two days later. Real case driving this: PipeLime 2026-05-28
+    // where the avatar upload kept 500ing and there was no UX for partial
+    // publish, so the agent had to surface it manually each round. Now the
+    // executor records skipped_sub_posts and we narrate it on resume.
+    if (state.kind === "content_plan_execution") {
+      const meta = (state.result?.metadata ?? {}) as Record<string, unknown>;
+      const partialPublish = meta["partial_publish"] === true;
+      const totals = (meta["totals"] as Record<string, unknown>) ?? {};
+      const succeeded = typeof totals["succeeded"] === "number" ? (totals["succeeded"] as number) : null;
+      const failed = typeof totals["failed"] === "number" ? (totals["failed"] as number) : null;
+      const attempted =
+        typeof totals["plan_items_attempted"] === "number"
+          ? (totals["plan_items_attempted"] as number)
+          : null;
+      const subSkipped =
+        typeof totals["sub_posts_skipped_total"] === "number"
+          ? (totals["sub_posts_skipped_total"] as number)
+          : 0;
+      const skippedHist = (meta["skipped_networks_histogram"] as Record<string, { manual: number; auto: number }>) ?? {};
+      const autoSkippedNetworks = (meta["auto_skipped_networks"] as string[]) ?? [];
+      const status = typeof meta["status"] === "string" ? (meta["status"] as string) : null;
+      const headline =
+        attempted !== null && succeeded !== null && failed !== null
+          ? `Resultado: ${succeeded}/${attempted} item${attempted === 1 ? "" : "s"} publicado${succeeded === 1 ? "" : "s"}${failed > 0 ? `, ${failed} fallaron` : ""}${subSkipped > 0 ? `, ${subSkipped} sub_post${subSkipped === 1 ? "" : "s"} salteado${subSkipped === 1 ? "" : "s"}` : ""}.`
+          : `Resultado: ${status ?? "ver result.metadata"}.`;
+
+      if (partialPublish) {
+        const skippedSummaryParts: string[] = [];
+        for (const [net, counts] of Object.entries(skippedHist)) {
+          const total = counts.manual + counts.auto;
+          const breakdown: string[] = [];
+          if (counts.manual > 0) breakdown.push(`${counts.manual} a pedido`);
+          if (counts.auto > 0) breakdown.push(`${counts.auto} por fallo`);
+          skippedSummaryParts.push(`${net} (${total} sub_post${total === 1 ? "" : "s"}: ${breakdown.join(", ")})`);
+        }
+        const skippedSummary = skippedSummaryParts.join("; ");
+        const retryHint =
+          autoSkippedNetworks.length > 0
+            ? `Las redes con auto-skip pueden reintentarse llamando execute_content_plan(plan_id, plan_item_slugs: [los slugs afectados], confirm: true) sin skip_networks; el plan en DB sigue intacto.`
+            : `Las redes salteadas a pedido están listas para retomarse: execute_content_plan(plan_id, plan_item_slugs: [...], confirm: true) sin skip_networks las publica.`;
+        return `${ageLabel.charAt(0).toUpperCase()}${ageLabel.slice(1)} el usuario disparó ${kindLabel} y se fue mientras corría. Recién terminó como PUBLICACIÓN PARCIAL y todavía no se enteró en chat. ${headline} Redes salteadas: ${skippedSummary}. Empezá tu primera respuesta diciéndole, en castellano natural, qué se publicó y qué quedó afuera (con motivo simple, no copies "asset_resolution_failed"; traducí a "el upload del video falló" o equivalente). ${retryHint} Ofrecele reintentar las que quedaron afuera, y SI te dice que sí, hacé el call sugerido. Después de mencionar el pipeline, llamá mark_pipeline_acknowledged(pipeline_id) para que esto no se repita en la próxima sesión. Mirá result.metadata.skipped_sub_posts y result.metadata.results para el detalle por item.`;
+      }
+      return `${ageLabel.charAt(0).toUpperCase()}${ageLabel.slice(1)} el usuario disparó ${kindLabel} y se fue mientras corría. Recién terminó completo y todavía no se enteró en chat. ${headline} Empezá tu primera respuesta avisándole en una o dos líneas qué quedó publicado / calendarizado (mirá result.metadata.results para listar los slugs creados y el campo scheduled de cada uno), y después llamá mark_pipeline_acknowledged(pipeline_id) para que esto no se repita en la próxima sesión.`;
+    }
     return `${ageLabel.charAt(0).toUpperCase()}${ageLabel.slice(1)} el usuario disparó ${kindLabel} y se fue mientras corría el pipeline. Recién terminó y todavía no se enteró en chat. Empezá tu primera respuesta de la sesión avisándole que está listo, resumí en una o dos líneas qué quedó publicado / generado (leé result.metadata si lo necesitás), y después llamá mark_pipeline_acknowledged(pipeline_id) para que esto no se repita en la próxima sesión.`;
   }
   if (phaseLabel === "failed") {

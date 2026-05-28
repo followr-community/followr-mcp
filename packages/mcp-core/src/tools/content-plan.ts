@@ -3219,6 +3219,11 @@ DO NOT CALL this without explicit user confirmation in chat. The MCP rejects cal
 
 PARTIAL EXECUTION: pass plan_item_slugs to execute only a subset of items (e.g. ["lun-drop-campera"] to execute just Monday). Items not in the list are left intact in the plan and can be executed later by calling execute_content_plan again with a different slug list. The plan's status only flips to 'executed' once every item has been attempted; partial executions keep the plan in 'draft' so it can be resumed. Use this when the user asks to ship "the first one only" or "Monday and Tuesday but wait on the rest" - this is the supported flow, NOT update_content_plan + remove_item as a workaround.
 
+PARTIAL PUBLISH PER PLAN_ITEM (skip_networks, skip_failed_networks): two NON-destructive ways to publish a plan_item across only a SUBSET of its sub_posts in a given run. Both leave the plan in DB untouched, so a later retry can re-include the skipped networks.
+- skip_networks: ["tiktok"] tells the executor "for this run, ignore the TikTok sub_post in every plan_item being executed; build the PostGroup with only the remaining sub_posts". Use this for a deliberate user choice: e.g. TikTok upload was failing persistently in the previous run, user wants to publish IG + FB now and reintentar TikTok later. The TT sub_post stays in the plan; calling execute_content_plan again without skip_networks would retry it.
+- skip_failed_networks: true tells the executor "if a sub_post fails (asset resolution or per-Post creation), mark it as skipped and keep going with the other sub_posts of the same plan_item, instead of failing the whole plan_item". Use this in set-and-forget mode where the user is not watching and would rather get partial coverage than a hard fail on intermittent flakes (e.g. one network's upload 500s while the others are fine). The user can retry only the skipped networks afterwards.
+The two flags compose: skip_networks pre-filters before any work happens; skip_failed_networks acts on whatever fails after that. Each result item exposes skipped_sub_posts: Array<{ sub_post_index, network, reason: "manually_skipped" | "asset_resolution_failed" | "post_creation_failed", detail? }>. The aggregate response also surfaces skipped_sub_posts_total so the agent can lead the user-facing summary with "publiqué N de M redes" without having to recompute. When the asynchronous pipeline finishes (set-and-forget), list_pending_pipelines reads the same field and the intro_for_agent narrates the partial publish so the agent reports it on the user's next message without being asked.
+
 ITEM-BY-ITEM CONFIRMATION FLOW: when the user asks to advance one item at a time, the right sequence is: (1) call preview_plan_item(plan_id, slug) for the next item; (2) surface the preview to the user (caption verbatim, plain-language asset descriptions, cost); (3) wait for explicit approval; (4) call execute_content_plan(plan_id, plan_item_slugs: [slug], confirm: true); (5) on success, repeat for the next slug listed in the response's remaining_slugs. Do NOT skip step 1 - the compact summary table is too thin for per-item approval.`,
       inputSchema: {
         plan_id: z.string().min(1),
@@ -3235,6 +3240,31 @@ ITEM-BY-ITEM CONFIRMATION FLOW: when the user asks to advance one item at a time
           .describe(
             "Optional subset of plan_item slugs to execute. When set, only matching items run; the rest stay in the plan untouched and can be executed in a later call. When omitted, every item in the plan runs. Use this for confirm-each-item flows ('arranca con el primero', 'andá pidiendo confirmación') - it is the supported alternative to removing items via update_content_plan and re-adding them later.",
           ),
+        skip_networks: z
+          .array(
+            z.enum([
+              "instagram",
+              "tiktok",
+              "facebook",
+              "linkedin",
+              "x",
+              "pinterest",
+              "threads",
+              "youtube",
+              "bluesky",
+            ]),
+          )
+          .max(9)
+          .optional()
+          .describe(
+            "Optional list of social networks to BYPASS for this run only. Sub_posts in any plan_item being executed that target one of these networks are treated as if they weren't in the plan: no asset generation, no upload, no Post creation, no cost. The PostGroup is still created with the remaining sub_posts. The plan in DB is NOT mutated, so a later execute_content_plan call without skip_networks will retry the skipped networks normally. Use this when the user wants to publish across a subset of networks AFTER a previous run failed on one of them ('publica IG y FB y dejá TikTok para después'). For permanent removal of a sub_post, use update_content_plan with remove_sub_post instead.",
+          ),
+        skip_failed_networks: z
+          .boolean()
+          .optional()
+          .describe(
+            "Default false. When true, sub_posts that fail (asset resolution after retries, or Post creation) are marked as skipped instead of failing their whole plan_item. The remaining sub_posts of the same plan_item proceed and the PostGroup is created with whatever ended up working. Recovery info appears in each result's skipped_sub_posts. Use this in set-and-forget mode where the user is not watching and would rather get partial coverage than a hard fail on intermittent flakes. Compose with skip_networks: skip_networks pre-filters before any work; skip_failed_networks catches the residual failures.",
+          ),
         wait: z
           .boolean()
           .optional()
@@ -3243,7 +3273,7 @@ ITEM-BY-ITEM CONFIRMATION FLOW: when the user asks to advance one item at a time
           ),
       },
     },
-    async ({ plan_id, confirm, plan_item_slugs, wait }) => {
+    async ({ plan_id, confirm, plan_item_slugs, wait, skip_networks, skip_failed_networks }) => {
       if (confirm !== true) {
         return toolError({
           reason: "confirmation_required",
@@ -3304,6 +3334,14 @@ ITEM-BY-ITEM CONFIRMATION FLOW: when the user asks to advance one item at a time
         itemsToRun = plan.plan_items;
       }
       const isPartialExecution = itemsToRun.length < plan.plan_items.length;
+
+      // Normalize the partial-publish flags into a single object the executor
+      // and per-item runner pass around together. Default to "do nothing"
+      // (empty list + false) so older callers see identical behavior.
+      const skipOpts: { skip_networks: SocialNetwork[]; skip_failed_networks: boolean } = {
+        skip_networks: (skip_networks ?? []) as SocialNetwork[],
+        skip_failed_networks: skip_failed_networks ?? false,
+      };
 
       // Re-validate before execute to catch any quota / state drift since draft.
       const v = await runValidation({
@@ -3396,6 +3434,7 @@ ITEM-BY-ITEM CONFIRMATION FLOW: when the user asks to advance one item at a time
               copyCtx,
               brandContext,
               { hasConnectedNetworks, scheduleTimezone },
+              skipOpts,
             );
             itemResults.push(result);
             return result;
@@ -3474,6 +3513,56 @@ ITEM-BY-ITEM CONFIRMATION FLOW: when the user asks to advance one item at a time
           0,
         );
 
+        // Aggregate skipped sub_posts across every item in this run. Two
+        // outputs:
+        //  - skippedSubPostsAggregate: a flat list with item slug + network
+        //    + reason. Read by the response, by the pipeline serializer and
+        //    by buildPendingPipelineIntro to narrate the partial publish.
+        //  - skippedNetworksHistogram: { tiktok: { manual: 3, auto: 1 } }
+        //    so the agent can say "salteamos TikTok en 4 de 7 items".
+        const skippedSubPostsAggregate: Array<{
+          slug: string;
+          social_network: string;
+          reason: string;
+          detail?: string;
+        }> = [];
+        const skippedNetworksHistogram: Record<string, { manual: number; auto: number }> = {};
+        for (const r of itemResults) {
+          const skipped = r["skipped_sub_posts"];
+          if (!Array.isArray(skipped)) continue;
+          const slug = typeof r["slug"] === "string" ? r["slug"] : "";
+          for (const s of skipped as Array<Record<string, unknown>>) {
+            const net = typeof s["social_network"] === "string" ? (s["social_network"] as string) : "?";
+            const reason = typeof s["reason"] === "string" ? (s["reason"] as string) : "?";
+            const detail = typeof s["detail"] === "string" ? (s["detail"] as string) : undefined;
+            skippedSubPostsAggregate.push({
+              slug,
+              social_network: net,
+              reason,
+              ...(detail ? { detail } : {}),
+            });
+            if (!skippedNetworksHistogram[net]) {
+              skippedNetworksHistogram[net] = { manual: 0, auto: 0 };
+            }
+            const bucket =
+              reason === "manually_skipped"
+                ? "manual"
+                : ("auto" as const);
+            skippedNetworksHistogram[net][bucket] += 1;
+          }
+        }
+        const partialPublish = skippedSubPostsAggregate.length > 0;
+        // List of unique networks that had at least one auto-skip. The agent
+        // uses this to offer "querés reintentar X" with a single execute_content_plan
+        // call (no manual skip required).
+        const autoSkippedNetworks = Array.from(
+          new Set(
+            skippedSubPostsAggregate
+              .filter((s) => s.reason !== "manually_skipped")
+              .map((s) => s.social_network),
+          ),
+        );
+
         // Branch next-actions by whether items were scheduled or left as drafts.
         // Mixed runs (some scheduled, some draft) describe both states. The
         // helper checks each result for the `scheduled` flag set by
@@ -3490,7 +3579,23 @@ ITEM-BY-ITEM CONFIRMATION FLOW: when the user asks to advance one item at a time
           draftCount > 0
             ? `Revisar los borradores (${draftCount}) en la vista de drafts de Followr; podés programarlos a mano desde la app o publicarlos directo.`
             : null;
-        const successLines = [calendarLine, draftLine].filter((l): l is string => l !== null);
+        // Partial-publish next_actions line: surfaces when any sub_post got
+        // skipped (manual or auto). When at least one network was auto-skipped
+        // (i.e. failed), suggest a one-call retry that targets just those
+        // networks without skip_networks. The agent surfaces this verbatim
+        // so the user knows what to do next.
+        const partialPublishLine = partialPublish
+          ? autoSkippedNetworks.length > 0
+            ? `Algunas redes quedaron sin publicar (${Object.entries(skippedNetworksHistogram)
+                .map(([n, c]) => `${n}: ${c.manual + c.auto}`)
+                .join(", ")}). Si querés reintentar solo las redes que fallaron, llamá execute_content_plan(plan_id, plan_item_slugs: [...slugs afectados], confirm: true) sin skip_networks; si las salteadas fueron a pedido y querés cerrarlas también, llamá lo mismo y pasale skip_networks solo a los items donde NO querés esa red.`
+            : `Algunas redes quedaron salteadas a pedido (${Object.entries(skippedNetworksHistogram)
+                .map(([n, c]) => `${n}: ${c.manual + c.auto}`)
+                .join(", ")}). El plan en DB sigue intacto; cuando quieras publicarlas, llamá execute_content_plan(plan_id, plan_item_slugs: [...slugs afectados], confirm: true) sin skip_networks.`
+          : null;
+        const successLines = [calendarLine, draftLine, partialPublishLine].filter(
+          (l): l is string => l !== null,
+        );
         const nextActions =
           overallStatus === "succeeded"
             ? isPartialExecution
@@ -3519,13 +3624,29 @@ ITEM-BY-ITEM CONFIRMATION FLOW: when the user asks to advance one item at a time
           plan_id,
           status: overallStatus,
           partial_execution: isPartialExecution,
+          // True when at least one sub_post was skipped (manual via
+          // skip_networks or auto via skip_failed_networks). Distinct from
+          // partial_execution which describes plan-level slug subsetting.
+          // The pipeline serializer reads this flag and the on-resume
+          // intro_for_agent text adapts so the agent narrates the partial
+          // publish without being asked.
+          partial_publish: partialPublish,
           executed_slugs: itemsToRun.map((it) => it.slug),
           remaining_slugs: remainingSlugs,
           results: itemResults,
+          // Aggregate skipped detail across every plan_item in this run. Used
+          // by buildPendingPipelineIntro to tell the user, on a NEW session,
+          // "el plan terminó, salteé X redes; ¿reintento?". Also useful for
+          // analytics: how often does skip_failed_networks actually save
+          // a run.
+          skipped_sub_posts: skippedSubPostsAggregate,
+          skipped_networks_histogram: skippedNetworksHistogram,
+          auto_skipped_networks: autoSkippedNetworks,
           totals: {
             plan_items_attempted: itemResults.length,
             succeeded,
             failed,
+            sub_posts_skipped_total: skippedSubPostsAggregate.length,
             estimated_credits_consumed: consumedEstimate,
             ai_image_and_video_budget_remaining: budgetAfter,
           },
@@ -4981,6 +5102,21 @@ interface SubPostAssetResolution {
   sub_post_index: number;
   asset_ids: number[];
   error?: string;
+  /**
+   * True when this sub_post was bypassed instead of resolved. Two paths
+   * lead here:
+   *  - manually_skipped: skipOpts.skip_networks included this sub_post's
+   *    network at execute time. No resolver was called, no cost incurred.
+   *  - asset_resolution_failed: resolver threw and skipOpts.skip_failed_networks
+   *    was true, so the failure was downgraded to a skip and the rest of
+   *    the plan_item kept going. The underlying error lives in skip_detail.
+   * Downstream phases (emptyAssetsFail check, post creation loop, summary
+   * builder) treat skipped resolutions as "not part of this run" and never
+   * try to use their asset_ids.
+   */
+  skipped?: boolean;
+  skip_reason?: "manually_skipped" | "asset_resolution_failed";
+  skip_detail?: string;
 }
 
 /**
@@ -5108,7 +5244,62 @@ async function executePlanItem(
      */
     scheduleTimezone: string;
   },
+  skipOpts: {
+    /**
+     * Networks the caller wants the executor to bypass for THIS run only.
+     * The matching sub_posts are not resolved, not generated, not posted;
+     * the plan in DB stays untouched so a later call without skip_networks
+     * still publishes them. Use case: TikTok kept failing on the previous
+     * run, the user wants to publish IG + FB now and retry TT later.
+     */
+    skip_networks: SocialNetwork[];
+    /**
+     * When true, sub_post failures (asset resolution or per-Post creation)
+     * downgrade to "skipped" instead of failing the whole plan_item. The
+     * remaining sub_posts of the same plan_item proceed and the PostGroup
+     * is created with whatever ended up working. Designed for set-and-forget
+     * mode where the user is not watching and partial coverage beats hard
+     * fail on intermittent flakes.
+     */
+    skip_failed_networks: boolean;
+  },
 ): Promise<Record<string, unknown>> {
+  // Manually-skipped networks: build a Set so the per-sub_post checks below
+  // are O(1) regardless of how many networks the caller listed. SocialNetwork
+  // is a closed union so a hash lookup is fine.
+  const manuallySkippedNetworkSet = new Set<SocialNetwork>(skipOpts.skip_networks);
+
+  // ── Phase 0: short-circuit when every sub_post is manually skipped ───
+  // The agent should never call us with skip_networks covering every
+  // sub_post of the plan_item, but be tolerant: return a "no-op for this
+  // item" result without touching the backend so the call is cheap and the
+  // response shape matches the partial-publish narrative.
+  if (
+    manuallySkippedNetworkSet.size > 0 &&
+    item.sub_posts.every((sp) => manuallySkippedNetworkSet.has(sp.social_network))
+  ) {
+    const skipped_sub_posts = item.sub_posts.map((sp, idx) => ({
+      sub_post_index: idx,
+      social_network: sp.social_network,
+      reason: "manually_skipped" as const,
+    }));
+    const networkLabels = skipped_sub_posts
+      .map((s) => displayNetworkName(s.social_network))
+      .join(", ");
+    return {
+      slug: item.slug,
+      date: item.date,
+      publish_at_time_local: item.publish_at_time_local,
+      status: "skipped_all_networks" as const,
+      credits_consumed_estimate: 0,
+      sub_posts_created: 0,
+      sub_posts_failed: 0,
+      sub_posts_skipped: skipped_sub_posts.length,
+      skipped_sub_posts,
+      user_facing_summary: `Posteo "${item.concept_shared}" del ${item.date} no se ejecutó: todas las redes (${networkLabels}) estaban en skip_networks. El plan_item sigue en el plan; podés ejecutarlo más tarde sin skip_networks.`,
+      recovery_suggestion: `Para publicarlo, llamá execute_content_plan(plan_id, plan_item_slugs: ["${item.slug}"], confirm: true) sin skip_networks (o con un subset menor).`,
+    };
+  }
   // 1. Build a fingerprint-keyed promise cache so any AI generation
   // (or URL upload) requested by multiple sub_posts is performed exactly
   // once. The cached Promise is reused across consumers, which means a
@@ -5150,6 +5341,20 @@ async function executePlanItem(
   try {
     assetResolutions = await Promise.all(
       item.sub_posts.map(async (sp, idx): Promise<SubPostAssetResolution> => {
+        // Manual skip: the caller asked us to bypass this network for this
+        // run. Don't even build the AssetSourceRefs, since fingerprinting
+        // them would still warm the resolveCache and a later sub_post that
+        // shares the same fingerprint would (correctly) pick up the cached
+        // result, but the asset would never be attached anywhere. Cleaner
+        // to short-circuit early.
+        if (manuallySkippedNetworkSet.has(sp.social_network)) {
+          return {
+            sub_post_index: idx,
+            asset_ids: [],
+            skipped: true,
+            skip_reason: "manually_skipped",
+          };
+        }
         const refs = subPostAssetRefs(sp, item);
         try {
           // F4: carousel image-to-image chaining. When a sub_post is a
@@ -5203,7 +5408,21 @@ async function executePlanItem(
     0,
   );
 
-  const anyFail = assetResolutions.find((r) => r.error);
+  // Collect every resolution that threw. With skip_failed_networks=true we
+  // downgrade each one to a skip in-place; the remaining sub_posts keep
+  // going and the PostGroup is created with whatever ended up working.
+  // With skip_failed_networks=false (default) the FIRST failure still
+  // aborts the plan_item, preserving the legacy fail-fast behavior.
+  const failedResolutions = assetResolutions.filter((r) => !!r.error && !r.skipped);
+  if (failedResolutions.length > 0 && skipOpts.skip_failed_networks) {
+    for (const f of failedResolutions) {
+      f.skipped = true;
+      f.skip_reason = "asset_resolution_failed";
+      f.skip_detail = f.error;
+    }
+  }
+
+  const anyFail = failedResolutions.length > 0 && !skipOpts.skip_failed_networks ? failedResolutions[0]! : null;
   if (anyFail) {
     // List the sub_posts that completed asset resolution successfully along
     // with the asset ids they ended up with. The agent can swap those into
@@ -5211,7 +5430,7 @@ async function executePlanItem(
     // pointing at { type: "asset_id", id } so a retry does not re-bill the
     // credits already spent on this attempt.
     const succeededSubPostAssets = assetResolutions
-      .filter((r) => !r.error && r.asset_ids.length > 0)
+      .filter((r) => !r.error && !r.skipped && r.asset_ids.length > 0)
       .map((r) => ({
         sub_post_index: r.sub_post_index,
         asset_ids: r.asset_ids,
@@ -5229,8 +5448,8 @@ async function executePlanItem(
       credits_consumed_estimate: creditsConsumed,
       recovery_suggestion:
         succeededSubPostAssets.length > 0
-          ? `Sub_post #${anyFail.sub_post_index} failed but ${succeededSubPostAssets.length} other sub_post(s) generated assets successfully (${creditsConsumed} cr already spent). To retry WITHOUT double-billing: (1) call update_content_plan with one replace_sub_post per entry in succeeded_sub_post_assets, swapping assets_strategy to { type: "asset_id", id: <asset_id> } for each completed asset. (2) Separately fix the failing sub_post (e.g. swap to a non-premium video model when blocked_by_plan, change prompt, point at an asset_id). (3) Call execute_content_plan(plan_id, plan_item_slugs: ["${item.slug}"], confirm: true) to retry just this item.`
-          : `One sub_post failed to resolve its assets and no other sub_post had completed yet. Fix the failing sub_post with update_content_plan (e.g. change the video model when blocked_by_plan is true on the chosen model) and retry execute_content_plan with plan_item_slugs: ["${item.slug}"] to retry just this item.`,
+          ? `Sub_post #${anyFail.sub_post_index} (${failedSubPost?.social_network ?? "?"}) failed but ${succeededSubPostAssets.length} other sub_post(s) generated assets successfully (${creditsConsumed} cr already spent). THREE recovery paths: (A, fastest, non-destructive) call execute_content_plan(plan_id, plan_item_slugs: ["${item.slug}"], skip_networks: ["${failedSubPost?.social_network ?? "?"}"], confirm: true) to publish the other networks now and leave this network for later. (B, partial-coverage friendly) call execute_content_plan(plan_id, plan_item_slugs: ["${item.slug}"], skip_failed_networks: true, confirm: true) so failures auto-skip instead of aborting the plan_item. (C, retry without double-billing) call update_content_plan with one replace_sub_post per entry in succeeded_sub_post_assets swapping assets_strategy to { type: "asset_id", id: <asset_id> }, separately fix the failing sub_post, then re-execute. Pick A when the user wants partial publish now, B for set-and-forget mode, C when they want every network published from a single retry.`
+          : `One sub_post (${failedSubPost?.social_network ?? "?"}) failed to resolve its assets and no other sub_post had completed yet. Either (A) call execute_content_plan(plan_id, plan_item_slugs: ["${item.slug}"], skip_networks: ["${failedSubPost?.social_network ?? "?"}"], confirm: true) to skip this network and publish the rest, or (B) fix the failing sub_post with update_content_plan (e.g. change the video model when blocked_by_plan is true on the chosen model) and retry execute_content_plan with plan_item_slugs: ["${item.slug}"] to publish the full plan_item.`,
     };
   }
 
@@ -5241,8 +5460,9 @@ async function executePlanItem(
   // or a deleted referenced asset can sneak through. Creating a post
   // without media on a network that requires media leaves a broken draft
   // and looks exactly like the FB/IG "copy attached, image missing" bug
-  // reported on 2026-05-21.
-  const emptyAssetsFail = assetResolutions.find((r) => r.asset_ids.length === 0);
+  // reported on 2026-05-21. Skipped resolutions are not failures: their
+  // asset_ids list is empty by construction, so exclude them from this check.
+  const emptyAssetsFail = assetResolutions.find((r) => !r.skipped && r.asset_ids.length === 0);
   if (emptyAssetsFail) {
     const sp = item.sub_posts[emptyAssetsFail.sub_post_index]!;
     return {
@@ -5302,8 +5522,18 @@ async function executePlanItem(
   const postResults: Array<{
     sub_post_index: number;
     social_network: SocialNetwork;
-    status: "created" | "failed";
+    status: "created" | "failed" | "skipped";
     error_message?: string;
+    /** When status is "skipped", explains why. Manual = caller listed the
+     * network in skip_networks. asset_resolution_failed = resolver threw and
+     * skip_failed_networks downgraded the failure. post_creation_failed =
+     * createPost threw and skip_failed_networks downgraded the failure. */
+    skip_reason?:
+      | "manually_skipped"
+      | "asset_resolution_failed"
+      | "post_creation_failed";
+    /** Underlying error detail when status is "skipped" with a failure cause. */
+    skip_detail?: string;
     /** Which path resolved the post description. Surfaces in the result so the
      * agent can tell the user "the copy was generated server-side" vs "the
      * copy you wrote was used verbatim". */
@@ -5315,6 +5545,19 @@ async function executePlanItem(
   for (let i = 0; i < item.sub_posts.length; i++) {
     const sp = item.sub_posts[i] as SubPost;
     const resolution = assetResolutions.find((r) => r.sub_post_index === i)!;
+    // Skip path: resolution was either manually skipped or auto-skipped after
+    // a failure. Don't call createPost; record the skip so the response
+    // shape lines up and the summary can narrate "publiqué 2 de 3 redes".
+    if (resolution.skipped) {
+      postResults.push({
+        sub_post_index: i,
+        social_network: sp.social_network,
+        status: "skipped",
+        skip_reason: resolution.skip_reason ?? "manually_skipped",
+        ...(resolution.skip_detail ? { skip_detail: resolution.skip_detail } : {}),
+      });
+      continue;
+    }
     const internalNetworkId =
       NETWORK_FORMAT_COMPATIBILITY[`${sp.social_network}:${sp.product_type}`]?.internal_id ??
       sp.social_network;
@@ -5369,35 +5612,66 @@ async function executePlanItem(
         copy_ai_result_id: copyResolution.ai_result_id,
       });
     } catch (e) {
-      postResults.push({
-        sub_post_index: i,
-        social_network: sp.social_network,
-        status: "failed",
-        error_message: e instanceof Error ? e.message : String(e),
-      });
+      // skip_failed_networks downgrades createPost failures to a skip too,
+      // mirroring the behavior on asset-resolution failures. Without the
+      // flag (default) the failure stays as "failed" and the existing
+      // partial-failure narrative kicks in.
+      if (skipOpts.skip_failed_networks) {
+        postResults.push({
+          sub_post_index: i,
+          social_network: sp.social_network,
+          status: "skipped",
+          skip_reason: "post_creation_failed",
+          skip_detail: e instanceof Error ? e.message : String(e),
+        });
+      } else {
+        postResults.push({
+          sub_post_index: i,
+          social_network: sp.social_network,
+          status: "failed",
+          error_message: e instanceof Error ? e.message : String(e),
+        });
+      }
     }
   }
 
   const subPostsCreated = postResults.filter((p) => p.status === "created").length;
-  const subPostsFailed = postResults.length - subPostsCreated;
+  const subPostsSkipped = postResults.filter((p) => p.status === "skipped").length;
+  const subPostsFailed = postResults.length - subPostsCreated - subPostsSkipped;
 
   if (subPostsCreated === 0) {
-    // Roll back the empty PostGroup to avoid orphans.
+    // Roll back the empty PostGroup to avoid orphans. Note: when all
+    // sub_posts were skipped (e.g. skip_failed_networks downgraded every
+    // failure) we still arrive here because zero Posts were created;
+    // the error_message and recovery_suggestion adapt to that case.
     try {
       await client.deletePostGroup(group.id);
     } catch {
       // Non-fatal: surface in details.
     }
+    const skippedSubPostsDetail = postResults
+      .filter((p) => p.status === "skipped")
+      .map((p) => ({
+        sub_post_index: p.sub_post_index,
+        social_network: p.social_network,
+        reason: p.skip_reason ?? "manually_skipped",
+        ...(p.skip_detail ? { detail: p.skip_detail } : {}),
+      }));
+    const allSkipped = subPostsSkipped === postResults.length;
     return {
       slug: item.slug,
       date: item.date,
-      status: "failed_creating_posts",
-      error_message:
-        postResults.find((p) => p.status === "failed")?.error_message ?? "All sub_posts failed.",
+      status: allSkipped ? ("skipped_all_networks" as const) : "failed_creating_posts",
+      error_message: allSkipped
+        ? `All sub_posts of plan_item "${item.slug}" were skipped (manual skip_networks or auto-skipped after failures with skip_failed_networks=true). No Posts were created and the empty PostGroup was rolled back.`
+        : postResults.find((p) => p.status === "failed")?.error_message ?? "All sub_posts failed.",
       credits_consumed_estimate: creditsConsumed,
       sub_post_results: postResults,
-      recovery_suggestion:
-        "PostGroup was deleted to avoid leaving an orphan. The assets remain in your library. Fix the per-sub_post issues with update_content_plan and retry.",
+      sub_posts_skipped: subPostsSkipped,
+      skipped_sub_posts: skippedSubPostsDetail,
+      recovery_suggestion: allSkipped
+        ? `Call execute_content_plan(plan_id, plan_item_slugs: ["${item.slug}"], confirm: true) without skip_networks (or with a smaller skip_networks list) to publish the skipped networks. Skipped reasons per network: ${skippedSubPostsDetail.map((s) => `${s.social_network}=${s.reason}`).join("; ") || "n/a"}.`
+        : "PostGroup was deleted to avoid leaving an orphan. The assets remain in your library. Fix the per-sub_post issues with update_content_plan and retry; or pass skip_networks/skip_failed_networks on the retry to publish the rest now.",
     };
   }
 
@@ -5419,6 +5693,17 @@ async function executePlanItem(
   const networksFailed = postResults
     .filter((p) => p.status === "failed")
     .map((p) => displayNetworkName(p.social_network));
+  // Networks skipped by skip_networks (manual) or downgraded by
+  // skip_failed_networks (auto). Carry the reason so the summary line can
+  // tell the user WHY a network is missing instead of leaving them guessing.
+  const networksSkippedDetail = postResults
+    .filter((p) => p.status === "skipped")
+    .map((p) => ({
+      name: displayNetworkName(p.social_network),
+      network: p.social_network,
+      reason: p.skip_reason ?? "manually_skipped",
+      detail: p.skip_detail,
+    }));
   const reuseLine =
     uniqueAssetGenerations < totalRequestedSources
       ? ` Se generaron ${uniqueAssetGenerations} asset${uniqueAssetGenerations === 1 ? "" : "s"} reutilizando entre ${totalRequestedSources - uniqueAssetGenerations} redes adicionales (ahorro de ${totalRequestedSources - uniqueAssetGenerations} generación${totalRequestedSources - uniqueAssetGenerations === 1 ? "" : "es"}).`
@@ -5437,11 +5722,39 @@ async function executePlanItem(
   const stateLabel = scheduled
     ? `calendarizado para el ${item.date} a las ${item.publish_at_time_local}`
     : `listo como borrador del ${item.date} ${item.publish_at_time_local}`;
+  // Compose the skipped-networks tail of the summary line. We surface the
+  // distinction between manual skips ("vos pediste saltearla") and auto
+  // skips ("falló y la salteamos para vos") so the user knows whether to
+  // expect a retry. Empty when no networks were skipped.
+  const skippedTail = (() => {
+    if (networksSkippedDetail.length === 0) return "";
+    const manual = networksSkippedDetail.filter((s) => s.reason === "manually_skipped");
+    const auto = networksSkippedDetail.filter((s) => s.reason !== "manually_skipped");
+    const parts: string[] = [];
+    if (manual.length > 0) {
+      parts.push(`saltadas a pedido (skip_networks): ${manual.map((s) => s.name).join(", ")}`);
+    }
+    if (auto.length > 0) {
+      parts.push(
+        `auto-saltadas tras fallar (${auto.map((s) => `${s.name} = ${s.reason}`).join("; ")})`,
+      );
+    }
+    return ` Redes ${parts.join("; ")}.`;
+  })();
   const userFacingSummary =
     subPostsFailed === 0
-      ? `Posteo "${item.concept_shared}" ${stateLabel} en ${networksCreated.join(", ")}. Costo: ${creditsConsumed} ${generationsLabel}.${reuseLine}`
-      : `Posteo "${item.concept_shared}" ${stateLabel}: creado para ${networksCreated.join(", ") || "ninguna red"}, falló en ${networksFailed.join(", ")}. Costo: ${creditsConsumed} ${generationsLabel}.${reuseLine}`;
+      ? `Posteo "${item.concept_shared}" ${stateLabel} en ${networksCreated.join(", ") || "ninguna red"}. Costo: ${creditsConsumed} ${generationsLabel}.${reuseLine}${skippedTail}`
+      : `Posteo "${item.concept_shared}" ${stateLabel}: creado para ${networksCreated.join(", ") || "ninguna red"}, falló en ${networksFailed.join(", ")}. Costo: ${creditsConsumed} ${generationsLabel}.${reuseLine}${skippedTail}`;
 
+  // status field semantics:
+  // - "created": every non-skipped sub_post succeeded (subPostsFailed === 0).
+  // - "partially_created": at least one sub_post failed AND at least one
+  //   succeeded. Skipped sub_posts do NOT trigger this status (they were a
+  //   deliberate choice or auto-handled), but they ARE counted separately
+  //   in sub_posts_skipped + skipped_sub_posts so the agent can mention
+  //   them in the user-facing summary.
+  // - "skipped_all_networks" is reserved for the all-empty paths handled
+  //   above.
   return {
     slug: item.slug,
     date: item.date,
@@ -5457,6 +5770,12 @@ async function executePlanItem(
     user_facing_summary: userFacingSummary,
     sub_posts_created: subPostsCreated,
     sub_posts_failed: subPostsFailed,
+    sub_posts_skipped: subPostsSkipped,
+    skipped_sub_posts: networksSkippedDetail.map((s) => ({
+      social_network: s.network,
+      reason: s.reason,
+      ...(s.detail ? { detail: s.detail } : {}),
+    })),
     sub_post_results: postResults,
     credits_consumed_estimate: creditsConsumed,
     asset_reuse_summary: {
