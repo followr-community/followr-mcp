@@ -6,6 +6,7 @@
     "module": "ESNext"
   },
   "include": ["src/**/*", "src/**/*.json"],
+  "exclude": ["src/**/*.test.ts"],
   "references": [
     { "path": "../shared" }
   ]
