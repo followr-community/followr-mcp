@@ -75,9 +75,14 @@ import { localDateTimeToUtcIso, resolveTimezone } from "../lib/timezone.js";
 import {
   type AssetLayout,
   type AssetSourceAiImage,
+  type AssetSourceConceptImage,
+  type AssetSourceConceptVideo,
   type AssetsStrategy,
   type ContentPlan,
+  type OverrideLite,
+  type PlanDefaults,
   type PlanItem,
+  type PlanItemLite,
   type ProductType,
   type SocialNetwork,
   type SubPost,
@@ -87,6 +92,13 @@ import {
   getPlan,
   updatePlan as updatePlanInState,
 } from "../lib/content-plan-state.js";
+import { normalizeIncomingPlan } from "../lib/plan-normalize.js";
+import {
+  composeImageBrief,
+  composeVideoBrief,
+  composeImageBriefFromSpecOnly,
+  composeVideoBriefFromSpecOnly,
+} from "../lib/brief-composer.js";
 import {
   createPipeline,
   isCancellationRequested,
@@ -1853,6 +1865,216 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
     sub_posts: z.array(SubPostSchema).min(1).max(10),
   });
 
+  // ────────────────────────────────────────────────────────────────────────
+  // TIER 1 (concept-only) schemas. Added 2026-05-27 / v0.6.1.
+  //
+  // These are an ADDITIVE alternative to the schemas above. The agent picks
+  // per sub_post: either Tier 3 (assets_strategy with explicit prompts) or
+  // Tier 1 (assets_strategy_lite with kind + slot_count + optional override).
+  //
+  // A normalization step inside draft_content_plan converts Lite sub_posts to
+  // an internal canonical shape that uses the same AssetsStrategy interface
+  // as Tier 3, but with concept_only_image / concept_only_video AssetSource
+  // entries that the executor recognises and routes to Creative Studio (Paths
+  // A and B) or the legacy AI Images endpoint (Path C, bypass).
+  //
+  // The Lite schema is intentionally compact so the LLM emits a much smaller
+  // tool_use input. See PLANNING_STRATEGY.TIER_1 (in prepare_content_plan_context)
+  // for the decision heuristic and Path A/B/C routing rules.
+  // ────────────────────────────────────────────────────────────────────────
+
+  const PlanDefaultsSchema = z
+    .object({
+      image_model: z
+        .string()
+        .optional()
+        .describe(
+          "Default AI image model for the whole plan. Honored by every Tier 1 sub_post whose override.model is not set. Defaults to nano_banana_2 (25 cr/img). Use nano_banana_pro (45 cr) for premium. PLAN-LEVEL COST LOCK: the executor uses this model verbatim, no server-side auto-upgrades.",
+        ),
+      video_model: z
+        .string()
+        .optional()
+        .describe(
+          "Default AI video model. Defaults to wan_2.2 (~400 cr/sec). Use veo_3_fast or higher only when the user accepts the cost.",
+        ),
+      video_duration_seconds: z
+        .number()
+        .int()
+        .min(2)
+        .max(60)
+        .optional()
+        .describe("Default video duration in seconds. Defaults to 8s."),
+      avatar_id: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          "Default avatar id for any avatar_lipsync or avatar_multi_scene sub_post. Per-sub_post override possible via the assets_strategy_lite.override.avatar_id_override.",
+        ),
+      avatar_voice_id: z
+        .string()
+        .optional()
+        .describe(
+          "Default ElevenLabs voice id for avatar TTS. Defaults to company.default_voice.",
+        ),
+    })
+    .strict();
+
+  const AssetKindEnum = z.enum([
+    "image",
+    "image_url",
+    "image_asset_id",
+    "carousel_image",
+    "video",
+    "video_url",
+    "video_asset_id",
+    "avatar_lipsync",
+    "avatar_multi_scene",
+  ]);
+
+  // 300 chars is the cap for art_direction_hint (Path B). Beyond that the agent
+  // should switch to literal_prompt (Path C) per the routing heuristic.
+  const OverrideSchema = z
+    .object({
+      model: z
+        .string()
+        .optional()
+        .describe(
+          "Per-sub_post override of plan_defaults.image_model / .video_model. Use only when this specific item needs a different model (e.g. ideogram_v3 for legible typography).",
+        ),
+      aspect_ratio: z
+        .enum(["1:1", "4:3", "16:9", "3:4", "9:16"])
+        .optional()
+        .describe(
+          "Override the auto-derived aspect ratio. Auto rules: IG feed = 1:1, IG reel / TikTok / YouTube Short = 9:16, LinkedIn feed = 16:9 or 1:1, FB feed = 1:1.",
+        ),
+      duration_seconds: z.number().int().min(2).max(60).optional(),
+      art_direction_hint: z
+        .string()
+        .max(300)
+        .optional()
+        .describe(
+          "PATH B (Creative Studio + hint). Up to 300 chars of additional conceptual direction extracted from the user's chat. Examples: 'épico, luz dorada de atardecer', 'tono cálido', 'minimalista con mucho aire'. Creative Studio applies brand enrichment AND respects this hint (additive). MUTUALLY EXCLUSIVE with literal_prompt.",
+        ),
+      literal_prompt: z
+        .string()
+        .max(2000)
+        .optional()
+        .describe(
+          "PATH C (bypass Creative Studio, raw prompt to /api/aiResults/image). Use when: (a) the user pasted a Midjourney / Stable Diffusion style prompt; (b) the user used technical photo / film vocabulary (lens, F-stop, film stock, anamorphic, dolly zoom); (c) the user explicitly asked to skip brand enrichment ('sin marca', 'experimental', 'stock-like'); (d) the user picked a model Creative Studio does not support (ideogram_v3, flux_pro, recraftv3, gpt-image-2). When in doubt for ambiguous mid-detail direction, ASK the user once before defaulting here. MUTUALLY EXCLUSIVE with art_direction_hint.",
+        ),
+      reference_image_urls: z
+        .array(z.string().url())
+        .max(5)
+        .optional()
+        .describe(
+          "Image-to-image references. Up to 5 URLs. Works in both Creative Studio (passed as reference_images) and the AI Images bypass path.",
+        ),
+      avatar_id_override: z.number().int().positive().optional(),
+      avatar_voice_id_override: z.string().optional(),
+    })
+    .strict()
+    .refine((v) => !(v.art_direction_hint && v.literal_prompt), {
+      message:
+        "art_direction_hint (Path B) and literal_prompt (Path C) are mutually exclusive. Pick one or neither.",
+    });
+
+  // Lite (Tier 1) assets strategy. Compact, structural.
+  const AssetsStrategyLiteSchema = z
+    .object({
+      asset_kind: AssetKindEnum,
+      slot_count: z
+        .number()
+        .int()
+        .min(2)
+        .max(20)
+        .optional()
+        .describe("REQUIRED when asset_kind = carousel_image. Number of slides (2 to 20)."),
+      scene_count: z
+        .number()
+        .int()
+        .min(1)
+        .max(10)
+        .optional()
+        .describe("REQUIRED when asset_kind = avatar_multi_scene. Matches avatar_scripts.length."),
+      avatar_scripts: z
+        .array(z.string().min(1).max(500))
+        .max(10)
+        .optional()
+        .describe(
+          "REQUIRED when asset_kind = avatar_lipsync (1 script) or avatar_multi_scene (N scripts matching scene_count). VERBATIM scripts the avatar will speak. Audience hears these literally so the LLM owns the content; never inferred server-side.",
+        ),
+      source_url: z
+        .string()
+        .url()
+        .optional()
+        .describe("REQUIRED when asset_kind = image_url or video_url."),
+      source_asset_id: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("REQUIRED when asset_kind = image_asset_id or video_asset_id."),
+      override: OverrideSchema.optional(),
+    })
+    .strict();
+
+  const SubPostLiteSchema = z
+    .object({
+      social_network: SocialNetworkEnum,
+      product_type: ProductTypeEnum,
+      asset_layout: AssetLayoutEnum,
+      assets_strategy_lite: AssetsStrategyLiteSchema,
+      caption_concept: z
+        .string()
+        .min(1)
+        .max(800)
+        .describe(
+          "INTERNAL DIRECTIVE for THIS sub_post, capped at 800 chars in Tier 1 (was 2000 in Tier 3). Brief intent: hook, key points, CTA, length target. Used both as the seed for brief composition (Creative Studio gets concept_shared + caption_concept as the brief) and as the Path B fallback when copy_draft is empty.",
+        ),
+      copy_draft: z
+        .string()
+        .min(1)
+        .max(3000)
+        .optional()
+        .describe(
+          "Optional in Tier 1. RECOMMENDED FLOW: leave undefined in draft_content_plan and fill via set_copy_drafts AFTER draft returns, one tool call per plan_item. This keeps the giant single-shot tool_use payload manageable. If you skip set_copy_drafts, execute_content_plan falls back to Path B (server-side generate_text). Path A (your draft) > Path B always in quality.",
+        ),
+      tags: z.array(z.string()).optional(),
+    })
+    .strict();
+
+  const PlanItemLiteSchema = z
+    .object({
+      slug: z
+        .string()
+        .min(1)
+        .max(80)
+        .regex(/^[a-z0-9\-_]+$/i, "slug must be alphanumeric with - or _"),
+      date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, "expected YYYY-MM-DD"),
+      publish_at_time_local: z
+        .string()
+        .regex(/^\d{2}:\d{2}$/, "expected HH:mm (24h)"),
+      timezone: z.string().min(1).max(60),
+      concept_shared: z.string().min(1).max(500),
+      rationale: z
+        .string()
+        .max(400)
+        .optional()
+        .describe(
+          "Optional in Tier 1, capped at 400 chars (was required 1000 in Tier 3). Reasoning trace surfaced in preview_plan_item.",
+        ),
+      paired_with: z.array(z.string().min(1).max(80)).optional(),
+      sub_posts: z.array(SubPostLiteSchema).min(1).max(10),
+    })
+    .strict();
+
+  // Discriminator: a plan_item is Lite when ANY sub_post has assets_strategy_lite,
+  // otherwise Full. Mix in a single plan IS supported: the normalizer converts
+  // per sub_post. zod's union picks the matching branch by parse success.
+  const PlanItemUnionSchema = z.union([PlanItemLiteSchema, PlanItemSchema]);
+
   server.registerTool(
     "draft_content_plan",
     {
@@ -1860,7 +2082,18 @@ IMPORTANT: even though this returns a lot of data, it does NOT draft a plan. Aft
       title: "Validate a structured content plan and persist it for review before execution",
       description: `Take a fully-structured plan_items array (each plan_item = one PostGroup with one or more per-network sub_posts) and validate it against the connected networks, per-network specs, asset layout compatibility, carousel limits and the user's current AI budget. On success, persists the plan in session memory with a plan_id that the user can later approve via execute_content_plan.
 
-EVERY sub_post must have BOTH caption_concept (your editorial brief) AND copy_draft (the publication-ready text) when running interactively. caption_concept is your reasoning trace; copy_draft is what the user actually sees in Followr. If you omit copy_draft, execute_content_plan falls back to Followr's generate_text using caption_concept as the brief (path B); the fallback works but produces more generic copy than a Claude-written draft. See PLANNING_STRATEGY.copy_drafting_principle for length and hashtag guidance per network. The 2026-05-21 PostApprove audit shipped 10 drafts where the directive text leaked into the post body as the visible copy because copy_draft did not exist yet; this field is what prevents that failure mode.
+TIER 1 (RECOMMENDED for interactive flows, v0.6.1+): for each sub_post, emit \`assets_strategy_lite\` (asset_kind + slot_count + optional override) instead of the legacy \`assets_strategy\` with explicit prompts. Pair with top-level \`plan_defaults\` (image_model, video_model, video_duration_seconds, avatar_id, avatar_voice_id). The server composes the brief for Creative Studio at execute time from concept_shared + caption_concept; the LLM no longer writes per-asset prompts. This keeps the draft_content_plan tool_use payload small enough to fit under claude.ai's output cap on plans of 7+ days. Tier 3 (explicit prompts) remains valid for rare items where the user gave pixel-level direction; mix freely.
+
+TIER 1 ROUTING (Path A / B / C for AI images and videos):
+- Path A (default): no override on the assets_strategy_lite. Server infers the brief from concept + caption + format. Creative Studio applies brand enrichment (1850-char design system + style_key + logo + colors).
+- Path B: override.art_direction_hint (<= 300 chars). Short conceptual direction from the user ("luz dorada", "tono cálido"). Brief gets appended; Creative Studio still enriches.
+- Path C: override.literal_prompt (<= 2000 chars). Bypasses Creative Studio, forwards prompt verbatim to /api/aiResults/image. Use ONLY when the user gave pixel-level direction (lens, F-stop, film stock, anamorphic, dolly zoom) or pasted a Midjourney-style prompt. When in doubt for ambiguous mid-detail direction, ASK the user once ("¿respetamos identidad de marca o priorizamos tu dirección literal?") before defaulting to Path C.
+
+COPY_DRAFT FLOW (Strategy B): leave copy_draft UNDEFINED on every sub_post in this call. Right after this tool returns plan_id, call \`set_copy_drafts\` once per plan_item (covering all its sub_posts in a single call) with the publication-ready copies. Only then surface the plan to the user. This staggers the heavy text generation across N small tool calls instead of one giant tool_use. If you skip set_copy_drafts, execute_content_plan falls back to Path B server-side generate_text (functional but more generic copies).
+
+TIER 3 LEGACY: for sub_posts that need explicit prompts (rare; user gave full Midjourney-style direction, OR you need a non-CS model like ideogram_v3 for typography), emit \`assets_strategy\` instead of \`assets_strategy_lite\`. Mix in a single plan is fine. The two shapes are discriminated by field name.
+
+EVERY sub_post must have caption_concept (your editorial brief). copy_draft (the publication-ready text) is RECOMMENDED but optional in Tier 1 (gets filled via set_copy_drafts). caption_concept is your reasoning trace; copy_draft is what the user actually sees in Followr. If you omit copy_draft, execute_content_plan falls back to Followr's generate_text using caption_concept as the brief (path B); the fallback works but produces more generic copy than a Claude-written draft. See PLANNING_STRATEGY.copy_drafting_principle for length and hashtag guidance per network. The 2026-05-21 PostApprove audit shipped 10 drafts where the directive text leaked into the post body as the visible copy because copy_draft did not exist yet; this field is what prevents that failure mode.
 
 For AI image generation, when two sub_posts in the same plan_item need conceptually the same asset (cover, step illustration, CTA), set shared_concept_key on BOTH AssetSourceAiImage refs so the resolver collapses them to ONE generation. See PLANNING_STRATEGY.image_reuse_principle. The validator flags near-duplicate prompts (>=85% similar) within the same plan_item as a non-blocking warning with merge_with_shared_concept_key as the recommended resolution.
 
@@ -1910,7 +2143,10 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
               ),
           })
           .optional(),
-        plan_items: z.array(PlanItemSchema).min(1).max(60),
+        plan_items: z.array(PlanItemUnionSchema).min(1).max(60),
+        plan_defaults: PlanDefaultsSchema.optional().describe(
+          "Plan-level defaults for Tier 1 (concept-only) sub_posts. Honored as cost lock at execute time. Tier 3 sub_posts (assets_strategy with explicit prompts) ignore this block.",
+        ),
         use_brand_voice: z.boolean().optional().default(true),
         auto_publish_schedule: z
           .object({
@@ -1977,6 +2213,46 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
         });
       }
 
+      // 1b-bis. Normalize Tier 1 (assets_strategy_lite) sub_posts to the
+      // canonical PlanItem / AssetsStrategy shape. Tier 3 sub_posts pass through
+      // unchanged. After this point all downstream code (validator, dedupe,
+      // executor, preview) operates on PlanItem[] with concept_only_image /
+      // concept_only_video AssetSource entries for the Lite parts.
+      //
+      // The normalizer expands each Lite sub_post:
+      //   asset_kind = carousel_image with slot_count=N → N entries of
+      //     concept_only_image inside carousel_sources with slot_index 0..N-1
+      //   asset_kind = image → 1 concept_only_image inside image_source
+      //   asset_kind = video → 1 concept_only_video inside video_source
+      //   asset_kind = image_url / image_asset_id / video_url / video_asset_id
+      //     → existing AssetSourceUrl / AssetSourceAssetId shape
+      //   asset_kind = avatar_lipsync / avatar_multi_scene → existing
+      //     AssetSourceAvatarLipsync / AssetSourceAvatarVideo with scripts
+      //     verbatim from the agent
+      // Errors collected per sub_post (missing slot_count, missing avatar_id,
+      // etc.) come back as a single toolError with all of them grouped so the
+      // agent can fix the lot in one round-trip.
+      const norm = normalizeIncomingPlan(
+        input.plan_items as Array<PlanItem | PlanItemLite>,
+        input.plan_defaults,
+      );
+      if (norm.errors.length > 0) {
+        return toolError({
+          reason: "tier1_normalization_errors",
+          user_message:
+            "El plan tiene problemas de estructura en su forma Lite (assets_strategy_lite). Detalles abajo en details.normalization_errors. Cada entrada dice qué falta o está mal en cada sub_post (por slug + sub_post_index).",
+          details: {
+            normalization_errors: norm.errors.map((e) => ({
+              slug: e.slug,
+              sub_post_index: e.sub_post_index,
+              reason: e.reason,
+              user_facing_message: e.user_facing_message,
+            })),
+          },
+          blocking: true,
+        });
+      }
+
       // 1c. Brand templates gate. When the company has a Brand Visual
       // Identity configured AND the plan generates at least one AI image,
       // we require the brand to have manufactured templates in
@@ -1993,7 +2269,7 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
       // Skip the gate when the company has no Brand Visual Identity at
       // all: that case is handled upstream by prepare_content_plan_context
       // via brand_visual_identity_setup_proposal.
-      const planItemsArr = input.plan_items as PlanItem[];
+      const planItemsArr = norm.plan_items;
       const planUsesAiImages = planItemsArr.some((it) =>
         it.sub_posts.some((sp) => {
           const s = sp.assets_strategy as {
@@ -2001,7 +2277,9 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
             carousel_sources?: Array<{ type?: string }>;
           };
           if (s.image_source?.type === "ai_generate") return true;
+          if (s.image_source?.type === "concept_only_image") return true;
           if (s.carousel_sources?.some((cs) => cs.type === "ai_generate")) return true;
+          if (s.carousel_sources?.some((cs) => cs.type === "concept_only_image")) return true;
           return false;
         }),
       );
@@ -2060,6 +2338,7 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
         user_answers: input.user_answers ?? {},
         plan_items: planItemsArr,
         use_brand_voice: input.use_brand_voice ?? true,
+        ...(input.plan_defaults ? { plan_defaults: input.plan_defaults as PlanDefaults } : {}),
         ...(input.auto_publish_schedule ? { auto_publish_schedule: input.auto_publish_schedule } : {}),
       });
 
@@ -2123,7 +2402,7 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
   const ChangeReplaceItem = z.object({
     action: z.literal("replace_item"),
     slug: z.string().min(1),
-    new_item: PlanItemSchema,
+    new_item: PlanItemUnionSchema,
   });
   const ChangeUpdateField = z.object({
     action: z.literal("update_field"),
@@ -2139,7 +2418,7 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
   });
   const ChangeAddItem = z.object({
     action: z.literal("add_item"),
-    new_item: PlanItemSchema,
+    new_item: PlanItemUnionSchema,
   });
   const ChangeRemoveItem = z.object({
     action: z.literal("remove_item"),
@@ -2164,12 +2443,12 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
     action: z.literal("replace_sub_post"),
     slug: z.string().min(1),
     sub_post_index: z.number().int().nonnegative(),
-    new_sub_post: SubPostSchema,
+    new_sub_post: z.union([SubPostLiteSchema, SubPostSchema]),
   });
   const ChangeAddSubPost = z.object({
     action: z.literal("add_sub_post"),
     slug: z.string().min(1),
-    new_sub_post: SubPostSchema,
+    new_sub_post: z.union([SubPostLiteSchema, SubPostSchema]),
   });
   const ChangeRemoveSubPost = z.object({
     action: z.literal("remove_sub_post"),
@@ -2197,6 +2476,9 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
         "Each entry takes a subset of the original item's sub_posts (matched by social_network), turns it into a new plan_item with its own publish_at_time_local. Used to separate a heterogeneous plan_item into per-network siblings with different publish times.",
       ),
   });
+  // Mutual exclusion between new_carousel_sources (Tier 3) and slot_count
+  // (Tier 1) is enforced in applyChange so this schema stays a plain
+  // ZodObject and remains compatible with z.discriminatedUnion below.
   const ChangeConvertToCarousel = z.object({
     action: z.literal("convert_to_carousel"),
     slug: z.string().min(1),
@@ -2204,7 +2486,51 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
     new_carousel_sources: z
       .array(z.union([AssetSourceUrlSchema, AssetSourceAssetIdSchema, AssetSourceAiImageSchema]))
       .min(2)
-      .max(20),
+      .max(20)
+      .optional()
+      .describe(
+        "Tier 3 path. Pass an explicit array of AssetSource entries (urls, asset_ids, or ai_generate with prompts). Mutually exclusive with slot_count (the apply step rejects when both are set or neither is).",
+      ),
+    slot_count: z
+      .number()
+      .int()
+      .min(2)
+      .max(20)
+      .optional()
+      .describe(
+        "Tier 1 path. Pass just the slide count; the server expands to N concept_only_image sources sharing the existing concept_only_image template (or plan_defaults). Mutually exclusive with new_carousel_sources.",
+      ),
+  });
+
+  // Tier 1 atomic ops (v0.6.1+). Keep the diff small for common UX flows.
+  const ChangeUpdateSlotCount = z.object({
+    action: z.literal("update_slot_count"),
+    slug: z.string().min(1),
+    sub_post_index: z.number().int().nonnegative(),
+    slot_count: z.number().int().min(2).max(20).describe("New number of carousel slides."),
+  });
+  const ChangeSetOverride = z.object({
+    action: z.literal("set_override"),
+    slug: z.string().min(1),
+    sub_post_index: z.number().int().nonnegative(),
+    override: OverrideSchema.nullable().describe(
+      "Replace (or clear with null) the override block of all concept_only_* sources in this sub_post. Use to switch a Tier 1 sub_post between Path A / B / C without re-emitting the whole sub_post.",
+    ),
+  });
+  const ChangeSetPlanDefault = z.object({
+    action: z.literal("set_plan_default"),
+    field: z.enum([
+      "image_model",
+      "video_model",
+      "video_duration_seconds",
+      "avatar_id",
+      "avatar_voice_id",
+    ]),
+    value: z
+      .union([z.string(), z.number(), z.null()])
+      .describe(
+        "Set the plan-level default (or clear with null). Note: this only affects sub_posts added via add_item / add_sub_post / replace_item / replace_sub_post AFTER this call. Existing concept_only_* sources keep the model / duration / avatar that was locked at draft time (cost lock). To upgrade an existing item, use replace_sub_post or set_override.",
+      ),
   });
 
   const ChangeSchema = z.discriminatedUnion("action", [
@@ -2219,6 +2545,9 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
     ChangeRemoveSubPost,
     ChangeSplitByNetwork,
     ChangeConvertToCarousel,
+    ChangeUpdateSlotCount,
+    ChangeSetOverride,
+    ChangeSetPlanDefault,
   ]);
 
   server.registerTool(
@@ -2231,15 +2560,20 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
 PRECONDITION: plan_id must exist (created by draft_content_plan and not yet executed/expired).
 
 AVAILABLE CHANGES:
-- replace_item: replace one full plan_item by slug.
+- replace_item: replace one full plan_item by slug. new_item can be Tier 3 (PlanItem) or Tier 1 (PlanItemLite); the normalizer maps either to canonical.
 - update_field: change date / publish_at_time_local / timezone / concept_shared / rationale on a plan_item.
-- add_item: append a new plan_item.
+- add_item: append a new plan_item. new_item accepts Tier 3 or Tier 1 shape.
 - remove_item: delete a plan_item by slug.
 - shift_dates: shift all dates by N days (positive = later, negative = earlier).
 - set_global: change use_brand_voice or auto_publish_schedule.
-- replace_sub_post / add_sub_post / remove_sub_post: surgical edits inside one plan_item.
+- replace_sub_post / add_sub_post / remove_sub_post: surgical edits inside one plan_item. new_sub_post accepts Tier 3 or Tier 1 shape.
 - split_subposts_by_network: separate a heterogeneous plan_item into multiple plan_items by network grouping with different publish_at_time_local. Use this when the user wants the photo and the reel on different times instead of the default single PostGroup.
-- convert_to_carousel: change a single_image sub_post into carousel_images by providing new_carousel_sources.
+- convert_to_carousel: change a sub_post into carousel_images. Pass new_carousel_sources (Tier 3, explicit per-slide sources) OR slot_count (Tier 1, server expands to N concept_only_image sources sharing the existing template / plan_defaults).
+
+TIER 1 ATOMIC OPS (v0.6.1+, recommended for fine-grained iteration on Tier 1 plans):
+- update_slot_count: shrink or grow a Tier 1 carousel_image sub_post to slot_count slides. Preserves the existing concept_only_image template (model, aspect, mode, hint / literal_prompt, refs) across all new slots. Throws if the sub_post is not a Tier 1 carousel.
+- set_override: replace (or clear with null) the override block of every concept_only_* source in a sub_post. Use to switch a Tier 1 sub_post between Path A (no override / concept_only) / Path B (art_direction_hint <= 300 chars) / Path C (literal_prompt) without re-emitting the whole sub_post. Throws if the sub_post has no Tier 1 sources.
+- set_plan_default: change one field of plan_defaults (image_model, video_model, video_duration_seconds, avatar_id, avatar_voice_id). Affects ONLY items added via subsequent add_item / add_sub_post / replace_* / convert_to_carousel(slot_count) calls. Existing concept_only_* sources keep their cost-locked values (use replace_sub_post or set_override to upgrade them individually).
 
 OUTPUT: same shape as draft_content_plan (plan_id stays the same; status reflects post-change validation; full blocker / warning lists; refreshed budget snapshot).
 
@@ -2272,18 +2606,71 @@ AFTER THIS: same flow as draft. Show the updated table, await explicit approval,
       }
 
       // Apply changes IN ORDER, mutating a working copy.
-      const working = {
+      const working: WorkingState = {
         plan_items: plan.plan_items.map((it) => ({ ...it, sub_posts: it.sub_posts.map((sp) => ({ ...sp })) })),
         use_brand_voice: plan.use_brand_voice,
         auto_publish_schedule: plan.auto_publish_schedule ?? undefined,
+        plan_defaults: plan.plan_defaults ? { ...plan.plan_defaults } : undefined,
       };
 
       const changeErrors: Array<{ change_index: number; reason: string }> = [];
 
+      // Normalize any Tier 1 (Lite) payloads inside the changes before
+      // applying them. This keeps applyChange operating on canonical PlanItem
+      // / SubPost shapes throughout. We use the persisted plan's plan_defaults
+      // so per-sub_post overrides take precedence and unspecified defaults
+      // fall back to plan-level locks (model, duration, avatar).
       for (let idx = 0; idx < changes.length; idx++) {
         const change = changes[idx]!;
         try {
-          applyChange(working, change);
+          if (
+            (change.action === "replace_item" || change.action === "add_item") &&
+            (change.new_item as { sub_posts?: Array<{ assets_strategy_lite?: unknown }> }).sub_posts?.some(
+              (sp) => sp.assets_strategy_lite !== undefined,
+            )
+          ) {
+            const norm = normalizeIncomingPlan(
+              [change.new_item as PlanItem | PlanItemLite],
+              plan.plan_defaults,
+            );
+            if (norm.errors.length > 0) {
+              throw new Error(
+                `Tier 1 normalization failed for new_item: ${norm.errors.map((e) => e.user_facing_message).join("; ")}`,
+              );
+            }
+            const normalized = norm.plan_items[0];
+            if (!normalized) throw new Error("normalization returned empty plan_items");
+            (change as { new_item: PlanItem }).new_item = normalized;
+          } else if (
+            (change.action === "replace_sub_post" || change.action === "add_sub_post") &&
+            (change.new_sub_post as { assets_strategy_lite?: unknown }).assets_strategy_lite !== undefined
+          ) {
+            // Wrap the sub_post in a throwaway plan_item shell so we can
+            // reuse normalizeIncomingPlan. The shell's fields are placeholders;
+            // only the sub_post conversion matters.
+            const shell: PlanItemLite = {
+              slug: change.slug,
+              date: "2026-01-01",
+              publish_at_time_local: "12:00",
+              timezone: "UTC",
+              concept_shared: "placeholder for sub_post normalization",
+              sub_posts: [change.new_sub_post as never],
+            };
+            const norm = normalizeIncomingPlan([shell], plan.plan_defaults);
+            if (norm.errors.length > 0) {
+              throw new Error(
+                `Tier 1 normalization failed for new_sub_post: ${norm.errors.map((e) => e.user_facing_message).join("; ")}`,
+              );
+            }
+            const normalizedSub = norm.plan_items[0]?.sub_posts[0];
+            if (!normalizedSub) throw new Error("normalization returned empty sub_post");
+            (change as { new_sub_post: SubPost }).new_sub_post = normalizedSub;
+          }
+          // Cast to internal Change type: after the normalization step
+          // above, any new_item / new_sub_post payload that was Lite has
+          // been replaced in-place with its canonical PlanItem / SubPost.
+          // The runtime invariant is enforced; the cast tells TypeScript.
+          applyChange(working, change as unknown as Change);
         } catch (e) {
           changeErrors.push({
             change_index: idx,
@@ -2300,6 +2687,7 @@ AFTER THIS: same flow as draft. Show the updated table, await explicit approval,
         ...(working.auto_publish_schedule
           ? { auto_publish_schedule: working.auto_publish_schedule }
           : {}),
+        ...(working.plan_defaults ? { plan_defaults: working.plan_defaults } : {}),
       };
       // Auto-resolve any near-duplicate AI image prompts the user may have
       // re-introduced via this update_content_plan call. Same silent
@@ -2578,6 +2966,131 @@ PRESENTING TO THE USER: do NOT dump all 5 rendered_markdown blocks one after ano
   );
 
   // ────────────────────────────────────────────────────────────────────────
+  // set_copy_drafts (Tier 1 / Strategy B: fill copy_draft on N sub_posts
+  // AFTER draft_content_plan so the initial draft stays compact).
+  // ────────────────────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "set_copy_drafts",
+    {
+      annotations: MUTATION_IDEMPOTENT,
+      title: "Set or overwrite copy_draft on N sub_posts of a plan",
+      description: `Fill or overwrite the publication-ready copy (copy_draft) on one or more sub_posts of a draft plan, in one tool call. Designed for the Tier 1 (concept-only) flow: keep draft_content_plan small by omitting copy_draft, then call this tool once per plan_item to attach the copies before presenting the plan to the user.
+
+USE WHEN:
+- You just ran draft_content_plan in Tier 1 (assets_strategy_lite) without copy_draft on any sub_post.
+- BEFORE surfacing the plan to the user, you want each sub_post to have its publication-ready copy already attached (so the summary the user sees is the real text, not a placeholder).
+
+RECOMMENDED CADENCE: one call per plan_item, covering all sub_posts of that day in the same call. For a 7-day plan with 3 networks per day, that is 7 calls of ~500-1500 tokens each. Much smaller than packing all copies into the initial draft.
+
+IDEMPOTENT: re-applying the same draft to the same (slug, sub_post_index) is a no-op. Re-applying a different draft overwrites the previous value. Safe to retry.
+
+OUTPUT: { plan_id, applied_count, applied (list of "slug#index" entries that got updated), missing (list of (slug, sub_post_index) pairs that did not match anything in the plan, so you can fix them and retry). next_step instructs whether to continue with more plan_items or surface the plan.
+
+NOT REQUIRED FOR EXECUTION: execute_content_plan still runs without this tool. If copy_draft is empty at execute time, the server falls back to Path B (generate_text from caption_concept + brand context). The fallback is functional but produces more generic copy than an agent-written draft, so calling this tool is strongly recommended for interactive flows.
+
+SCOPE LIMIT: this tool ONLY edits copy_draft. To edit other fields (concept_shared, asset_kind, slot_count, override, etc.) use update_content_plan with the matching change operation.`,
+      inputSchema: {
+        plan_id: z.string().min(1),
+        drafts: z
+          .array(
+            z.object({
+              slug: z.string().min(1),
+              sub_post_index: z.number().int().nonnegative(),
+              copy_draft: z.string().min(1).max(3000),
+            }),
+          )
+          .min(1)
+          .max(60)
+          .describe(
+            "List of (slug, sub_post_index, copy_draft) tuples. Up to 60 entries per call (enough for a full 7-day plan in one shot, but the recommended cadence is one call per plan_item).",
+          ),
+      },
+    },
+    async ({ plan_id, drafts }) => {
+      const plan = getPlan(plan_id);
+      if (!plan) {
+        return toolError({
+          reason: "plan_id_not_found",
+          user_message:
+            "No encuentro ese plan. Puede haber expirado (2 hs en memoria) o nunca existió. Reconstruí el plan con draft_content_plan y reintentá.",
+          blocking: true,
+        });
+      }
+      if (plan.status === "executed") {
+        return toolError({
+          reason: "plan_already_executed",
+          user_message:
+            "Este plan ya fue ejecutado, no puedo modificar las copies. Si querés editar los posts publicados, hacelo directo desde el feed de Followr o creá un plan nuevo.",
+          blocking: true,
+        });
+      }
+
+      const applied: string[] = [];
+      const missing: Array<{ slug: string; sub_post_index: number; reason: string }> = [];
+
+      for (const d of drafts) {
+        const item = plan.plan_items.find((i) => i.slug === d.slug);
+        if (!item) {
+          missing.push({
+            slug: d.slug,
+            sub_post_index: d.sub_post_index,
+            reason: "plan_item_not_found",
+          });
+          continue;
+        }
+        const sp = item.sub_posts[d.sub_post_index];
+        if (!sp) {
+          missing.push({
+            slug: d.slug,
+            sub_post_index: d.sub_post_index,
+            reason: `sub_post_index out of range (this plan_item has ${item.sub_posts.length} sub_posts)`,
+          });
+          continue;
+        }
+        sp.copy_draft = d.copy_draft;
+        applied.push(`${d.slug}#${d.sub_post_index}`);
+      }
+
+      // Snapshot how many sub_posts in the plan still have an empty copy_draft
+      // after this call, so the agent knows whether to continue with more
+      // plan_items or move on to presenting the plan.
+      const pendingCount = plan.plan_items.reduce(
+        (acc, it) =>
+          acc + it.sub_posts.filter((sp) => !sp.copy_draft || sp.copy_draft.trim().length === 0).length,
+        0,
+      );
+
+      const nextStep =
+        missing.length > 0
+          ? "Some sub_posts not found. Verify slug + sub_post_index against the plan structure and retry the failed entries."
+          : pendingCount > 0
+            ? `Copies persisted (${applied.length} updated). ${pendingCount} sub_post(s) still without copy_draft across the plan; continue with the next plan_item(s) before surfacing the plan to the user.`
+            : "All sub_posts now have copy_draft. Ready to surface the plan to the user and ask for approval before execute_content_plan.";
+
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                plan_id,
+                applied_count: applied.length,
+                applied,
+                missing,
+                remaining_pending_copy_drafts: pendingCount,
+                next_step: nextStep,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    },
+  );
+
+  // ────────────────────────────────────────────────────────────────────────
   // execute_content_plan
   // ────────────────────────────────────────────────────────────────────────
 
@@ -2591,6 +3104,15 @@ PRESENTING TO THE USER: do NOT dump all 5 rendered_markdown blocks one after ano
 COPY RESOLUTION: each per-network Post's description is resolved as follows. Path A (preferred): use sp.copy_draft verbatim. Path B (fallback when copy_draft is empty): call Followr generate_chat with sp.caption_concept + brand context (company description, tones, audience) + per-network length and hashtag policy + the plan's language; persist the response as the description. Costs ai_text_budget words (very large budget by default). Path C (last resort when generation fails): persist sp.caption_concept verbatim. The chosen path is surfaced per sub_post in the response as copy_resolution_path: "copy_draft" | "generated" | "directive_fallback" so the agent can tell the user whether the copy was their own draft, server-generated, or the directive fallback.
 
 ASSET RESOLUTION: AssetSourceAiImage refs with the same shared_concept_key collapse to ONE generation inside a plan_item, regardless of prompt drift. Without shared_concept_key, dedupe falls back to exact (model, aspect_ratio, prompt) equality. Aspect_ratio is honored from the ref when set, otherwise from the company's ai_preferences.image_aspect_ratio.
+
+TIER 1 (concept_only_image / concept_only_video) RESOLUTION (v0.6.1+): for sub_posts drafted in Tier 1 (assets_strategy_lite), the executor routes per the spec's mode field:
+- mode=concept_only (Path A): server composes a brief from plan_item.concept_shared + sub_post.caption_concept + asset_layout + format hints, hands to Creative Studio (POST /api/companies/{id}/creative). Creative Studio enriches with the brand design system (1850 chars), style_key from the cached [visual_style:slug@date] marker, logo, brand colors, and renders via the model declared in the spec (locked at draft time from override.model OR plan_defaults.image_model OR nano_banana_2).
+- mode=explicit_brief (Path B): same as Path A but the spec's art_direction_hint (<=300 chars) is appended to the composed brief before Creative Studio enrichment.
+- mode=literal_prompt (Path C): server BYPASSES Creative Studio and routes the literal_prompt verbatim to /api/aiResults/image with the declared model. NO brand enrichment is applied. Used when the user gave pixel-level technical direction or picked a CS-incompatible model.
+
+TIER 1 AUTO-DEDUPE: two concept_only_image sources with identical kind+model+aspect+slot_index+slot_count+mode+hint-or-prompt+refs collapse into one generation via the structural fingerprint. This is the Tier 1 equivalent of shared_concept_key in Tier 3, but inferred from the structure (no explicit key required from the agent). Same plan_item, same shape -> one generation, one charge.
+
+TIER 1 COST LOCK: the model the executor passes to Creative Studio (or to /api/aiResults/image in Path C) is exactly the one resolved at draft time. No server-side auto-upgrades. The cost reported in summary_for_user is what the user actually pays.
 
 PRECONDITION: plan_id must exist in session memory (created by draft_content_plan, not yet executed, not expired). The agent MUST have surfaced the plan summary to the user and received EXPLICIT approval ("dale", "ejecutalo", "OK", etc) BEFORE calling this. The MCP requires confirm: true literal to proceed.
 
@@ -3054,7 +3576,7 @@ interface ResolvedAsset {
   ai_result_id: number | null;
 }
 
-interface AssetSourceRef {
+export interface AssetSourceRef {
   src: ImageSrc | VideoSrc;
   mode: "image" | "video";
   // For video sources, the aspect ratio is derived from network/product_type.
@@ -3158,7 +3680,7 @@ function videoAspectRatioForSubPostInItem(sp: SubPost, item: PlanItem): "9:16" |
  * be part of the fingerprint. For video that means model + aspect_ratio
  * + duration + reference_image_url + prompt.
  */
-function fingerprintAssetSource(ref: AssetSourceRef): string {
+export function fingerprintAssetSource(ref: AssetSourceRef): string {
   const { src, mode, aspect_ratio } = ref;
   if (src.type === "url") return `url:${src.url}`;
   if (src.type === "asset_id") return `id:${src.id}`;
@@ -3198,6 +3720,37 @@ function fingerprintAssetSource(ref: AssetSourceRef): string {
   }
   if (src.type === "ai_avatar_lipsync") return `lipsync:${src.avatar_id}|${src.script}`;
   if (src.type === "ai_avatar_video") return `avatar:${src.avatar_id}|${src.generate_backgrounds ?? false}|${src.scripts.join("||")}`;
+  if (src.type === "concept_only_image") {
+    // Tier 1 dedupe: two sub_posts of the same plan_item with identical kind
+    // / aspect / model / mode / hint-or-literal-prompt / refs collapse into
+    // one generation. This auto-replicates what shared_concept_key did in
+    // Tier 3, but inferred from structural equality (no key required from
+    // the agent). slot_index is part of the fingerprint so the slides of one
+    // carousel remain distinct, but slot_index N of the IG carousel matches
+    // slot_index N of the FB carousel when the rest is identical.
+    const model = src.model ?? "default";
+    const ratio = src.aspect_ratio ?? "default";
+    const refsKey = src.reference_image_urls?.join(",") ?? "";
+    const variant =
+      src.mode === "literal_prompt"
+        ? `lit:${src.literal_prompt ?? ""}`
+        : src.mode === "explicit_brief"
+          ? `hint:${src.art_direction_hint ?? ""}`
+          : "concept";
+    return `concept_img:${model}|${ratio}|${src.slot_index}/${src.slot_count}|${variant}|${refsKey}`;
+  }
+  if (src.type === "concept_only_video") {
+    const model = src.model ?? "default";
+    const ratio = src.aspect_ratio ?? "9:16";
+    const dur = src.duration_seconds ?? 8;
+    const variant =
+      src.mode === "literal_prompt"
+        ? `lit:${src.literal_prompt ?? ""}`
+        : src.mode === "explicit_brief"
+          ? `hint:${src.art_direction_hint ?? ""}`
+          : "concept";
+    return `concept_vid:${model}|${ratio}|${dur}|${variant}|${src.reference_image_url ?? ""}`;
+  }
   return JSON.stringify(src);
 }
 
@@ -3776,12 +4329,28 @@ function isImageRefRejectionError(message: string): boolean {
   );
 }
 
+/**
+ * Brief composition context: which plan_item + sub_post owns a given
+ * AssetSource. Required by the Tier 1 (concept_only_*) branches in
+ * resolveAssetSourceFresh so the server-side brief composer can read
+ * concept_shared + caption_concept. The map is populated by executePlanItem
+ * up front and threaded down through resolveOnce. When multiple sub_posts
+ * share a fingerprint (cross-network dedupe), the FIRST sub_post wins;
+ * by design the image is identical across consumers, so any caption_concept
+ * yields the same brief intent.
+ */
+export type BriefComposerContext = {
+  plan_item: PlanItem;
+  sub_post: SubPost;
+} | null;
+
 async function resolveAssetSourceFresh(
   client: FollowrClient,
   companyId: number,
   ref: AssetSourceRef,
   prefs: AiPreferences,
   brandContext: BrandContext,
+  briefContext: BriefComposerContext = null,
 ): Promise<ResolvedAsset> {
   const { src, mode, aspect_ratio } = ref;
   if (src.type === "asset_id") {
@@ -3838,7 +4407,7 @@ async function resolveAssetSourceFresh(
 
       try {
         const creative = await client.createCreative(companyId, {
-          content_type: "single",
+          content_type: "single_creative",
           style_key: styleKey,
           prompt: imgSrc.prompt,
           aspect_ratio: csAspectRatio,
@@ -4061,6 +4630,194 @@ async function resolveAssetSourceFresh(
       ai_result_id: final.id,
     };
   }
+  if (src.type === "concept_only_image") {
+    // Tier 1 image. Path A / Path B go through Creative Studio with a brief
+    // composed server-side. Path C bypasses CS and forwards the literal
+    // prompt to /api/aiResults/image verbatim.
+    //
+    // The brief composer takes plan_item.concept_shared + sub_post.caption_concept
+    // + asset_layout + (optional) art_direction_hint and produces a 200-500
+    // char brief that Creative Studio enriches with its 1850-char design
+    // system (palette, typography, anti-patterns, logo, style_key). The agent
+    // never wrote a prompt; the server composes it.
+    const csModel = src.model ?? "nano_banana_2";
+    const csCompatibleModels = new Set(["nano_banana_2", "nano_banana_pro"]);
+    const modelIsCsCompat = csCompatibleModels.has(csModel);
+    const standardRatio = (src.aspect_ratio ?? prefs.image_aspect_ratio ?? "1:1") as StandardAspectRatio;
+
+    if (src.mode === "literal_prompt") {
+      // Path C: bypass Creative Studio. Forward literal_prompt to legacy
+      // /api/aiResults/image with NO brand enrichment.
+      if (!src.literal_prompt) {
+        throw new Error(
+          `concept_only_image with mode=literal_prompt requires override.literal_prompt to be set.`,
+        );
+      }
+      const aiDriver = resolveDriver({ prefs, modality: "image", model: csModel });
+      const payload: Record<string, unknown> = {
+        q: src.literal_prompt,
+        company_id: companyId,
+        aspect_ratio: standardRatio,
+        model: csModel,
+        ...(aiDriver ? { driver: aiDriver } : {}),
+        ...(src.reference_image_urls && src.reference_image_urls.length > 0
+          ? src.reference_image_urls.length > 1
+            ? { image_urls: src.reference_image_urls }
+            : { image_url: src.reference_image_urls[0] }
+          : {}),
+      };
+      const aiResult = await client.generateImage(payload as Parameters<FollowrClient["generateImage"]>[0]);
+      const final = await client.waitForAiResult(aiResult.id, { timeoutMs: 5 * 60 * 1000 });
+      if (final.status !== "completed") {
+        throw new Error(
+          `concept_only_image (Path C) generation failed: status=${final.status}, message=${final.status_message ?? "no message"}.`,
+        );
+      }
+      const imageUrl =
+        (final as unknown as { image_url?: string; response?: string }).image_url ??
+        (final as unknown as { response?: string }).response;
+      if (!imageUrl || typeof imageUrl !== "string") {
+        throw new Error(`concept_only_image (Path C) completed without image URL (id=${final.id}).`);
+      }
+      const m = IMAGE_MODELS.find((x) => x.model_id === csModel);
+      const credits = m ? m.cost_per_image : 25;
+      const a = await uploadFromUrl(client, { companyId, url: imageUrl, type: "image" });
+      return {
+        asset_id: a.id,
+        asset_url: (a as Asset & { url?: string }).url ?? null,
+        credits_consumed: credits,
+        ai_result_id: final.id,
+      };
+    }
+
+    // Path A / Path B: route through Creative Studio. CS only supports
+    // nano_banana_* today; if the agent picked a different model in Tier 1
+    // we fail loudly so they fix the plan (this scenario is also surfaced
+    // as a validator warning at draft time).
+    if (!modelIsCsCompat) {
+      throw new Error(
+        `concept_only_image with model=${csModel} cannot route through Creative Studio (only nano_banana_2 / nano_banana_pro are CS-compatible). Move this item to Path C (override.literal_prompt) or change the model to nano_banana_2/pro.`,
+      );
+    }
+
+    // Need the plan_item + sub_post to compose the brief. They are threaded
+    // down by executePlanItem via the briefContext arg. When briefContext is
+    // null (legacy callers / tests) we fall back to a brief built from the
+    // spec alone, which is degraded but functional.
+    const brief = briefContext
+      ? composeImageBrief({
+          plan_item: briefContext.plan_item,
+          sub_post: briefContext.sub_post,
+          spec: src,
+        })
+      : composeImageBriefFromSpecOnly(src);
+
+    const company = await client.getCompany(companyId);
+    const cachedMarker = parseVisualStyleMarker(company.description ?? null);
+    const styleKey =
+      cachedMarker && isValidStyleSlug(cachedMarker.slug)
+        ? cachedMarker.slug
+        : AI_DECIDES_SLUG;
+    const csAspectRatio = toCreativeStudioAspectRatio(standardRatio);
+
+    const creative = await client.createCreative(companyId, {
+      content_type: "single_creative",
+      style_key: styleKey,
+      prompt: brief,
+      aspect_ratio: csAspectRatio,
+      slide_count: 1,
+      model: csModel,
+      brand_context: company.description ?? "",
+      include_brand_logo: true,
+      use_brand_colors: true,
+      image_urls:
+        src.reference_image_urls && src.reference_image_urls.length > 0
+          ? src.reference_image_urls.slice(0, 4)
+          : null,
+      carousel_format: null,
+    });
+    const final = await client.waitForCreative(creative.id, {
+      expectedSlides: 1,
+      intervalMs: 3000,
+      timeoutMs: 3 * 60_000,
+    });
+    const firstResult = final.ai_results?.[0];
+    const firstImage = firstResult?.images?.[0];
+    if (!firstImage?.url) {
+      throw new Error(
+        `concept_only_image (Path ${src.mode === "explicit_brief" ? "B" : "A"}) Creative ${creative.id} completed without an image url.`,
+      );
+    }
+    const asset = await uploadFromUrl(client, {
+      companyId,
+      url: firstImage.url,
+      type: "image",
+      name: `concept-${creative.id}-slot-${src.slot_index + 1}.jpg`,
+    });
+    const credits = csModel === "nano_banana_pro" ? 45 : 25;
+    return {
+      asset_id: asset.id,
+      asset_url: (asset as Asset & { url?: string }).url ?? firstImage.url,
+      credits_consumed: credits,
+      ai_result_id: firstResult?.id ?? null,
+    };
+  }
+  if (src.type === "concept_only_video") {
+    // Tier 1 video. Bypass Creative Studio (CS does not generate videos
+    // today) and route to client.generateAiVideoClip with a server-composed
+    // brief OR (Path C) the literal_prompt.
+    const promptText =
+      src.mode === "literal_prompt"
+        ? src.literal_prompt ?? ""
+        : briefContext
+          ? composeVideoBrief({
+              plan_item: briefContext.plan_item,
+              sub_post: briefContext.sub_post,
+              spec: src,
+            })
+          : composeVideoBriefFromSpecOnly(src);
+    if (!promptText) {
+      throw new Error(
+        `concept_only_video requires either composed brief (Path A/B) or override.literal_prompt (Path C).`,
+      );
+    }
+    const vidModel = src.model ?? "wan_2.2";
+    const aiDriver = resolveDriver({ prefs, modality: "video", model: vidModel });
+    const aiResult = await client.generateAiVideoClip({
+      type: "video",
+      q: promptText,
+      aspect_ratio: src.aspect_ratio ?? aspect_ratio ?? "9:16",
+      model: vidModel,
+      company_id: companyId,
+      ...(aiDriver ? { driver: aiDriver } : {}),
+      ...(src.reference_image_url ? { image_url: src.reference_image_url } : {}),
+    });
+    const final = await client.waitForAiResult(aiResult.id, {
+      timeoutMs: 20 * 60 * 1000,
+      intervalMs: 5000,
+    });
+    if (final.status !== "completed") {
+      throw new Error(
+        `concept_only_video generation failed (model=${vidModel}, id=${final.id}, status=${final.status}, message=${final.status_message ?? "no message"}).`,
+      );
+    }
+    const m = VIDEO_MODELS.find((x) => x.model_id === vidModel);
+    const duration = src.duration_seconds ?? m?.default_duration_seconds ?? 8;
+    const credits = (m?.cost_per_second ?? 400) * duration;
+    const videoUrl =
+      (final as unknown as { video_url?: string; response?: string }).video_url ??
+      (final as unknown as { response?: string }).response;
+    if (!videoUrl || typeof videoUrl !== "string") {
+      throw new Error(`concept_only_video completed without video URL (id=${final.id}).`);
+    }
+    const a = await uploadFromUrl(client, { companyId, url: videoUrl, type: "video" });
+    return {
+      asset_id: a.id,
+      asset_url: (a as Asset & { url?: string }).url ?? null,
+      credits_consumed: credits,
+      ai_result_id: final.id,
+    };
+  }
   if (src.type === "ai_avatar_lipsync" || src.type === "ai_avatar_video") {
     // execute_content_plan v1 does not run avatar tools end-to-end. The
     // agent has to materialize the avatar asset manually and then point
@@ -4103,6 +4860,7 @@ function shouldChainCarousel(sp: SubPost, refs: AssetSourceRef[]): boolean {
   for (const r of refs) {
     if (r.mode !== "image") continue;
     if (r.src.type === "ai_generate") aiImageCount += 1;
+    if (r.src.type === "concept_only_image") aiImageCount += 1;
   }
   return aiImageCount >= 2;
 }
@@ -4125,8 +4883,10 @@ async function resolveCarouselSourcesSequential(
   let previousUrl: string | null = null;
   for (let i = 0; i < refs.length; i += 1) {
     const ref = refs[i]!;
-    // Only AI-generated image slides receive the chain reference. Other
-    // types (asset_id, url) pass through with their original ref.
+    // AI-generated image slides (Tier 3 ai_generate or Tier 1 concept_only_image)
+    // receive the chain reference: previous slide's resolved URL feeds into
+    // the next slide's reference list so the model preserves visual
+    // continuity. Other types (asset_id, url) pass through unchanged.
     if (i > 0 && ref.src.type === "ai_generate" && ref.mode === "image" && previousUrl) {
       const imgSrc = ref.src as Extract<ImageSrc, { type: "ai_generate" }>;
       // Append previousUrl as an additional reference_image_urls entry.
@@ -4139,6 +4899,24 @@ async function resolveCarouselSourcesSequential(
         ],
       };
       const chainedRef: AssetSourceRef = { ...ref, src: chainedImgSrc };
+      const resolved = await resolveOnce(chainedRef);
+      results.push(resolved);
+      previousUrl = resolved.asset_url ?? previousUrl;
+    } else if (
+      i > 0 &&
+      ref.src.type === "concept_only_image" &&
+      ref.mode === "image" &&
+      previousUrl
+    ) {
+      const conceptSrc = ref.src;
+      const chainedConcept: typeof conceptSrc = {
+        ...conceptSrc,
+        reference_image_urls: [
+          ...(conceptSrc.reference_image_urls ?? []),
+          previousUrl,
+        ],
+      };
+      const chainedRef: AssetSourceRef = { ...ref, src: chainedConcept };
       const resolved = await resolveOnce(chainedRef);
       results.push(resolved);
       previousUrl = resolved.asset_url ?? previousUrl;
@@ -4203,11 +4981,29 @@ async function executePlanItem(
   // against the VCP 2026-05-21 session where the lunes reel was billed
   // 3×400 cr instead of 1×400.
   const resolveCache = new Map<string, Promise<ResolvedAsset>>();
+
+  // Tier 1 brief composer context: map fingerprint → first (plan_item,
+  // sub_post) that owns a given AssetSource. When concept_only_image /
+  // concept_only_video sources are resolved, the executor reads from this
+  // map to compose the brief that goes to Creative Studio (Paths A and B).
+  // First sub_post wins by design: shared assets are conceptually identical
+  // across consumers, so any caption_concept produces the right brief.
+  const briefContextByFingerprint = new Map<string, BriefComposerContext>();
+  for (const sp of item.sub_posts) {
+    for (const ref of subPostAssetRefs(sp, item)) {
+      const fp = fingerprintAssetSource(ref);
+      if (!briefContextByFingerprint.has(fp)) {
+        briefContextByFingerprint.set(fp, { plan_item: item, sub_post: sp });
+      }
+    }
+  }
+
   const resolveOnce = (ref: AssetSourceRef): Promise<ResolvedAsset> => {
     const fp = fingerprintAssetSource(ref);
     let p = resolveCache.get(fp);
     if (!p) {
-      p = resolveAssetSourceFresh(client, companyId, ref, prefs, brandContext);
+      const briefCtx = briefContextByFingerprint.get(fp) ?? null;
+      p = resolveAssetSourceFresh(client, companyId, ref, prefs, brandContext, briefCtx);
       resolveCache.set(fp, p);
     }
     return p;
@@ -4631,7 +5427,7 @@ function validateLayoutShape(
   return null;
 }
 
-interface SubPostCost {
+export interface SubPostCost {
   image_ai_cost: number;
   image_ai_count: number;
   video_ai_cost: number;
@@ -4649,7 +5445,7 @@ interface SubPostCost {
  * 1.200 cr (3 separate generations); now both draft AND execute report the
  * deduped cost ("400 cr"), which is what actually gets charged.
  */
-function estimatePlanItemCostDeduped(item: PlanItem): SubPostCost {
+export function estimatePlanItemCostDeduped(item: PlanItem): SubPostCost {
   const out: SubPostCost = {
     image_ai_cost: 0,
     image_ai_count: 0,
@@ -4697,6 +5493,29 @@ function estimatePlanItemCostDeduped(item: PlanItem): SubPostCost {
         const backgroundCost = src.generate_backgrounds ? 60 * sceneCount : 0;
         out.video_ai_count += 1;
         out.video_ai_cost += lipsyncCost + backgroundCost;
+      } else if (src.type === "concept_only_image") {
+        // Tier 1 image. Cost = model.cost_per_image (locked via plan_defaults
+        // OR per-sub_post override.model). The fingerprint accounts for the
+        // slot_index so each carousel slot is counted once across all
+        // networks that share that slot (auto cross-network dedupe).
+        const m =
+          IMAGE_MODELS.find((x) => x.model_id === (src.model ?? "nano_banana_2")) ??
+          IMAGE_MODELS[0];
+        out.image_ai_count += 1;
+        out.image_ai_cost += m?.cost_per_image ?? 25;
+      } else if (src.type === "concept_only_video") {
+        // Tier 1 video. Cost = model.cost_per_second * duration_seconds. When
+        // model is unknown we fall back to the conservative ceiling (Veo 3
+        // Fast 8s) so budget gates are not silently bypassed.
+        const m = VIDEO_MODELS.find((x) => x.model_id === src.model);
+        const duration = src.duration_seconds ?? m?.default_duration_seconds ?? 8;
+        if (m) {
+          out.video_ai_count += 1;
+          out.video_ai_cost += m.cost_per_second * duration;
+        } else {
+          out.video_ai_count += 1;
+          out.video_ai_cost += 400 * 8;
+        }
       }
     }
   }
@@ -5187,6 +6006,58 @@ function describeAssetSource(
       audio_status: "synthetic_voice",
     };
   }
+  if (src.type === "concept_only_image") {
+    // Tier 1: prompt does not exist yet. The user-facing description tells
+    // them the asset shape and where the brief comes from (concept_shared +
+    // caption_concept), so they understand what they are approving without
+    // a literal prompt to read.
+    const modelId = src.model ?? "nano_banana_2";
+    const m = IMAGE_MODELS.find((x) => x.model_id === modelId);
+    const modeNote =
+      src.mode === "literal_prompt"
+        ? `prompt literal: "${(src.literal_prompt ?? "").slice(0, 80)}${(src.literal_prompt ?? "").length > 80 ? "..." : ""}"`
+        : src.mode === "explicit_brief"
+          ? `con dirección extra: "${src.art_direction_hint ?? ""}"`
+          : "brief inferido del concepto del día + caption_concept";
+    const slotNote = src.slot_count > 1 ? ` (slide ${src.slot_index + 1} de ${src.slot_count})` : "";
+    const desc: AssetPreview = {
+      kind: "ai_image",
+      description: `Imagen generada con IA${slotNote}, ${modeNote}.`,
+      model: modelId,
+      cost_credits: m?.cost_per_image ?? 25,
+    };
+    if (src.reference_image_urls && src.reference_image_urls.length > 0 && src.reference_image_urls[0]) {
+      desc.reference_image_url = src.reference_image_urls[0];
+    }
+    return desc;
+  }
+  if (src.type === "concept_only_video") {
+    const modelId = src.model ?? "wan_2.2";
+    const m = VIDEO_MODELS.find((x) => x.model_id === modelId);
+    const dur = src.duration_seconds ?? m?.default_duration_seconds ?? 8;
+    const audioCap = m?.audio_capability ?? "silent_only";
+    const modeNote =
+      src.mode === "literal_prompt"
+        ? `prompt literal: "${(src.literal_prompt ?? "").slice(0, 80)}${(src.literal_prompt ?? "").length > 80 ? "..." : ""}"`
+        : src.mode === "explicit_brief"
+          ? `con dirección extra: "${src.art_direction_hint ?? ""}"`
+          : "brief inferido del concepto del día + caption_concept";
+    const desc: AssetPreview = {
+      kind: "ai_video",
+      description: `Video generado con IA, ${modeNote}.`,
+      model: modelId,
+      duration_seconds: dur,
+      cost_credits: m ? m.cost_per_second * dur : 400 * dur,
+      video_kind_user_facing:
+        audioCap === "with_native_audio" ? "ai_clip_with_audio" : "ai_clip_silent",
+      audio_status:
+        audioCap === "with_native_audio" ? "with_native_audio" : "silent_video",
+    };
+    if (src.reference_image_url) {
+      desc.reference_image_url = src.reference_image_url;
+    }
+    return desc;
+  }
   return { kind: "ai_image", description: "(asset desconocido)", cost_credits: 0 };
 }
 
@@ -5591,6 +6462,7 @@ function displayAssetStrategy(strategy: AssetsStrategy, layout: AssetLayout): st
     if (strategy.image_source.type === "url") return "Foto del sitio";
     if (strategy.image_source.type === "asset_id") return "Foto ya subida";
     if (strategy.image_source.type === "ai_generate") return "Imagen con IA";
+    if (strategy.image_source.type === "concept_only_image") return "Imagen con IA";
   }
   if (layout === "carousel_images" && strategy.carousel_sources) {
     return `${strategy.carousel_sources.length} imágenes (carrusel)`;
@@ -5603,6 +6475,10 @@ function displayAssetStrategy(strategy: AssetsStrategy, layout: AssetLayout): st
       const model = VIDEO_MODELS.find((m) => m.model_id === vs.model);
       const audioBit = model?.audio_capability === "with_native_audio" ? " con audio" : " sin audio";
       return model ? `Video con IA (${model.display_name}${audioBit})` : "Video con IA";
+    }
+    if (vs.type === "concept_only_video") {
+      const model = vs.model ? VIDEO_MODELS.find((m) => m.model_id === vs.model) : undefined;
+      return model ? `Video con IA (${model.display_name})` : "Video con IA";
     }
     if (vs.type === "ai_avatar_lipsync") return "Avatar habla a cámara";
     if (vs.type === "ai_avatar_video") return `Avatar narra ${vs.scripts.length} escena${vs.scripts.length === 1 ? "" : "s"}`;
@@ -6694,6 +7570,7 @@ type WorkingState = {
   plan_items: Array<PlanItem & { sub_posts: SubPost[] }>;
   use_brand_voice: boolean;
   auto_publish_schedule?: { timezone: string; time_per_day: string };
+  plan_defaults?: PlanDefaults;
 };
 
 type Change =
@@ -6720,7 +7597,30 @@ type Change =
       action: "convert_to_carousel";
       slug: string;
       sub_post_index: number;
-      new_carousel_sources: NonNullable<AssetsStrategy["carousel_sources"]>;
+      new_carousel_sources?: NonNullable<AssetsStrategy["carousel_sources"]>;
+      slot_count?: number;
+    }
+  | {
+      action: "update_slot_count";
+      slug: string;
+      sub_post_index: number;
+      slot_count: number;
+    }
+  | {
+      action: "set_override";
+      slug: string;
+      sub_post_index: number;
+      override: OverrideLite | null;
+    }
+  | {
+      action: "set_plan_default";
+      field:
+        | "image_model"
+        | "video_model"
+        | "video_duration_seconds"
+        | "avatar_id"
+        | "avatar_voice_id";
+      value: string | number | null;
     };
 
 function applyChange(state: WorkingState, change: Change): void {
@@ -6842,9 +7742,226 @@ function applyChange(state: WorkingState, change: Change): void {
       const sp = it.sub_posts[change.sub_post_index];
       if (!sp) throw new Error(`convert_to_carousel: sub_post_index out of range.`);
       sp.asset_layout = "carousel_images";
-      sp.assets_strategy = {
-        carousel_sources: [...change.new_carousel_sources],
+      if (change.new_carousel_sources && change.new_carousel_sources.length > 0) {
+        // Tier 3 path: explicit sources provided.
+        sp.assets_strategy = {
+          carousel_sources: [...change.new_carousel_sources],
+        };
+      } else if (typeof change.slot_count === "number") {
+        // Tier 1 path: expand slot_count to N concept_only_image sources
+        // inheriting the existing sub_post's first concept_only_image
+        // template (model, aspect, override) when one exists; otherwise
+        // build from plan_defaults.
+        const existing =
+          (sp.assets_strategy.image_source?.type === "concept_only_image"
+            ? sp.assets_strategy.image_source
+            : null) ??
+          (sp.assets_strategy.carousel_sources?.find(
+            (s) => s.type === "concept_only_image",
+          ) as AssetSourceConceptImage | undefined) ??
+          null;
+        const baseModel =
+          existing?.model ?? state.plan_defaults?.image_model ?? "nano_banana_2";
+        const baseAspect = existing?.aspect_ratio ?? "1:1";
+        const baseMode = existing?.mode ?? "concept_only";
+        const newSources: AssetSourceConceptImage[] = [];
+        for (let i = 0; i < change.slot_count; i++) {
+          const src: AssetSourceConceptImage = {
+            type: "concept_only_image",
+            mode: baseMode,
+            slot_index: i,
+            slot_count: change.slot_count,
+            model: baseModel,
+            aspect_ratio: baseAspect,
+          };
+          if (existing?.art_direction_hint) src.art_direction_hint = existing.art_direction_hint;
+          if (existing?.literal_prompt) src.literal_prompt = existing.literal_prompt;
+          if (existing?.reference_image_urls && existing.reference_image_urls.length > 0) {
+            src.reference_image_urls = existing.reference_image_urls;
+          }
+          newSources.push(src);
+        }
+        sp.assets_strategy = { carousel_sources: newSources };
+      } else {
+        throw new Error(
+          `convert_to_carousel: pass either new_carousel_sources (Tier 3) or slot_count (Tier 1).`,
+        );
+      }
+      return;
+    }
+    case "update_slot_count": {
+      // Re-shape an existing carousel_image sub_post to a new slot count,
+      // preserving the concept_only_image template (model, aspect, mode,
+      // hint / literal_prompt, refs) across all new slots. Throws if the
+      // sub_post is not a carousel of concept_only_image sources.
+      const it = state.plan_items.find((x) => x.slug === change.slug);
+      if (!it) throw new Error(`update_slot_count: slug ${change.slug} not found.`);
+      const sp = it.sub_posts[change.sub_post_index];
+      if (!sp) throw new Error(`update_slot_count: sub_post_index out of range.`);
+      if (sp.asset_layout !== "carousel_images" || !sp.assets_strategy.carousel_sources) {
+        throw new Error(
+          `update_slot_count: sub_post is not a carousel_images. Use convert_to_carousel first.`,
+        );
+      }
+      const template = sp.assets_strategy.carousel_sources.find(
+        (s) => s.type === "concept_only_image",
+      ) as AssetSourceConceptImage | undefined;
+      if (!template) {
+        throw new Error(
+          `update_slot_count: carousel is not Tier 1 (no concept_only_image sources to template from). Use replace_sub_post or convert_to_carousel with explicit new_carousel_sources for Tier 3 carousels.`,
+        );
+      }
+      const newSources: AssetSourceConceptImage[] = [];
+      for (let i = 0; i < change.slot_count; i++) {
+        const src: AssetSourceConceptImage = {
+          type: "concept_only_image",
+          mode: template.mode,
+          slot_index: i,
+          slot_count: change.slot_count,
+          model: template.model,
+          aspect_ratio: template.aspect_ratio,
+        };
+        if (template.art_direction_hint) src.art_direction_hint = template.art_direction_hint;
+        if (template.literal_prompt) src.literal_prompt = template.literal_prompt;
+        if (template.reference_image_urls && template.reference_image_urls.length > 0) {
+          src.reference_image_urls = template.reference_image_urls;
+        }
+        newSources.push(src);
+      }
+      sp.assets_strategy.carousel_sources = newSources;
+      return;
+    }
+    case "set_override": {
+      // Apply the override block to every concept_only_* source in the
+      // sub_post. For Tier 3 sources (ai_generate, url, asset_id, avatar_*)
+      // this op is a no-op with a clear error so the agent does not
+      // silently fail to apply user intent.
+      const it = state.plan_items.find((x) => x.slug === change.slug);
+      if (!it) throw new Error(`set_override: slug ${change.slug} not found.`);
+      const sp = it.sub_posts[change.sub_post_index];
+      if (!sp) throw new Error(`set_override: sub_post_index out of range.`);
+
+      const ov = change.override;
+      // Enforce mutual exclusion at the apply layer too (zod refine already
+      // catches it on shape, but applyChange is reused by callers that
+      // might construct changes programmatically).
+      if (ov && ov.art_direction_hint && ov.literal_prompt) {
+        throw new Error(
+          `set_override: art_direction_hint and literal_prompt are mutually exclusive.`,
+        );
+      }
+
+      const applyToConceptImage = (src: AssetSourceConceptImage): AssetSourceConceptImage => {
+        const next: AssetSourceConceptImage = { ...src };
+        if (ov === null) {
+          // Clear: reset to concept_only with no hint / no literal.
+          next.mode = "concept_only";
+          delete next.art_direction_hint;
+          delete next.literal_prompt;
+          delete next.reference_image_urls;
+          return next;
+        }
+        if (ov.model !== undefined) next.model = ov.model;
+        if (ov.aspect_ratio !== undefined) next.aspect_ratio = ov.aspect_ratio;
+        if (ov.literal_prompt !== undefined) {
+          next.mode = "literal_prompt";
+          next.literal_prompt = ov.literal_prompt;
+          delete next.art_direction_hint;
+        } else if (ov.art_direction_hint !== undefined) {
+          next.mode = "explicit_brief";
+          next.art_direction_hint = ov.art_direction_hint;
+          delete next.literal_prompt;
+        } else {
+          next.mode = "concept_only";
+          delete next.art_direction_hint;
+          delete next.literal_prompt;
+        }
+        if (ov.reference_image_urls !== undefined) {
+          if (ov.reference_image_urls.length > 0) next.reference_image_urls = ov.reference_image_urls;
+          else delete next.reference_image_urls;
+        }
+        return next;
       };
+
+      const applyToConceptVideo = (src: AssetSourceConceptVideo): AssetSourceConceptVideo => {
+        const next: AssetSourceConceptVideo = { ...src };
+        if (ov === null) {
+          next.mode = "concept_only";
+          delete next.art_direction_hint;
+          delete next.literal_prompt;
+          delete next.reference_image_url;
+          return next;
+        }
+        if (ov.model !== undefined) next.model = ov.model;
+        if (ov.aspect_ratio !== undefined) next.aspect_ratio = ov.aspect_ratio;
+        if (ov.duration_seconds !== undefined) next.duration_seconds = ov.duration_seconds;
+        if (ov.literal_prompt !== undefined) {
+          next.mode = "literal_prompt";
+          next.literal_prompt = ov.literal_prompt;
+          delete next.art_direction_hint;
+        } else if (ov.art_direction_hint !== undefined) {
+          next.mode = "explicit_brief";
+          next.art_direction_hint = ov.art_direction_hint;
+          delete next.literal_prompt;
+        } else {
+          next.mode = "concept_only";
+          delete next.art_direction_hint;
+          delete next.literal_prompt;
+        }
+        if (ov.reference_image_urls !== undefined && ov.reference_image_urls.length > 0) {
+          next.reference_image_url = ov.reference_image_urls[0];
+        } else if (ov.reference_image_urls !== undefined) {
+          delete next.reference_image_url;
+        }
+        return next;
+      };
+
+      let touched = 0;
+      if (sp.assets_strategy.image_source?.type === "concept_only_image") {
+        sp.assets_strategy.image_source = applyToConceptImage(sp.assets_strategy.image_source);
+        touched += 1;
+      }
+      if (sp.assets_strategy.carousel_sources) {
+        sp.assets_strategy.carousel_sources = sp.assets_strategy.carousel_sources.map((s) =>
+          s.type === "concept_only_image" ? applyToConceptImage(s) : s,
+        );
+        touched += sp.assets_strategy.carousel_sources.filter(
+          (s) => s.type === "concept_only_image",
+        ).length;
+      }
+      if (sp.assets_strategy.video_source?.type === "concept_only_video") {
+        sp.assets_strategy.video_source = applyToConceptVideo(sp.assets_strategy.video_source);
+        touched += 1;
+      }
+      if (touched === 0) {
+        throw new Error(
+          `set_override: this sub_post has no Tier 1 (concept_only_*) sources. Use replace_sub_post if you want to convert a Tier 3 sub_post into Tier 1 with an override.`,
+        );
+      }
+      return;
+    }
+    case "set_plan_default": {
+      // Only affects future add_item / add_sub_post / replace_* / convert_to_carousel(slot_count)
+      // operations. Existing concept_only_* sources keep their cost-locked values.
+      if (!state.plan_defaults) state.plan_defaults = {};
+      const v = change.value;
+      switch (change.field) {
+        case "image_model":
+        case "video_model":
+        case "avatar_voice_id": {
+          if (v === null) delete state.plan_defaults[change.field];
+          else if (typeof v === "string") state.plan_defaults[change.field] = v;
+          else throw new Error(`set_plan_default ${change.field} expects string or null.`);
+          break;
+        }
+        case "video_duration_seconds":
+        case "avatar_id": {
+          if (v === null) delete state.plan_defaults[change.field];
+          else if (typeof v === "number") state.plan_defaults[change.field] = v;
+          else throw new Error(`set_plan_default ${change.field} expects number or null.`);
+          break;
+        }
+      }
       return;
     }
   }

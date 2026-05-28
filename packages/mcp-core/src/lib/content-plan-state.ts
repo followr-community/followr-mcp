@@ -103,6 +103,62 @@ export type AssetSourceAvatarVideo = {
   generate_backgrounds?: boolean;
 };
 
+// ── Tier 1 (concept-only) asset sources ─────────────────────────────────────
+//
+// These are produced by the normalization step when a sub_post arrives in the
+// Lite shape (assets_strategy_lite). The LLM declares structure (asset_kind +
+// slot_count + format + optional override) and the normalizer expands that to
+// N entries of AssetSourceConceptImage or one AssetSourceConceptVideo inside
+// AssetsStrategy.
+//
+// Downstream consumers (validator, fingerprinting, cost, preview, executor)
+// branch on the discriminator `type` and handle the concept_only variants in
+// addition to the existing url / asset_id / ai_generate / ai_avatar_* ones.
+//
+// Three sub-modes via `mode`:
+//   - concept_only:    server composes the brief at execute time from
+//                      plan_item.concept_shared + sub_post.caption_concept +
+//                      asset_layout + format hints. Routes to Creative Studio.
+//                      No prompt provided by the agent.
+//   - explicit_brief:  the agent passes art_direction_hint (<= 300 chars)
+//                      that the server appends to the auto-composed brief.
+//                      Still routes to Creative Studio (brand enrichment
+//                      applies).
+//   - literal_prompt:  the agent passes literal_prompt (<= 2000 chars) that
+//                      the server forwards verbatim to /api/aiResults/image
+//                      (bypasses Creative Studio entirely). Use when the
+//                      user gave pixel-level direction or pasted a
+//                      Midjourney-style prompt.
+//
+// Added 2026-05-27 as part of v0.6.1 Tier 1 (concept-only mode).
+export type AssetSourceConceptImage = {
+  type: "concept_only_image";
+  mode: "concept_only" | "explicit_brief" | "literal_prompt";
+  /** Stable per-plan-item index so two carousels with same kind+count auto-share. */
+  slot_index: number;
+  /** Total slot count for the parent carousel (1 for single_image). */
+  slot_count: number;
+  model?: string;
+  aspect_ratio?: "1:1" | "4:3" | "16:9" | "3:4" | "9:16";
+  /** Required when mode === "explicit_brief". Capped at 300 chars at the schema layer. */
+  art_direction_hint?: string;
+  /** Required when mode === "literal_prompt". Capped at 2000 chars. */
+  literal_prompt?: string;
+  /** Image-to-image references. Applies in both Creative Studio and AI Images paths. */
+  reference_image_urls?: string[];
+};
+
+export type AssetSourceConceptVideo = {
+  type: "concept_only_video";
+  mode: "concept_only" | "explicit_brief" | "literal_prompt";
+  model?: string;
+  aspect_ratio?: "1:1" | "4:3" | "16:9" | "3:4" | "9:16";
+  duration_seconds?: number;
+  art_direction_hint?: string;
+  literal_prompt?: string;
+  reference_image_url?: string;
+};
+
 export type AssetLayout =
   | "single_image"
   | "carousel_images"
@@ -124,14 +180,109 @@ export type SocialNetwork =
   | "bluesky";
 
 export interface AssetsStrategy {
-  image_source?: AssetSourceUrl | AssetSourceAssetId | AssetSourceAiImage;
-  carousel_sources?: Array<AssetSourceUrl | AssetSourceAssetId | AssetSourceAiImage>;
+  image_source?:
+    | AssetSourceUrl
+    | AssetSourceAssetId
+    | AssetSourceAiImage
+    | AssetSourceConceptImage;
+  carousel_sources?: Array<
+    | AssetSourceUrl
+    | AssetSourceAssetId
+    | AssetSourceAiImage
+    | AssetSourceConceptImage
+  >;
   video_source?:
     | AssetSourceUrl
     | AssetSourceAssetId
     | AssetSourceAiVideo
     | AssetSourceAvatarLipsync
-    | AssetSourceAvatarVideo;
+    | AssetSourceAvatarVideo
+    | AssetSourceConceptVideo;
+}
+
+/**
+ * Plan-level defaults block. Tier 1 plans pass this once at draft time and
+ * every sub_post that does not override values inherits them. Mirrors the
+ * fields the user can lock at the plan level (model, video duration, avatar
+ * choice). When undefined or partially undefined, hardcoded defaults apply
+ * (nano_banana_2 / wan_2.2 / 8s / company.default_voice).
+ */
+export interface PlanDefaults {
+  image_model?: string;
+  video_model?: string;
+  video_duration_seconds?: number;
+  avatar_id?: number;
+  avatar_voice_id?: string;
+}
+
+// ── Tier 1 input shapes (pre-normalization) ─────────────────────────────────
+//
+// These mirror the zod schemas declared in tools/content-plan.ts. They are
+// what the agent emits when drafting in Tier 1 / concept-only mode. The
+// normalizer maps them to the canonical PlanItem shape with concept_only_*
+// AssetSource entries inside AssetsStrategy.
+
+export type AssetKindLite =
+  | "image"
+  | "image_url"
+  | "image_asset_id"
+  | "carousel_image"
+  | "video"
+  | "video_url"
+  | "video_asset_id"
+  | "avatar_lipsync"
+  | "avatar_multi_scene";
+
+export interface OverrideLite {
+  model?: string;
+  aspect_ratio?: "1:1" | "4:3" | "16:9" | "3:4" | "9:16";
+  duration_seconds?: number;
+  art_direction_hint?: string;
+  literal_prompt?: string;
+  reference_image_urls?: string[];
+  avatar_id_override?: number;
+  avatar_voice_id_override?: string;
+}
+
+export interface AssetsStrategyLite {
+  asset_kind: AssetKindLite;
+  slot_count?: number;
+  scene_count?: number;
+  avatar_scripts?: string[];
+  source_url?: string;
+  source_asset_id?: number;
+  override?: OverrideLite;
+}
+
+export interface SubPostLite {
+  social_network: SocialNetwork;
+  product_type: ProductType;
+  asset_layout: AssetLayout;
+  assets_strategy_lite: AssetsStrategyLite;
+  caption_concept: string;
+  copy_draft?: string;
+  tags?: string[];
+}
+
+export interface PlanItemLite {
+  slug: string;
+  date: string;
+  publish_at_time_local: string;
+  timezone: string;
+  concept_shared: string;
+  rationale?: string;
+  paired_with?: string[];
+  sub_posts: SubPostLite[];
+}
+
+/** Discriminator helper: a sub_post is Lite when assets_strategy_lite is present. */
+export function isSubPostLite(sp: SubPost | SubPostLite): sp is SubPostLite {
+  return (sp as { assets_strategy_lite?: unknown }).assets_strategy_lite !== undefined;
+}
+
+/** Discriminator helper: a plan_item is Lite when ANY sub_post is Lite. */
+export function isPlanItemLite(item: PlanItem | PlanItemLite): item is PlanItemLite {
+  return item.sub_posts.some((sp) => isSubPostLite(sp));
 }
 
 /**
@@ -242,6 +393,13 @@ export interface ContentPlan {
   created_at_ms: number;
   expires_at_ms: number;
   time_window: { start: string; end: string };
+  /**
+   * Plan-level defaults for Tier 1 (concept-only) sub_posts. When a sub_post's
+   * normalized AssetSourceConceptImage / Video has no model / aspect_ratio /
+   * duration override, the executor reads from here. Honored as a cost lock:
+   * the model used at execute time equals the model declared in the plan.
+   */
+  plan_defaults?: PlanDefaults;
   user_answers: {
     posts_per_day?: number;
     networks_intent?: SocialNetwork[];

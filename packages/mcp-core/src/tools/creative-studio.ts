@@ -300,10 +300,10 @@ REGISTERS the asset in the company's Media Library. The user can then reference 
             "Visual style slug from list_visual_styles. If omitted, the backend chooses ('ai_decides' equivalent). Recommended: surface options via list_visual_styles or propose_visual_style_options first and let the user pick.",
           ),
         content_type: z
-          .enum(["single", "carousel", "auto"])
-          .default("single")
+          .enum(["single_creative", "carousel"])
+          .default("single_creative")
           .describe(
-            "single = 1 image. carousel = multi-slide with narrative continuity. auto = backend decides based on the prompt. Default single.",
+            "single_creative = 1 image. carousel = multi-slide with narrative continuity. Backend enum confirmed empirically 2026-05-27 by intercepting the Followr UI: the value 'single' (documented earlier) is REJECTED with 'The selected content type is invalid.'; the correct value is 'single_creative'. 'auto' is also not a valid backend value; the UI label 'AI Decides' translates to one of the two concrete values internally.",
           ),
         slide_count: z
           .number()
@@ -376,10 +376,10 @@ REGISTERS the asset in the company's Media Library. The user can then reference 
     }) => {
       try {
         // ── Validation ──────────────────────────────────────────────
-        if (content_type === "single" && slide_count !== 1) {
+        if (content_type === "single_creative" && slide_count !== 1) {
           return toolError({
             reason: "invalid_slide_count",
-            user_message: `content_type='single' requires slide_count=1, got ${slide_count}. Pasalo a 1, o cambia content_type a 'carousel' si querés multi-slide.`,
+            user_message: `content_type='single_creative' requires slide_count=1, got ${slide_count}. Pasalo a 1, o cambia content_type a 'carousel' si querés multi-slide.`,
             blocking: true,
           });
         }

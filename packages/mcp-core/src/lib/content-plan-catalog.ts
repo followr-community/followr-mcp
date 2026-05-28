@@ -931,4 +931,51 @@ export const PLANNING_STRATEGY = {
     "  - During setup_brand_visual_identity the wizard offers to clear ai_image_styles (defensive: cosmetic only, but avoids user confusion seeing 'Hyperrealism selected' in Followr UI while the brand identity says otherwise).\n" +
     "  - Unverified for premium image models (gpt_image_2, imagen4_*, ideogram_v3, flux_pro_1.1). If a future test shows premium models DO consume the field, this principle needs updating. Tracked in TODO_V2.md.\n\n" +
     "DO NOT spend agent context explaining ai_image_styles to the user. If they ask, say 'es un campo de Followr UI sin efecto en la generación con el modelo default; no afecta tu Brand Visual Identity'.",
+
+  tier_1_concept_only_mode:
+    "TIER 1 (concept-only) is the RECOMMENDED draft mode in v0.6.1+. The agent emits assets_strategy_lite (asset_kind + slot_count + optional override) instead of the Tier 3 assets_strategy with explicit prompts. Cuts the draft_content_plan output tokens by ~70% on a typical 7-day plan, which is what makes the tool actually fit under claude.ai's per-message output cap.\n\n" +
+    "DEFAULT INTENT: every sub_post in an interactive draft uses Tier 1 unless you have a specific reason to fall back to Tier 3.\n\n" +
+    "WHAT YOU EMIT IN TIER 1, per sub_post (instead of assets_strategy):\n" +
+    "  assets_strategy_lite: {\n" +
+    "    asset_kind: 'image' | 'carousel_image' | 'video' | 'avatar_lipsync' | 'avatar_multi_scene' | 'image_url' | 'image_asset_id' | 'video_url' | 'video_asset_id',\n" +
+    "    slot_count?: number,            // required for carousel_image\n" +
+    "    scene_count?: number,           // required for avatar_multi_scene (and matches avatar_scripts.length)\n" +
+    "    avatar_scripts?: string[],      // verbatim; agent owns the script content\n" +
+    "    source_url?: string,            // required for *_url\n" +
+    "    source_asset_id?: number,       // required for *_asset_id\n" +
+    "    override?: { /* see routing below */ },\n" +
+    "  }\n\n" +
+    "AND at the top level of draft_content_plan you pass plan_defaults (image_model, video_model, video_duration_seconds, avatar_id, avatar_voice_id) for the whole plan. Per-sub_post override.model wins; otherwise plan_defaults applies; otherwise hardcoded fallbacks (nano_banana_2 / wan_2.2 / 8s).\n\n" +
+    "AVATAR SCRIPTS: avatar_scripts is the ONE field the LLM still writes verbatim. The audience literally hears those words. Never delegate to server inference.\n\n" +
+    "WHEN TO FALL BACK TO TIER 3 (rare):\n" +
+    "  - User pasted a Midjourney-style prompt and asked for it verbatim (use Path C; see routing below).\n" +
+    "  - User picked a model Creative Studio does not support (ideogram_v3, flux_pro_1.1, recraftv3, gpt-image-2) AND wants prompt-level control. Set override.model AND override.literal_prompt in Tier 1, OR use Tier 3 with use_creative_studio: false.\n" +
+    "  - You need shared_concept_key explicit dedup across plan_items (Tier 1 only auto-dedups WITHIN a plan_item).\n\n" +
+    "MIX FREELY: a single draft_content_plan call can have some plan_items in Tier 1 (assets_strategy_lite) and some in Tier 3 (assets_strategy). Both are validated and normalized correctly.",
+
+  tier_1_routing_paths:
+    "Tier 1 has 3 paths for AI image / video sub_posts. Pick one per sub_post based on the user's direction in chat.\n\n" +
+    "PATH A (default, ~95% of items): the user gave no specific creative direction.\n" +
+    "  - Emit assets_strategy_lite WITHOUT override (or with only override.model / override.aspect_ratio).\n" +
+    "  - At execute time the server composes a brief from concept_shared + caption_concept + asset_layout + format and passes it to Creative Studio.\n" +
+    "  - Creative Studio applies the full 1850-char brand design system + style_key + logo + colors.\n\n" +
+    "PATH B (user gave SHORT conceptual hint): the user said things like 'que sea épico', 'tono cálido', 'luz dorada', 'minimalista con mucho aire'.\n" +
+    "  - Emit override.art_direction_hint with the LLM's faithful, slightly-distilled paraphrase (max 300 chars).\n" +
+    "  - Server composes the brief and APPENDS the hint. Creative Studio still applies brand enrichment.\n" +
+    "  - Use Path B whenever the user's direction is mood / tone / atmosphere, under 300 chars, and compatible with the brand identity.\n\n" +
+    "PATH C (user gave PIXEL-LEVEL technical direction or pasted a literal prompt): the user wrote things like 'cinematic close-up, 85mm prime, Kodak Portra 400, anamorphic, dolly zoom, depth of field 1.4'.\n" +
+    "  - Emit override.literal_prompt with the user's verbatim text (or a tightly-edited version).\n" +
+    "  - Server BYPASSES Creative Studio entirely and routes the prompt to /api/aiResults/image as-is.\n" +
+    "  - NO brand enrichment is applied. The user is opting out of the brand visual identity for this specific asset.\n" +
+    "  - Triggers to use Path C: technical camera vocabulary (lens / F-stop / film stock / motion blur shutter), explicit 'sin marca' / 'experimental' / 'stock-like', user-pasted Midjourney-style prompt, request for a CS-incompatible model (ideogram_v3 / flux_pro / etc.).\n\n" +
+    "AMBIGUOUS CASES: if the user's direction is mid-detail (e.g., 'estilo Wes Anderson, simetría central, paleta pastel') and you cannot tell whether brand enrichment helps or fights against it, ASK THE USER ONCE before defaulting to Path C: '¿respetamos la identidad de marca o priorizamos la dirección literal aunque se separe un poco del look del feed?'. One question per plan; apply the same answer to all similarly ambiguous items in the same plan.\n\n" +
+    "MUTUAL EXCLUSION: art_direction_hint and literal_prompt cannot both be set on one sub_post. The zod refine rejects it.\n\n" +
+    "COST LOCK: the model resolved at draft time (override.model or plan_defaults.image_model or default) is the model the executor uses. No server-side auto-upgrades. The cost the user sees in summary_for_user is what they pay.",
+
+  tier_1_copy_draft_flow:
+    "STRATEGY B (deferred copy_drafts, paired with Tier 1): in interactive flows for plans of 3+ days, leave copy_draft UNDEFINED on every sub_post in draft_content_plan. Right after draft returns plan_id, call set_copy_drafts ONCE PER PLAN_ITEM with the publication-ready copies for all that day's sub_posts. Only after every plan_item has its copies filled, surface the plan to the user.\n\n" +
+    "WHY: pulling 7 plan_items * 3 networks * 100-200 word copies into a single draft_content_plan call dwarfs the output cap on claude.ai. Splitting into N small set_copy_drafts calls (one per plan_item, ~500-1500 tokens each) keeps every individual tool_use under the cap.\n\n" +
+    "CADENCE: call set_copy_drafts at most once per plan_item per round. If the plan has 7 days, expect 7 set_copy_drafts calls before presenting the plan.\n\n" +
+    "WHEN TO SKIP: in non-interactive flows (scheduled cron, autonomous loops), pass copy_draft inline in draft_content_plan. If you do skip set_copy_drafts and execute_content_plan fires with empty copy_draft, the server falls back to Path B (generate_text from caption_concept + brand context). That fallback is functional but produces more generic copies than an agent-written draft.\n\n" +
+    "DO NOT bundle multiple plan_items into one set_copy_drafts call to 'save round-trips'. Per-plan_item cadence is by design: each call is small and discrete, which is the whole point of the strategy.",
 };

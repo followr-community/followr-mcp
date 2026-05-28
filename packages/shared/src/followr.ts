@@ -1170,7 +1170,15 @@ export class FollowrClient {
   async createCreative(
     companyId: number,
     body: {
-      content_type: "single" | "carousel" | "auto";
+      // Backend enum confirmed empirically 2026-05-27 by intercepting the
+      // Followr UI XHR to POST /api/companies/{id}/creative. Value space:
+      //   - "single_creative" (NOT "single" — the doc 2026-05-25 was wrong)
+      //   - "carousel"
+      // The "auto" value documented earlier is unverified; the UI sends one
+      // of the two concrete values even when "AI Decides" is selected. If
+      // callers still pass "auto" the backend rejects with
+      // `{"error":"The selected content type is invalid."}`.
+      content_type: "single_creative" | "carousel";
       style_key: string;
       prompt: string;
       aspect_ratio: "1:1" | "4:5" | "9:16" | "16:9" | "2:3";
