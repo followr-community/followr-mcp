@@ -230,12 +230,12 @@ describe("deriveAspectRatio", () => {
     expect(deriveAspectRatio("instagram", "reel", "single_video")).toBe("9:16");
   });
 
-  it("TikTok feed = 9:16 because product_type isn't vertical -> falls through to social_network rules", () => {
-    // TikTok feed with single_video: product_type 'feed' doesn't auto-9:16,
-    // and TikTok doesn't have a dedicated rule in the helper, so falls
-    // through to default 1:1. The video aspect lock policy at execute time
-    // handles 9:16 vertical for TikTok separately.
-    expect(deriveAspectRatio("tiktok", "feed", "single_video")).toBe("1:1");
+  it("TikTok feed = 9:16 (TikTok is vertical-only even when product_type is 'feed')", () => {
+    // TikTok rejects 1:1 / landscape at publish time. The helper now
+    // returns 9:16 directly so Tier 1 sub_posts whose video_source has no
+    // explicit override land on the right ratio. Validated by the
+    // aspect_ratio_not_supported_for_network blocker in draft_content_plan.
+    expect(deriveAspectRatio("tiktok", "feed", "single_video")).toBe("9:16");
   });
 
   it("Instagram Story = 9:16", () => {

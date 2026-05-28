@@ -71,6 +71,7 @@ import {
 import { normalizePreferences } from "../lib/normalize-preferences.js";
 import { getAiPreferences } from "../lib/preferences.js";
 import { readCachedIndustry } from "./research.js";
+import { fetchAllCompanies } from "./context.js";
 import { localDateTimeToUtcIso, resolveTimezone } from "../lib/timezone.js";
 import {
   type AssetLayout,
@@ -92,7 +93,13 @@ import {
   getPlan,
   updatePlan as updatePlanInState,
 } from "../lib/content-plan-state.js";
-import { normalizeIncomingPlan } from "../lib/plan-normalize.js";
+import {
+  allowedAspectRatiosForNetwork,
+  deriveAspectRatio,
+  isAspectRatioAllowedForNetwork,
+  normalizeIncomingPlan,
+  type AspectRatio,
+} from "../lib/plan-normalize.js";
 import {
   composeImageBrief,
   composeVideoBrief,
@@ -107,7 +114,11 @@ import {
   markPipelineFailed,
   updatePipelinePhase,
 } from "../lib/pipeline-state.js";
-import { PipelineCancelledException } from "../lib/avatar-video-pipeline.js";
+import {
+  executeAvatarVideoPipeline,
+  PipelineCancelledException,
+  type AvatarVideoPipelineParams,
+} from "../lib/avatar-video-pipeline.js";
 import { toolError, toolErrorFromException } from "../lib/tool-error.js";
 import { uploadFromUrl } from "./assets.js";
 
@@ -522,9 +533,15 @@ RELATED TOOLS IN THE PLANNING WORKFLOW (named explicitly so the host's tool-sear
           .describe(
             "Default true. Historical name (kept for backwards compatibility). When true, the response includes industry_setup_proposal / industry_confirmation_required to guide the agent through the deep_research → confirm_industry flow. When false, those proposals are suppressed: use this only if the agent is driving industry classification manually and does not want the proposal hints surfaced. The hard block in draft_content_plan still requires a :confirmed marker regardless of this flag.",
           ),
+        disambiguation_acknowledged: z
+          .boolean()
+          .optional()
+          .describe(
+            "Pass true to confirm that the user EXPLICITLY picked this company by name in the chat when there is a name collision. The session-bootstrap tool (get_session_context) flags collisions via _assistant_guidance.has_name_collision / has_owned_name_collision; if you saw either of those true earlier in this conversation, you MUST surface the disambiguated options to the user, wait for their pick, AND then pass disambiguation_acknowledged: true here. The tool blocks with reason=company_disambiguation_required when a collision exists and this flag is missing, so silent picks fail loudly.",
+          ),
       },
     },
-    async ({ company, include_website_summary, auto_classify_industry }) => {
+    async ({ company, include_website_summary, auto_classify_industry, disambiguation_acknowledged }) => {
       // 1. Resolve company first; everything else depends on company_id.
       let companyResolved: Company;
       let disambiguation: Company[] | undefined;
@@ -536,6 +553,65 @@ RELATED TOOLS IN THE PLANNING WORKFLOW (named explicitly so the host's tool-sear
         return toolErrorFromException(err);
       }
       const company_id = companyResolved.id;
+
+      // 1b. Block when the hint resolved to multiple candidates AND the agent
+      // did not flag disambiguation_acknowledged. Previous behavior was to
+      // silently use the first match (arbitrary order) and return its context;
+      // the agent often surfaced that pick to the user as if the choice had
+      // been made. Hard-fail here so the agent must show the options first.
+      if (disambiguation && disambiguation.length > 1 && !disambiguation_acknowledged) {
+        return toolError({
+          reason: "company_disambiguation_required",
+          user_message: `Hay ${disambiguation.length} compañías que matchean ese nombre. Presentale las opciones al user por NOMBRE (nunca por id), esperá que elija explícitamente, y re-llamá esta tool con company igual al nombre EXACTO elegido (o el id numérico) y disambiguation_acknowledged: true.`,
+          blocking: true,
+          details: {
+            ambiguous_candidates: disambiguation.map((c) => ({ name: c.name })),
+            instructions_for_agent:
+              "Build an AskUserQuestion with one option per candidate. Use distinguishing fields (creation date, website, description excerpt) so the user can tell them apart WITHOUT seeing any numeric id. After their pick, re-call prepare_content_plan_context(company: <exact_name>, disambiguation_acknowledged: true).",
+          },
+        });
+      }
+
+      // 1c. Owned-vs-owned name collision check. resolveCompany returns a
+      // single Company when called with a numeric id OR an exact name match;
+      // it does NOT detect the case where the user owns MULTIPLE companies
+      // with the same name (real case 2026-05-26: two "PipeLime" both owned).
+      // We rescan owned companies once here so the agent cannot bypass the
+      // disambiguation by passing the numeric id directly.
+      try {
+        const me = await client.getMe();
+        const { companies: allCompanies } = await fetchAllCompanies(client);
+        const ownedCompanies = allCompanies.filter((c) => c.user_id === me.id);
+        const targetName = normalizeCompanyName(companyResolved.name ?? "");
+        const sameNameOwned = ownedCompanies.filter(
+          (c) => normalizeCompanyName(c.name ?? "") === targetName,
+        );
+        if (sameNameOwned.length > 1 && !disambiguation_acknowledged) {
+          return toolError({
+            reason: "company_disambiguation_required",
+            user_message: `El user posee ${sameNameOwned.length} compañías con el nombre "${companyResolved.name}". El agente DEBE preguntarle al user cuál usar antes de avanzar. Mostrale las opciones con distinguidores no numéricos (fecha de creación, sitio web, idioma, excerpt de descripción). Después re-llamá esta tool con disambiguation_acknowledged: true.`,
+            blocking: true,
+            details: {
+              owned_duplicates: sameNameOwned.map((c) => ({
+                name: c.name,
+                created_at: c.created_at,
+                website: (c as Company & { website?: string }).website ?? null,
+                language: (c as Company & { language?: string }).language ?? null,
+                country_iso_code: (c as Company & { country_iso_code?: string }).country_iso_code ?? null,
+                description_excerpt: c.description
+                  ? c.description.replace(/\[[^\]]+\]/g, "").replace(/\s+/g, " ").trim().slice(0, 140)
+                  : null,
+              })),
+              instructions_for_agent:
+                "Surface ALL duplicates in a single AskUserQuestion this turn. Enrich the question with fields from owned_duplicates that DIFFER (creation date, website, description excerpt). NEVER show numeric ids. After the user picks, re-call with the picked company AND disambiguation_acknowledged: true.",
+            },
+          });
+        }
+      } catch {
+        // Best-effort: if the collision scan fails, fall through. The validator
+        // pipeline downstream still catches obvious problems and the user-facing
+        // impact is bounded.
+      }
 
       // 2. Fan out everything else in parallel. Each lookup is tolerant: if a
       // sub-call fails, that section comes back null / [] and we surface a
@@ -1748,7 +1824,7 @@ RELATED TOOLS IN THE PLANNING WORKFLOW (named explicitly so the host's tool-sear
       .enum(["1:1", "4:3", "16:9", "3:4", "9:16"])
       .optional()
       .describe(
-        "Output aspect ratio for the AI image. When omitted, the platform falls back to the company's ai_preferences.image_aspect_ratio. Recommended per-network defaults: LinkedIn feed = 1.91:1 closest match is 16:9 (otherwise 1:1); LinkedIn carrusel = 1:1; Instagram feed/carousel = 1:1 (4:5 if you want vertical, choose 3:4 here as the closest enum value); Instagram Reel / Story = 9:16; TikTok / YouTube Short = 9:16; YouTube long = 16:9; Twitter = 16:9 or 1:1; Pinterest = 3:4 vertical. PREFER differentiating by aspect_ratio (structural) over differentiating by adjectives in the prompt (decorative). Two near-identical prompts that only differ in style words will produce near-identical outputs and burn credits for zero differentiation.",
+        "Output aspect ratio for the AI image. When omitted, the platform falls back to the company's ai_preferences.image_aspect_ratio. Pick the ratio that matches the destination network so the asset publishes without rejection: TikTok (any product_type) = 9:16; Instagram Reel / Story = 9:16; YouTube Short = 9:16; Instagram feed = 1:1 default, 3:4 for vertical 4:5, 16:9 for cinematic; Facebook feed = 1:1 / 3:4 / 16:9 / 9:16; LinkedIn feed = 16:9 or 1:1; YouTube long_video = 16:9; Pinterest feed = 3:4 default; X / Threads / Bluesky feed = flexible. PUBLISH-TIME GUARD: the draft validator emits aspect_ratio_not_supported_for_network blocker when the chosen ratio is not in the network's allowed set (e.g. 1:1 on TikTok). Prefer differentiating by aspect_ratio (structural) over differentiating by adjectives in the prompt (decorative); two near-identical prompts that only differ in style words will produce near-identical outputs and burn credits for zero differentiation.",
       ),
     shared_concept_key: z
       .string()
@@ -1949,7 +2025,7 @@ RELATED TOOLS IN THE PLANNING WORKFLOW (named explicitly so the host's tool-sear
         .enum(["1:1", "4:3", "16:9", "3:4", "9:16"])
         .optional()
         .describe(
-          "Override the auto-derived aspect ratio. Auto rules: IG feed = 1:1, IG reel / TikTok / YouTube Short = 9:16, LinkedIn feed = 16:9 or 1:1, FB feed = 1:1.",
+          "Override the auto-derived aspect ratio. Auto rules: TikTok (any product_type) = 9:16; IG reel / story = 9:16; YouTube Short = 9:16; IG feed = 1:1; FB feed = 1:1; LinkedIn feed = 16:9; YouTube long_video = 16:9; Pinterest feed = 3:4. PUBLISH-TIME GUARD: the draft validator rejects an override that the destination network does not accept (e.g. 1:1 on TikTok is impossible; that emits aspect_ratio_not_supported_for_network with the allowed set). Per-network allowed sets: TikTok feed = {9:16}; reel / story / short = {9:16}; IG feed = {1:1, 4:3, 3:4, 16:9}; FB feed = {1:1, 4:3, 3:4, 16:9, 9:16}; LinkedIn feed = {1:1, 4:3, 16:9}; YouTube long_video = {16:9}; Pinterest feed = {3:4, 1:1, 9:16}; X / Threads / Bluesky feed = {1:1, 16:9, 9:16, 3:4, 4:3}.",
         ),
       duration_seconds: z.number().int().min(2).max(60).optional(),
       art_direction_hint: z
@@ -2348,10 +2424,12 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
       const summaryRows = buildSummaryTable(plan);
 
       const manualMaterialization = collectManualMaterializationSteps(planItemsArr);
+      const costBreakdown = buildCostBreakdown(planItemsArr);
       const response = {
         plan_id: plan.plan_id,
         status: v.blockers.length > 0 ? "needs_revision" : "ready_for_execution",
         summary_for_user: summaryRows,
+        cost_breakdown: costBreakdown,
         totals: {
           plan_items_count: input.plan_items.length,
           sub_posts_count: input.plan_items.reduce((a, it) => a + it.sub_posts.length, 0),
@@ -2360,6 +2438,8 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
           estimated_asset_uploads: v.totals.upload_count,
           estimated_existing_asset_reuse: v.totals.reuse_count,
           estimated_total_credits_cost: v.totals.total_ai_cost,
+          estimated_credits_no_dedupe: costBreakdown.total_credits_no_dedupe,
+          dedupe_savings_credits: costBreakdown.total_dedupe_savings,
           budget_remaining_before_execution: v.budget_remaining,
           budget_remaining_after_execution:
             v.budget_remaining !== null ? v.budget_remaining - v.totals.total_ai_cost : null,
@@ -2390,7 +2470,7 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
         next_step_instructions:
           v.blockers.length > 0
             ? "There are blockers (listed above). Surface them to the user with the resolution_options for each, then call update_content_plan(plan_id, changes) with the chosen fixes. Do NOT call execute_content_plan until status is ready_for_execution."
-            : `FIRST handle upfront_decisions_required if not empty: each entry has a user_facing_message phrased as a question. Surface it BEFORE the plan summary, ask the user how to proceed (typical: 'la armamos ahora / avanzamos sin'), and ONLY after that decision is resolved continue to the summary. Do NOT bury these in a 'PD' at the end of the plan: by then the user has mentally approved the plan and won't pause to add the missing piece.${manualMaterialization ? " SECOND, BEFORE the cost summary, surface manual_materialization_required.user_message to the user (see instructions_for_agent in that block for the post-approval execution dance: generate avatar -> update_content_plan replace_sub_post -> execute_content_plan with plan_item_slugs). NEVER call execute_content_plan on any slug in manual_materialization_required.affected_plan_item_slugs without first materializing the avatar asset and swapping video_source to asset_id." : ""} THEN show summary_for_user to the user (translate display_name fields, never expose ids) AND tell them the cost in natural language: read totals.estimated_total_credits_cost and totals.budget_remaining_after_execution and say something like 'el plan consume aprox N créditos de imagen y video, te quedarían M después de ejecutarlo'. NEVER omit the cost just because summary_for_user does not include it; the user is paying for these credits and needs to know upfront. Surface ONLY warnings array (each has a user_facing_message safe to surface verbatim). Do NOT mention _internal_warning_signals; those are debug-only and you must obey USER-FACING LANGUAGE LOCK when speaking to the user. Ask for explicit approval ('lo ejecuto?' / 'cambio algo?'). When the user confirms, call execute_content_plan(plan_id, confirm: true). If the user wants to change a specific item, call update_content_plan(plan_id, changes) internally without naming the tool to the user. DO NOT propose your own prose version of the plan; summary_for_user is the canonical view.`,
+            : `FIRST handle upfront_decisions_required if not empty: each entry has a user_facing_message phrased as a question. Surface it BEFORE the plan summary, ask the user how to proceed (typical: 'la armamos ahora / avanzamos sin'), and ONLY after that decision is resolved continue to the summary. Do NOT bury these in a 'PD' at the end of the plan: by then the user has mentally approved the plan and won't pause to add the missing piece.${manualMaterialization ? "" : ""} THEN show summary_for_user to the user (translate display_name fields, never expose ids) AND tell them the cost in natural language: read totals.estimated_total_credits_cost and totals.budget_remaining_after_execution and say something like 'el plan consume aprox N créditos de imagen y video, te quedarían M después de ejecutarlo'. NEVER omit the cost just because summary_for_user does not include it; the user is paying for these credits and needs to know upfront. Surface ONLY warnings array (each has a user_facing_message safe to surface verbatim). Do NOT mention _internal_warning_signals; those are debug-only and you must obey USER-FACING LANGUAGE LOCK when speaking to the user. Ask for explicit approval ('lo ejecuto?' / 'cambio algo?'). When the user confirms, call execute_content_plan(plan_id, confirm: true). If the user wants to change a specific item, call update_content_plan(plan_id, changes) internally without naming the tool to the user. DO NOT propose your own prose version of the plan; summary_for_user is the canonical view.`,
       };
 
       return { content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }] };
@@ -2716,12 +2796,14 @@ AFTER THIS: same flow as draft. Show the updated table, await explicit approval,
       const manualMaterialization = collectManualMaterializationSteps(
         updatedPlan.plan_items,
       );
+      const costBreakdown = buildCostBreakdown(updatedPlan.plan_items);
       const response = {
         plan_id,
         status: v.blockers.length > 0 ? "needs_revision" : "ready_for_execution",
         applied_changes: changes.length - changeErrors.length,
         change_errors: changeErrors,
         summary_for_user: summaryRows,
+        cost_breakdown: costBreakdown,
         totals: {
           plan_items_count: updatedPlan.plan_items.length,
           sub_posts_count: updatedPlan.plan_items.reduce((a, it) => a + it.sub_posts.length, 0),
@@ -2730,6 +2812,8 @@ AFTER THIS: same flow as draft. Show the updated table, await explicit approval,
           estimated_asset_uploads: v.totals.upload_count,
           estimated_existing_asset_reuse: v.totals.reuse_count,
           estimated_total_credits_cost: v.totals.total_ai_cost,
+          estimated_credits_no_dedupe: costBreakdown.total_credits_no_dedupe,
+          dedupe_savings_credits: costBreakdown.total_dedupe_savings,
           budget_remaining_before_execution: v.budget_remaining,
           budget_remaining_after_execution:
             v.budget_remaining !== null ? v.budget_remaining - v.totals.total_ai_cost : null,
@@ -2745,7 +2829,7 @@ AFTER THIS: same flow as draft. Show the updated table, await explicit approval,
         next_step_instructions:
           v.blockers.length > 0
             ? "Plan still has blockers. Surface to the user, then iterate. Obey USER-FACING LANGUAGE LOCK: do not name tools or internal fields when explaining changes."
-            : `FIRST handle upfront_decisions_required if non-empty (same rule as draft_content_plan: surface BEFORE the plan summary, never as a trailing PD).${manualMaterialization ? " SECOND, if manual_materialization_required is non-null, follow its instructions_for_agent: surface the user_message BEFORE the cost summary, then handle the avatar materialization dance (generate -> replace_sub_post -> execute_content_plan with plan_item_slugs) when the user approves." : ""} Plan is valid. Surface summary_for_user verbatim AND mention the updated cost in natural language using totals.estimated_total_credits_cost and totals.budget_remaining_after_execution. Ask the user for explicit approval before executing. Surface ONLY warnings array (already filtered to user-safe); never mention _internal_warning_signals to the user. DO NOT replace summary_for_user with your own prose table.`,
+            : `FIRST handle upfront_decisions_required if non-empty (same rule as draft_content_plan: surface BEFORE the plan summary, never as a trailing PD).${manualMaterialization ? "" : ""} Plan is valid. Surface summary_for_user verbatim AND mention the updated cost in natural language using totals.estimated_total_credits_cost and totals.budget_remaining_after_execution. Ask the user for explicit approval before executing. Surface ONLY warnings array (already filtered to user-safe); never mention _internal_warning_signals to the user. DO NOT replace summary_for_user with your own prose table.`,
       };
       return { content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }] };
     },
@@ -3127,7 +3211,7 @@ ASSET STRATEGIES SUPPORTED IN v1:
 - asset_id: pass through.
 - ai_generate image: POST /api/aiResults/image, poll until completed, re-upload to asset library, attach asset id.
 - ai_generate video: POST /api/aiResults/video (text-to-video), poll until completed (~10-15 min for Veo), re-upload, attach.
-- ai_avatar_lipsync, ai_avatar_video: NOT supported in v1. The executor throws "Asset strategy ai_avatar_* is not supported" when it encounters one. draft_content_plan / update_content_plan / preview_content_plan all surface a manual_materialization_required block listing the affected slugs upfront with the exact dance: (1) call generate_avatar_video or generate_avatar_lipsync_clip for each fingerprint, (2) update_content_plan with replace_sub_post swapping video_source to { type: "asset_id", id: <resulting_asset_id> } for every consumer, (3) execute_content_plan with plan_item_slugs covering the now-materialized items. Read manual_materialization_required BEFORE calling execute on any avatar plan_item.
+- ai_avatar_lipsync, ai_avatar_video: materialized inline by the executor (2026-05-28). For each avatar source the runner fetches the avatar, validates voice + image, runs the TTS + lipsync + concat pipeline (executeAvatarVideoPipeline) and uploads the final video to the asset library before attaching it to the post. No separate generate_avatar_video / generate_avatar_lipsync_clip + update_content_plan + re-execute dance is required. manual_materialization_required is always null. The agent's flow is just: draft -> approve -> execute_content_plan(plan_id, confirm: true). Avatar generation eats time during the async pipeline (~3-5 min per multi-scene reel), so set_and_forget mode is the default UX: the user comes back later (or asks "cómo va?") and the agent reads get_pipeline_status.
 
 OUTPUT: { plan_id, status (succeeded / completed_with_partial_failures / failed_all), results (per plan_item: status, post_group_id when created, asset_ids per sub_post, credits_consumed, error and recovery_suggestion when failed), totals (count succeeded / failed, total credits consumed, budget remaining after). next_actions guides what the user can do next.
 
@@ -3527,11 +3611,11 @@ ITEM-BY-ITEM CONFIRMATION FLOW: when the user asks to advance one item at a time
                   partial_execution: isPartialExecution,
                   ...(unknownSlugs.length > 0 ? { unknown_slugs_skipped: unknownSlugs } : {}),
                   estimated_seconds: estimate,
-                  user_facing_summary: `Empecé la ejecución del plan (${itemsToRun.length} item${itemsToRun.length === 1 ? "" : "s"}${isPartialExecution ? ` de ${plan.plan_items.length} totales` : ""}). Va a tardar entre ${minMinutes} y ${maxMinutes} minutos. Decime "cómo va el plan" cuando quieras chequear progreso.`,
+                  user_facing_summary: `Empecé la ejecución del plan (${itemsToRun.length} item${itemsToRun.length === 1 ? "" : "s"}${isPartialExecution ? ` de ${plan.plan_items.length} totales` : ""}). Tarda entre ${minMinutes} y ${maxMinutes} minutos. Lo dejo corriendo en background; cuando vuelvas y me preguntes ya te paso el resumen.`,
                   _assistant_guidance: {
-                    next_step: "tell_user_eta_then_wait_for_status_request",
+                    next_step: "offer_toggle_then_default_to_set_and_forget",
                     conversational_flow:
-                      "1. Decile al user el user_facing_summary (tal cual o reformulado en castellano natural). 2. NO mencionés pipeline_id ni execution_id (son internos). 3. Cuando el user pregunte 'cómo va el plan' / 'fijate' / 'ya está?', llamá get_pipeline_status(pipeline_id) (instantáneo) y leele el user_facing_summary que viene en la respuesta. 4. Cuando el user diga 'esperá' / 'quédate ahí', llamá wait_for_pipeline(pipeline_id, max_wait_seconds=180). 5. NUNCA prometas 'te aviso cuando termine'. claude.ai no soporta push notifications de MCP. 6. Cuando termine, el field result.metadata trae el responseBody completo (executed_slugs, results, totals, next_actions); usalo para resumir al user lo que se hizo.",
+                      "1. Decile al user el user_facing_summary (tal cual o reformulado en castellano natural). 2. NO mencionés pipeline_id ni execution_id (son internos). 3. INMEDIATAMENTE después, ofrecele EL TOGGLE entre los dos modos así no se queda mirando la pantalla por defecto: 'Lo dejo en background y volvés cuando quieras, o querés que te vaya contando cómo va minuto a minuto?'. Modo por defecto = SET-AND-FORGET (background). Solo activá el modo STAY-WITH-ME si el user explícitamente dice 'esperá', 'contame cómo va', 'quédate ahí'. 4. SET-AND-FORGET: el user cierra Claude y se va. Al volver a abrir conversación, get_session_context.pending_pipelines_count va a marcarte que hay un pipeline terminado y list_pending_pipelines te trae el resumen. Esa es la red de seguridad que cierra el loop. 5. STAY-WITH-ME (chained wait): el user se queda. Llamá wait_for_pipeline(pipeline_id, max_wait_seconds=60) en loop, narrando entre llamadas el progreso ('voy 3 de 12 imágenes', 'arrancó el primer video') leyendo current_sub_phase y progress de la respuesta. Cada wait dura como mucho 60s así no se cuelga el WebSocket. Si volvió still_running después de 60s, narrá el avance y volvé a llamar wait. NO loopees sin hablar entre medio: el user tiene que ver que estás haciendo algo. 6. NUNCA prometas 'te aviso cuando termine'. claude.ai no soporta push notifications del MCP. 7. Cuando termine (cualquiera de los dos modos), el field result.metadata trae el responseBody completo (executed_slugs, results, totals, next_actions); usalo para resumir al user lo que se hizo.",
                   },
                 },
                 null,
@@ -4821,23 +4905,74 @@ async function resolveAssetSourceFresh(
     };
   }
   if (src.type === "ai_avatar_lipsync" || src.type === "ai_avatar_video") {
-    // execute_content_plan v1 does not run avatar tools end-to-end. The
-    // agent has to materialize the avatar asset manually and then point
-    // the plan at the resulting asset id. The original draft already
-    // committed to a SHAPE (single-scene lipsync vs multi-scene with
-    // subtitles); the recovery suggestion must preserve that shape and
-    // not silently degrade to lipsync to save credits.
-    const targetTool =
-      src.type === "ai_avatar_video"
-        ? "generate_avatar_video"
-        : "generate_avatar_lipsync_clip";
-    const shapeNote =
-      src.type === "ai_avatar_video"
-        ? "Multi-scene reel with burned-in subtitles, transitions, and per-scene backgrounds. Do NOT substitute generate_avatar_lipsync_clip even if it looks cheaper: that tool produces a single bare talking head without subtitles, which is a different output shape than what the plan committed to."
-        : "Single-scene bare talking head, no subtitles, no concat. This shape was chosen explicitly at draft time; do not upgrade to generate_avatar_video unless the user re-confirms.";
-    throw new Error(
-      `Asset strategy ${src.type} is not supported by execute_content_plan in v1. Generate the avatar video first by calling ${targetTool} (the tool that matches the plan's avatar shape), then pass the resulting asset id via assets_strategy.video_source = { type: "asset_id", id: <n> } and re-run execute_content_plan. ${shapeNote}`,
-    );
+    // Materialize the avatar asset inline so the agent does not have to
+    // call generate_avatar_video / generate_avatar_lipsync_clip as a
+    // separate step. Replaces the throw that used to require the agent to
+    // back out, generate the avatar, swap the source via update_content_plan,
+    // and re-call execute_content_plan. The avatar pipeline still runs as a
+    // first-class job (TTS + lipsync + concat + library upload) but it is
+    // invoked from inside this resolver so the user sees a single
+    // "ejecutando el plan" pipeline.
+    const isMultiScene = src.type === "ai_avatar_video";
+    const scripts = isMultiScene ? src.scripts : [src.script];
+    const generateBackgrounds = isMultiScene ? src.generate_backgrounds ?? false : false;
+    const avatarAspect: "9:16" | "16:9" =
+      aspect_ratio === "16:9" || aspect_ratio === "9:16" ? aspect_ratio : "9:16";
+
+    const avatar = await client.getAvatar(src.avatar_id, {
+      include: "image,voice,voice.audio",
+    });
+    if (!avatar.voice?.platform_external_id) {
+      throw new Error(
+        `Avatar #${src.avatar_id} ("${avatar.name}") has no voice configured. Assign a voice to the avatar via update_avatar or pick another avatar in plan_defaults.avatar_id.`,
+      );
+    }
+    if (!avatar.image?.url) {
+      throw new Error(
+        `Avatar #${src.avatar_id} ("${avatar.name}") has no image attached. Re-create it via create_avatar_full_flow or attach an image manually.`,
+      );
+    }
+
+    const pipelineParams: AvatarVideoPipelineParams = {
+      company_id: companyId,
+      avatar,
+      scripts,
+      aspect_ratio: avatarAspect,
+      generate_backgrounds: generateBackgrounds,
+    };
+
+    const result = await executeAvatarVideoPipeline(client, pipelineParams);
+    const finalUrl = result.finalVideo.response;
+    if (!finalUrl) {
+      throw new Error(
+        `Avatar pipeline (avatar #${src.avatar_id}) completed but final video URL was missing.`,
+      );
+    }
+    const sceneSuffix = scripts.length === 1 ? "scene" : "scenes";
+    const dateTag = new Date().toISOString().slice(0, 10);
+    const assetName = `Avatar ${result.avatar.name} (${scripts.length} ${sceneSuffix}, ${dateTag})`;
+    const asset = await uploadFromUrl(client, {
+      companyId,
+      url: finalUrl,
+      type: "video",
+      name: assetName,
+      visibility: "public",
+    });
+
+    // Cost mirrors the cost-deduped estimator so the executor cost ledger
+    // lines up with what draft_content_plan / update_content_plan / preview
+    // told the user up front.
+    const sceneCount = scripts.length;
+    const creditsConsumed = isMultiScene
+      ? 25 * 10 * sceneCount + (generateBackgrounds ? 60 * sceneCount : 0)
+      : 25 * 12;
+
+    return {
+      asset_id: asset.id,
+      asset_url: (asset as Asset & { url?: string }).url ?? null,
+      credits_consumed: creditsConsumed,
+      ai_result_id: result.finalVideo.id ?? null,
+    };
   }
   throw new Error(`Unknown asset source type: ${(src as { type?: string }).type ?? "unknown"}`);
 }
@@ -5599,6 +5734,171 @@ function buildSummaryTable(plan: ContentPlan): string[] {
   return lines;
 }
 
+/**
+ * Per-sub_post auditable cost breakdown. Surfaced in draft / update / preview
+ * responses next to the aggregate totals so the user can verify how the cost
+ * decomposes by item, network and asset kind. Mirrors the same dedupe rules
+ * the executor uses at runtime: the FIRST consumer of a fingerprint within a
+ * plan_item pays the credits cost; later consumers display 0 cr and a list
+ * of share_group consumers in `shared_with`. The `dedupe_savings` field on
+ * the plan-level total tells the user how many credits would have been spent
+ * without the deduplication.
+ */
+interface CostBreakdownAsset {
+  asset_kind:
+    | "ai_image"
+    | "ai_video"
+    | "concept_only_image"
+    | "concept_only_video"
+    | "avatar_lipsync"
+    | "avatar_video"
+    | "url_upload"
+    | "library_reuse";
+  mode: "image" | "video";
+  model: string | null;
+  credits_cost: number;
+  shared_with: string[];
+  is_dedupe_consumer: boolean;
+  notes?: string;
+}
+
+interface CostBreakdownSubPost {
+  slug: string;
+  sub_post_index: number;
+  network_display: string;
+  product_type: ProductType;
+  asset_layout: AssetLayout;
+  assets: CostBreakdownAsset[];
+  sub_post_total_credits: number;
+}
+
+interface CostBreakdown {
+  total_credits_charged: number;
+  total_credits_no_dedupe: number;
+  total_dedupe_savings: number;
+  sub_posts: CostBreakdownSubPost[];
+}
+
+function singleAssetCost(ref: AssetSourceRef): { cost: number; model: string | null; kind: CostBreakdownAsset["asset_kind"] } {
+  const { src, mode } = ref;
+  if (src.type === "url") return { cost: 0, model: null, kind: "url_upload" };
+  if (src.type === "asset_id") return { cost: 0, model: null, kind: "library_reuse" };
+  if (src.type === "ai_generate" && mode === "image") {
+    const imgSrc = src as Extract<ImageSrc, { type: "ai_generate" }>;
+    const m = IMAGE_MODELS.find((x) => x.model_id === (imgSrc.model ?? "nano_banana_2")) ?? IMAGE_MODELS[0];
+    return { cost: m?.cost_per_image ?? 25, model: imgSrc.model ?? "nano_banana_2", kind: "ai_image" };
+  }
+  if (src.type === "ai_generate" && mode === "video") {
+    const vidSrc = src as Extract<VideoSrc, { type: "ai_generate" }>;
+    const m = VIDEO_MODELS.find((x) => x.model_id === vidSrc.model);
+    const duration = vidSrc.duration_seconds ?? m?.default_duration_seconds ?? 8;
+    return {
+      cost: m ? m.cost_per_second * duration : 400 * 8,
+      model: vidSrc.model,
+      kind: "ai_video",
+    };
+  }
+  if (src.type === "ai_avatar_lipsync") {
+    return { cost: 25 * 12, model: "veed_fabric_1.0", kind: "avatar_lipsync" };
+  }
+  if (src.type === "ai_avatar_video") {
+    const sceneCount = src.scripts.length;
+    const lipsyncCost = 25 * 10 * sceneCount;
+    const backgroundCost = src.generate_backgrounds ? 60 * sceneCount : 0;
+    return {
+      cost: lipsyncCost + backgroundCost,
+      model: "veed_fabric_1.0+creatomate",
+      kind: "avatar_video",
+    };
+  }
+  if (src.type === "concept_only_image") {
+    const m = IMAGE_MODELS.find((x) => x.model_id === (src.model ?? "nano_banana_2")) ?? IMAGE_MODELS[0];
+    return {
+      cost: m?.cost_per_image ?? 25,
+      model: src.model ?? "nano_banana_2",
+      kind: "concept_only_image",
+    };
+  }
+  if (src.type === "concept_only_video") {
+    const m = VIDEO_MODELS.find((x) => x.model_id === src.model);
+    const duration = src.duration_seconds ?? m?.default_duration_seconds ?? 8;
+    return {
+      cost: m ? m.cost_per_second * duration : 400 * 8,
+      model: src.model ?? null,
+      kind: "concept_only_video",
+    };
+  }
+  return { cost: 0, model: null, kind: "url_upload" };
+}
+
+function buildCostBreakdown(plan_items: PlanItem[]): CostBreakdown {
+  const sub_posts: CostBreakdownSubPost[] = [];
+  let total_credits_charged = 0;
+  let total_credits_no_dedupe = 0;
+
+  for (const item of plan_items) {
+    // Build fingerprint → consumers across the plan_item once so each
+    // sub_post knows what share_group it belongs to.
+    const fpConsumers = new Map<string, string[]>();
+    for (let i = 0; i < item.sub_posts.length; i++) {
+      const sp = item.sub_posts[i] as SubPost;
+      for (const ref of subPostAssetRefs(sp, item)) {
+        const fp = fingerprintAssetSource(ref);
+        const label = `${item.slug}#${i} ${displayNetworkName(sp.social_network)}`;
+        const list = fpConsumers.get(fp) ?? [];
+        list.push(label);
+        fpConsumers.set(fp, list);
+      }
+    }
+    const fpCharged = new Set<string>();
+    for (let i = 0; i < item.sub_posts.length; i++) {
+      const sp = item.sub_posts[i] as SubPost;
+      const refs = subPostAssetRefs(sp, item);
+      const assets: CostBreakdownAsset[] = [];
+      let sub_post_total = 0;
+      for (const ref of refs) {
+        const fp = fingerprintAssetSource(ref);
+        const { cost, model, kind } = singleAssetCost(ref);
+        total_credits_no_dedupe += cost;
+        const is_first = !fpCharged.has(fp);
+        if (is_first) fpCharged.add(fp);
+        const consumers = fpConsumers.get(fp) ?? [];
+        const others = consumers.filter((c) => !c.startsWith(`${item.slug}#${i} `));
+        const credits_cost = is_first ? cost : 0;
+        sub_post_total += credits_cost;
+        if (is_first) total_credits_charged += credits_cost;
+        assets.push({
+          asset_kind: kind,
+          mode: ref.mode,
+          model,
+          credits_cost,
+          shared_with: others,
+          is_dedupe_consumer: !is_first,
+          ...(is_first
+            ? {}
+            : { notes: `Reusa la misma generación que ya se cobró en otra sub_post del día.` }),
+        });
+      }
+      sub_posts.push({
+        slug: item.slug,
+        sub_post_index: i,
+        network_display: displayNetworkName(sp.social_network),
+        product_type: sp.product_type,
+        asset_layout: sp.asset_layout,
+        assets,
+        sub_post_total_credits: sub_post_total,
+      });
+    }
+  }
+
+  return {
+    total_credits_charged,
+    total_credits_no_dedupe,
+    total_dedupe_savings: total_credits_no_dedupe - total_credits_charged,
+    sub_posts,
+  };
+}
+
 function displayNetworkName(network: SocialNetwork): string {
   const map: Record<SocialNetwork, string> = {
     instagram: "Instagram",
@@ -5845,77 +6145,20 @@ interface ManualMaterializationBlock {
 function collectManualMaterializationSteps(
   plan_items: PlanItem[],
 ): ManualMaterializationBlock | null {
-  const byFingerprint = new Map<string, ManualMaterializationStep>();
-
-  for (const item of plan_items) {
-    for (let idx = 0; idx < item.sub_posts.length; idx++) {
-      const sp = item.sub_posts[idx]!;
-      const vs = sp.assets_strategy.video_source;
-      if (!vs) continue;
-      if (vs.type !== "ai_avatar_lipsync" && vs.type !== "ai_avatar_video") continue;
-      const fp = fingerprintAssetSource({ src: vs, mode: "video" });
-      const consumer = {
-        slug: item.slug,
-        sub_post_index: idx,
-        network_display: displayNetworkName(sp.social_network),
-      };
-      const existing = byFingerprint.get(fp);
-      if (existing) {
-        existing.consumed_by.push(consumer);
-        continue;
-      }
-      const isMulti = vs.type === "ai_avatar_video";
-      const scripts = isMulti ? vs.scripts : [vs.script];
-      const totalSeconds = scripts
-        .map((s) => estimateTtsSeconds(s))
-        .reduce((a, b) => a + b, 0);
-      const generateBackgrounds = isMulti ? vs.generate_backgrounds ?? false : false;
-      const speechCost = AVATAR_TTS_COST_PER_SECOND * totalSeconds;
-      const bgCost = generateBackgrounds
-        ? AVATAR_BACKGROUND_COST_PER_SCENE * scripts.length
-        : 0;
-      const totalCost = speechCost + bgCost;
-      const suggestedTool: ManualMaterializationStep["suggested_tool"] = isMulti
-        ? "generate_avatar_video"
-        : "generate_avatar_lipsync_clip";
-      const shapeNote = isMulti
-        ? "Multi-scene reel con burned-in subtitles, transitions y per-scene backgrounds. NO substituir por generate_avatar_lipsync_clip aunque parezca más barato: es un output distinto."
-        : "Single-scene talking head, sin subtitles, sin concat. Es la SHAPE elegida en draft; no upgradear a generate_avatar_video sin re-confirmar con el user.";
-      const callHint = isMulti
-        ? `scripts=[${scripts.length} item(s)]${generateBackgrounds ? ", generate_backgrounds=true" : ""}`
-        : "script=<el único script del plan>";
-      byFingerprint.set(fp, {
-        fingerprint: fp,
-        source_type: vs.type,
-        suggested_tool: suggestedTool,
-        avatar_id: vs.avatar_id,
-        scripts_count: scripts.length,
-        generate_backgrounds: generateBackgrounds,
-        estimated_total_seconds: totalSeconds,
-        estimated_credits: totalCost,
-        shape_note: shapeNote,
-        consumed_by: [consumer],
-        next_action_for_agent: `Llamá ${suggestedTool}(company_id, avatar_id=${vs.avatar_id}, ${callHint}), esperá el video resultante, después llamá update_content_plan con un replace_sub_post por cada entry de consumed_by (swap video_source a { type: "asset_id", id: <asset_id_resultante> }), y finalmente execute_content_plan(plan_id, plan_item_slugs=[<los slugs cubiertos>], confirm=true).`,
-      });
-    }
-  }
-
-  if (byFingerprint.size === 0) return null;
-
-  const steps = Array.from(byFingerprint.values());
-  const totalCredits = steps.reduce((a, s) => a + s.estimated_credits, 0);
-  const affectedSlugs = Array.from(
-    new Set(steps.flatMap((s) => s.consumed_by.map((c) => c.slug))),
-  );
-
-  return {
-    count: steps.length,
-    total_estimated_credits: totalCredits,
-    affected_plan_item_slugs: affectedSlugs,
-    steps,
-    user_message: `Aviso importante: este plan tiene ${steps.length} pieza(s) con avatar (${affectedSlugs.length} día(s) afectado(s)) que requieren un paso extra de mi parte antes de publicar, aprox ${totalCredits} créditos en total para esos videos. Las voy a generar una por una, las agrego al plan y recién ahí se publica el día completo. Los días sin avatar se publican directo, sin esa pausa.`,
-    instructions_for_agent: `ANTES del cost summary y de pedir aprobación final, surface manual_materialization_required.user_message al usuario. Después, cuando el user apruebe el plan, el flujo correcto es: (1) para cada step, llamar suggested_tool y esperar el asset, (2) llamar update_content_plan con replace_sub_post para cada entry de consumed_by swappeando video_source a { type: "asset_id", id: <asset_id> }, (3) execute_content_plan con plan_item_slugs cubriendo los slugs afectados. Los plan_items NO afectados (sin avatar) se ejecutan con execute_content_plan normalmente sin esa danza. NUNCA llamar execute_content_plan sobre los slugs en affected_plan_item_slugs sin antes completar (1) y (2): el executor tira "Asset strategy ai_avatar_* is not supported by execute_content_plan in v1" y aborta el item. Cuando el user pide "arrancá con los primeros 2 posteos" y uno de esos 2 está en affected_plan_item_slugs, hacer la danza para ese antes de publicar.`,
-  };
+  // Auto-chain (2026-05-28): execute_content_plan now materializes
+  // ai_avatar_lipsync and ai_avatar_video sources inline as part of its
+  // async pipeline (the resolveAssetSourceFresh branch for these source
+  // types calls executeAvatarVideoPipeline + uploadFromUrl). The agent no
+  // longer needs to run a separate generate_avatar_video / lipsync step,
+  // swap the source to asset_id via update_content_plan, and re-execute.
+  //
+  // Surfacing this block to the agent regressed the UX: agents added a
+  // "necesita un paso extra de mi parte" note to the user even though the
+  // executor handles it now. The block is permanently disabled here; the
+  // type and field stay around so existing callers (and the response shape)
+  // do not break. The function returns null unconditionally.
+  void plan_items;
+  return null;
 }
 
 function describeAssetSource(
@@ -6805,6 +7048,86 @@ async function autoCorrectInvertedVideoSources(
   return corrections;
 }
 
+/**
+ * Inspect every AssetSource on a sub_post that carries an aspect_ratio field
+ * and confirm the ratio is publishable on the sub_post's destination network.
+ * Returns one blocker entry per offending source. Sources without an
+ * aspect_ratio field (avatar_lipsync, avatar_video, ai_generate video, url,
+ * asset_id) are skipped: their aspect is either derived elsewhere or
+ * irrelevant to the publish-time check.
+ */
+function collectAspectRatioIssues(
+  sp: SubPost,
+  sub_post_index: number,
+): Array<Record<string, unknown>> {
+  const issues: Array<Record<string, unknown>> = [];
+  const network = sp.social_network;
+  const productType = sp.product_type;
+  const allowed = allowedAspectRatiosForNetwork(network, productType);
+  const defaultAspect = deriveAspectRatio(network, productType, sp.asset_layout);
+  const displayNetwork = displayNetworkName(network);
+  const allowedLabel = allowed.join(", ");
+
+  const checkAspect = (
+    ratio: AspectRatio | undefined,
+    location: string,
+    asset_kind: "image" | "video",
+  ) => {
+    if (!ratio) return;
+    if (isAspectRatioAllowedForNetwork(ratio, network, productType)) return;
+    issues.push({
+      issue: "aspect_ratio_not_supported_for_network",
+      sub_post_index,
+      network,
+      product_type: productType,
+      asset_kind,
+      offending_aspect_ratio: ratio,
+      allowed_aspect_ratios: [...allowed],
+      location,
+      user_facing_message: `El ${asset_kind === "video" ? "video" : "asset visual"} para ${displayNetwork} (${productType}) está pedido en ${ratio}, pero ${displayNetwork} solo publica en ${allowedLabel}. Lo dejo en ${defaultAspect} (el default razonable para esa red) o decime vos cuál.`,
+      resolution_options: [
+        {
+          id: "auto_correct_to_default",
+          description: `Set aspect_ratio to ${defaultAspect} (the network's natural default).`,
+          user_facing_description: `Lo paso a ${defaultAspect}, que es lo que ${displayNetwork} acepta por default.`,
+        },
+        {
+          id: "pick_allowed_aspect",
+          description: `Override with one of the allowed ratios: ${allowedLabel}.`,
+          user_facing_description: `Elegí entre ${allowedLabel}.`,
+        },
+        {
+          id: "drop_subpost",
+          description: `Remove the ${displayNetwork} sub_post if the ratio is fundamental to the asset.`,
+          user_facing_description: `Saco el post de ${displayNetwork} y dejo solo las otras redes.`,
+        },
+      ],
+    });
+  };
+
+  const visitImageSource = (
+    src: NonNullable<AssetsStrategy["image_source"]>,
+    location: string,
+  ) => {
+    if (src.type === "ai_generate") checkAspect(src.aspect_ratio, location, "image");
+    if (src.type === "concept_only_image") checkAspect(src.aspect_ratio, location, "image");
+  };
+  if (sp.assets_strategy.image_source) {
+    visitImageSource(sp.assets_strategy.image_source, "image_source");
+  }
+  if (sp.assets_strategy.carousel_sources) {
+    sp.assets_strategy.carousel_sources.forEach((src, idx) => {
+      visitImageSource(src, `carousel_sources[${idx}]`);
+    });
+  }
+  const vs = sp.assets_strategy.video_source;
+  if (vs?.type === "concept_only_video") {
+    checkAspect(vs.aspect_ratio, "video_source", "video");
+  }
+
+  return issues;
+}
+
 async function runValidation(args: {
   plan_items: PlanItem[];
   time_window: { start: string; end: string };
@@ -6967,6 +7290,23 @@ async function runValidation(args: {
           detail: shapeBlocker,
         });
         continue;
+      }
+
+      // Aspect ratio per-network compatibility. Some networks reject assets
+      // generated with an aspect ratio they do not support at publish time
+      // (TikTok feed rejects anything other than 9:16; YouTube long_video
+      // rejects 9:16; IG feed accepts 1:1 / 4:3 / 3:4 / 16:9 but not 9:16).
+      // The model that generates the asset usually accepts more ratios than
+      // the destination network does, so a permissive zod schema would let
+      // the agent pass an aspect_ratio override that the network later
+      // rejects after the credits were already spent. Blocker emitted here
+      // so the user fixes it BEFORE generation runs.
+      const aspectIssues = collectAspectRatioIssues(sp, i);
+      for (const issue of aspectIssues) {
+        blockers.push({
+          ...issue,
+          item: item.slug,
+        });
       }
 
       if (

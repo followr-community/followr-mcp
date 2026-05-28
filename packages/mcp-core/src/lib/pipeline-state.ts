@@ -62,6 +62,15 @@ export interface PipelineState {
   created_at_ms: number;
   updated_at_ms: number;
   expires_at_ms: number;
+  // Set when the pipeline reached a terminal phase (completed / failed /
+  // cancelled). Used by list_pending_pipelines to filter recently-finished
+  // work the user has not yet seen in chat.
+  terminal_at_ms: number | null;
+  // Set when the agent surfaced the terminal state to the user in chat
+  // via mark_pipeline_acknowledged. Pipelines with this field non-null
+  // are excluded from list_pending_pipelines results so they only get
+  // mentioned once.
+  acknowledged_at_ms: number | null;
 
   // Status.
   phase: PipelinePhase;
@@ -100,6 +109,19 @@ export interface PipelineState {
 // fit comfortably. After this the state is gone but Followr ai_results
 // can be recovered via list_ai_results.
 const PIPELINE_TTL_MS = 6 * 60 * 60 * 1000;
+
+// 5 days: extended TTL applied when a pipeline reaches a terminal phase
+// (completed / failed / cancelled). The window covers list_pending_pipelines
+// so a user who fires a long-running plan and comes back later in the week
+// still gets a one-line "your plan finished" surfaced when they open chat.
+// Pipelines older than this fall out silently, even when still unacked, so
+// the queue does not balloon for long-idle accounts.
+const PIPELINE_TERMINAL_TTL_MS = 5 * 24 * 60 * 60 * 1000;
+
+function applyTerminalTtl(state: PipelineState): void {
+  state.terminal_at_ms = Date.now();
+  state.expires_at_ms = state.terminal_at_ms + PIPELINE_TERMINAL_TTL_MS;
+}
 
 // Cap to prevent runaway clients from filling memory. 256 = ~50 content
 // plans worth of pipelines (~5 pipelines each, on the bigger end). Oldest
@@ -155,6 +177,8 @@ export function createPipeline(init: {
     created_at_ms: now,
     updated_at_ms: now,
     expires_at_ms: now + PIPELINE_TTL_MS,
+    terminal_at_ms: null,
+    acknowledged_at_ms: null,
     phase: "queued",
     current_sub_phase: init.initial_sub_phase ?? "queued",
     progress: init.initial_progress ?? null,
@@ -247,6 +271,7 @@ export function markPipelineCompleted(
   state.result = result;
   state.failure = null;
   state.updated_at_ms = Date.now();
+  applyTerminalTtl(state);
 }
 
 export function markPipelineFailed(
@@ -260,6 +285,7 @@ export function markPipelineFailed(
   state.estimated_remaining_seconds = 0;
   state.failure = failure;
   state.updated_at_ms = Date.now();
+  applyTerminalTtl(state);
 }
 
 export function markPipelineCancelled(pipeline_id: string): void {
@@ -269,6 +295,49 @@ export function markPipelineCancelled(pipeline_id: string): void {
   state.current_sub_phase = `cancelled at ${state.current_sub_phase}`;
   state.estimated_remaining_seconds = 0;
   state.updated_at_ms = Date.now();
+  applyTerminalTtl(state);
+}
+
+// ── Acknowledgment API ─────────────────────────────────────────────────────
+
+export interface PendingPipelinesFilter {
+  company_id?: number;
+  max_age_days?: number;
+}
+
+/**
+ * Pipelines that already reached a terminal state and have not been
+ * surfaced to the user in chat (acknowledged_at_ms is null). Default
+ * window is 5 days; older entries are silently skipped even when unacked
+ * to keep the queue from growing without bound on long-idle accounts.
+ */
+export function listPendingPipelines(
+  filter: PendingPipelinesFilter = {},
+): PipelineState[] {
+  pruneExpired();
+  const maxAgeMs = (filter.max_age_days ?? 5) * 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  const out: PipelineState[] = [];
+  for (const p of pipelines.values()) {
+    if (filter.company_id && p.company_id !== filter.company_id) continue;
+    if (p.terminal_at_ms === null) continue;
+    if (p.acknowledged_at_ms !== null) continue;
+    if (now - p.terminal_at_ms > maxAgeMs) continue;
+    out.push(p);
+  }
+  // Newest first.
+  out.sort((a, b) => (b.terminal_at_ms ?? 0) - (a.terminal_at_ms ?? 0));
+  return out;
+}
+
+export function markPipelineAcknowledged(pipeline_id: string): boolean {
+  const state = pipelines.get(pipeline_id);
+  if (!state) return false;
+  if (state.acknowledged_at_ms !== null) return false;
+  if (state.terminal_at_ms === null) return false;
+  state.acknowledged_at_ms = Date.now();
+  state.updated_at_ms = Date.now();
+  return true;
 }
 
 // ── Cancellation API ───────────────────────────────────────────────────────

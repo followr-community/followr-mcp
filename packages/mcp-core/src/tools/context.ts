@@ -21,6 +21,7 @@ import { z } from "zod";
 
 import type { RegisterOptions } from "../index.js";
 import { READ_ONLY } from "../lib/annotations.js";
+import { listPendingPipelines } from "../lib/pipeline-state.js";
 import { toolErrorFromException } from "../lib/tool-error.js";
 
 interface SocialNetworkLite {
@@ -57,7 +58,35 @@ function sanitizeCompany(company: Company) {
 const COMPANIES_PAGE_SIZE = 30;
 const COMPANIES_PAGE_LIMIT = 50;
 
-async function fetchAllCompanies(client: FollowrClient): Promise<{
+function buildPendingPipelinesHint(ownedCompanyIds: number[]): {
+  pending_pipelines_count: number;
+  pending_pipelines_hint: string | null;
+} {
+  // Count terminal pipelines (completed / failed / cancelled) within the
+  // 5-day window that the agent has not yet surfaced via
+  // mark_pipeline_acknowledged. The session bootstrapper does NOT list the
+  // entries themselves (that is what list_pending_pipelines is for); it just
+  // tells the agent whether to bother fetching them. Empty queue → null
+  // hint and the agent skips the round-trip entirely.
+  const allOwned = ownedCompanyIds.length > 0 ? ownedCompanyIds : null;
+  let count = 0;
+  if (allOwned === null) {
+    count = listPendingPipelines({}).length;
+  } else {
+    for (const cid of allOwned) {
+      count += listPendingPipelines({ company_id: cid }).length;
+    }
+  }
+  return {
+    pending_pipelines_count: count,
+    pending_pipelines_hint:
+      count > 0
+        ? `Hay ${count} pipeline${count === 1 ? "" : "s"} terminado${count === 1 ? "" : "s"} en los últimos 5 días que el user todavía no vio en chat. Antes de tu primera respuesta sustantiva, llamá list_pending_pipelines() para leer el detalle y abrí la conversación contándole lo que terminó. Después de mencionar cada uno, llamá mark_pipeline_acknowledged(pipeline_id) para que no se repita en la próxima sesión.`
+        : null,
+  };
+}
+
+export async function fetchAllCompanies(client: FollowrClient): Promise<{
   companies: Company[];
   hit_cap: boolean;
 }> {
@@ -104,7 +133,7 @@ OWNED VS ACCESSIBLE COMPANIES: the response field "companies" lists the companie
 
 NAME COLLISIONS: there are two kinds of collisions, and the response surfaces both.
 
-(1) OWNED VS ACCESSIBLE: when an accessible (guest) company shares the SAME name as an owned company, the response merges that guest company into user_facing_options with a "(invitada)" suffix and sets _assistant_guidance.has_name_collision = true. In that case, when you ask the user which company to use, ALWAYS surface both options together in the SAME first turn (e.g. 'Tenés acceso a 2 PipeLime: una es tuya y otra es donde sos invitado. ¿Cuál usamos?'). Do NOT pose a generic "which X do you mean?" without showing the owner/guest disambiguation up front. The id_lookup map already contains both name -> id mappings (the guest entry is keyed with the "(invitada)" suffix).
+(1) OWNED VS ACCESSIBLE: when an accessible (guest) company shares the SAME name as an owned company, the response merges that guest company into user_facing_options with a "(invitada)" suffix and sets _assistant_guidance.has_name_collision = true. In that case, when you ask the user which company to use, ALWAYS surface both options together in the SAME first turn (e.g. 'Tenés acceso a 2 PipeLime: una es tuya y otra es donde sos invitado. ¿Cuál usamos?'). Do NOT pose a generic "which X do you mean?" without showing the owner/guest disambiguation up front. The id_lookup map already contains both name -> id mappings (the guest entry is keyed with the "(invitada)" suffix). NEVER assume "they obviously mean their own one and not the guest one" and pick silently: prepare_content_plan_context will reject the call with company_disambiguation_required when has_name_collision was true and disambiguation_acknowledged was not passed (real session 2026-05-28: the agent saw two "PipeLime" in the user's options, decided the owned one was the right pick, did not ask, and the user only noticed the silent decision after the plan was drafted). Even when the owned company is the obvious one, the user must pick explicitly so they know which one they are working on.
 
 (2) OWNED VS OWNED (added 2026-05-26): when TWO companies the user owns share the same name (real case: two "PipeLime" companies the user created, both with the same website), user_facing_options shows each duplicated entry with a built-in disambiguator "(creada YYYY-MM-DD)". Same-day collisions automatically extend to "(creada YYYY-MM-DD HH:MM)"; pathological same-minute collisions get a trailing "opción 1 / opción 2". The numeric id is DELIBERATELY EXCLUDED from these labels and from any user-facing surface. _assistant_guidance.has_owned_name_collision is true and owned_name_collisions[].companies[] carries the id (for internal id_lookup resolution) PLUS additional non-id distinguishers: website, language, country_iso_code, description_excerpt (first ~140 chars with internal markers stripped) and disabled_at. CRITICAL: do NOT silently pick one of the duplicates and just mention it in passing ("estoy trabajando sobre la que tiene IG conectado"). That's exactly what the prior implementation did and the user could not even tell which was used. EQUALLY CRITICAL: do NOT surface the numeric id to the user, ever, in any form — not in tables ("PipeLime A (17889) vs PipeLime B (42129)"), not in inline references, not as a "tiebreaker", not as headers, not as parenthetical hints. Use the date, the description excerpt, the website or any combination of non-id fields. Surface ALL duplicated entries in user_facing_options together in the SAME AskUserQuestion call this turn, ENRICH the question with whichever extra distinguishers from owned_name_collisions[].companies[] differ between the dupes (e.g. "una con sitio pipelime.ai y descripción de freelancers, otra sin sitio y descripción enterprise"), and wait for the user's explicit pick before calling any tool with a company_id. id_lookup keys are the EXACT disambiguated labels, so the user's pick resolves cleanly to a company_id internally.
 
@@ -455,6 +484,7 @@ If creative work follows (post generation, scheduling), consider calling get_com
           has_owned_name_collision: hasOwnedNameCollision,
           owned_name_collisions: ownedCollisionDetails,
           plan_capability_warnings: planCapabilityWarnings,
+          ...buildPendingPipelinesHint(ownedCompanies.map((c) => c.id)),
         },
       };
       if (hasAdminScope) {

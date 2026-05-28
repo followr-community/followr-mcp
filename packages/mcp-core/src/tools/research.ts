@@ -795,11 +795,13 @@ OUTPUT:
 - sufficiency: complete | partial | thin, with recommendations to enrich data.
 - hints_for_llm_fallback (only when sufficiency is thin and ecommerce extraction failed): platform_detected, sitemap_urls_to_try, og_image, next_steps_for_agent so the LLM can recover via WebFetch or user prompts.
 - meta: extractors_succeeded, extractors_failed, parser_used, requires_js_render, platform_detected, sitemap_diagnostics, duration_ms.
-- cache_suggestion: deep_research now persists the [industry:<id>@<date>] marker on Company.description automatically before returning, so subsequent prepare_content_plan_context / draft_content_plan calls read cached_industry and skip the re-classification. The suffix in cache_suggestion.suffix_to_append is what was applied; cache_suggestion.persisted is true when the write succeeded (false + persistence_error when not, in which case the planning tools will trigger another deep_research instead of reading from cache). The agent does NOT need to call any follow-up tool to apply the cache.
+- available_industries: full catalog of industry ids (except generic_business fallback) for the agent to map the user's free-text answer onto when calling confirm_industry.
+- cache_suggestion: as of 2026-05-28 deep_research NO LONGER writes the auto [industry:<id>@<date>] marker on Company.description. The keyword heuristic was wrong too often on minimalist SaaS landings and the auto write enabled silent classification (the agent took the heuristic at face value and called confirm_industry without ever giving the user a real chance to weigh in). The marker now lives behind confirm_industry only. cache_suggestion.suffix_proposed exposes the candidate suffix for diagnostics; cache_suggestion.persisted is always false now. To unblock draft_content_plan: present detected_industry to the user with available_industries as alternatives, get an explicit pick, and call confirm_industry(company_id, industry_id) with the user's choice.
 
 LIMITATIONS:
 - Pure custom SPAs without documented APIs and without a sitemap may still return empty. The tool surfaces hints_for_llm_fallback in that case so the LLM can try its own WebFetch on specific URLs.
-- The classifier works best in es / en. Other languages: the heuristic still runs on universal keywords (most strong keywords have es+en synonyms) but confidence may be lower; the LLM client handles the ambiguous case.`,
+- The classifier works best in es / en. Other languages: the heuristic still runs on universal keywords (most strong keywords have es+en synonyms) but confidence may be lower; the LLM client handles the ambiguous case.
+- detected_industry is a NOISY HINT, not a ground truth. The LLM client (you) is structurally a better classifier than the keyword scorer: you can read the scraped text + og metadata + product names + content_pillars_inferred and make a judgment call. Always present the proposal to the user before confirm_industry. NEVER call confirm_industry with the keyword scorer's pick without the user weighing in: the 2026-05-28 PipeLime session is the canonical anti-pattern (heuristic said local_business, agent overrode silently to saas reading the page, told the user 'te confirmo SaaS y avanzamos' but never paused for an explicit yes; the user only noticed after the plan was drafted).`,
       inputSchema: {
         company_id: z.number().int().positive(),
         website_url: z
@@ -1020,31 +1022,27 @@ LIMITATIONS:
           }
         }
 
-        // 12.5. Persist the industry cache to Company.description so that
-        //       downstream planning tools (prepare_content_plan_context,
-        //       draft_content_plan) can read cached_industry on subsequent
-        //       calls without re-classifying or asking the agent to write
-        //       it back manually. The MCP exposes no generic update_company
-        //       tool to the agent on purpose (Company has many sensitive
-        //       fields); leaving the cache persistence to the agent created
-        //       a structural block where draft_content_plan refused to run
-        //       because cached_industry was null and the agent had no tool
-        //       to fix it. We do it here, where we know exactly the right
-        //       suffix and we are already paying the deep_research cost.
+        // 12.5. NO auto-marker write (changed 2026-05-28). Earlier behavior
+        //       persisted the keyword scorer's pick to Company.description as
+        //       an auto [industry:<id>@<date>] marker so subsequent
+        //       prepare_content_plan_context calls could read cached_industry.
+        //       That auto write turned out to be the silent-classification
+        //       enabler observed in the PipeLime 2026-05-28 share: the
+        //       heuristic said local_business, the agent silently corrected to
+        //       saas reading the page, called confirm_industry without an
+        //       explicit user pick, and the user only noticed after the plan
+        //       was drafted. Now the marker only gets written by
+        //       confirm_industry (always with the :confirmed flag), which
+        //       requires the agent to surface the proposal to the user first.
+        //       cachePersisted stays false so the response makes the
+        //       behavior change visible.
         const suffix = buildCacheSuffix(profile.id);
-        let cachePersisted: { ok: true } | { ok: false; reason: string };
-        try {
-          const newDescription = applyCacheSuffixToDescription(description, suffix);
-          if (newDescription !== description) {
-            await client.updateCompany(company_id, { description: newDescription });
-          }
-          cachePersisted = { ok: true };
-        } catch (err) {
-          cachePersisted = {
-            ok: false,
-            reason: err instanceof Error ? err.message : String(err),
-          };
-        }
+        const cachePersisted: { ok: false; reason: string } = {
+          ok: false,
+          reason:
+            "deep_research no longer writes the auto marker. The marker is only written by confirm_industry after explicit user confirmation. Surface detected_industry to the user with available_industries as alternatives, then call confirm_industry with their pick.",
+        };
+        void description;
 
         // 13. Build response.
         const response = buildFullResult({
@@ -1701,12 +1699,19 @@ function buildFullResult(input: BuildFullResultInput) {
     },
     cache_suggestion: {
       field: "description",
-      suffix_to_append: buildCacheSuffix(input.profile.id),
-      note: input.cachePersisted.ok
-        ? "Already applied. deep_research wrote this suffix to Company.description so prepare_content_plan_context / draft_content_plan will read cached_industry on the next call without further action from the agent. The suffix is shown here for transparency only."
-        : `deep_research attempted to persist this suffix to Company.description and FAILED (${input.cachePersisted.reason}). The next planning call will re-run deep_research instead of reading the cache. Consider retrying deep_research with force_refresh: false to attempt the persistence again, or surface the failure to the user.`,
-      persisted: input.cachePersisted.ok,
+      suffix_proposed: buildCacheSuffix(input.profile.id),
+      note: "deep_research no longer auto-writes the cache marker. Present detected_industry to the user with available_industries as alternatives. When the user picks, call confirm_industry(company_id, industry_id) and the :confirmed marker gets written there.",
+      persisted: false,
       persistence_error: input.cachePersisted.ok ? null : input.cachePersisted.reason,
+    },
+    available_industries: ALL_INDUSTRY_IDS.filter((id) => id !== "generic_business").map((id) => ({
+      id,
+      display_name: INDUSTRY_PROFILES[id]?.display_name ?? id,
+    })),
+    _assistant_guidance: {
+      next_step: "propose_industry_to_user_then_confirm",
+      instructions:
+        "STEP 1. Look at detected_industry (keyword heuristic best guess), content_pillars_inferred, og metadata, scraped product names, and the company description. Make YOUR OWN classification call based on the actual content; the keyword scorer is noisy on minimalist SaaS / B2B landings. STEP 2. Present the proposal to the user explicitly. Phrase it as a question they have to answer, not as a 'te confirmo X y avanzamos'. Show 2-3 candidate industries from available_industries so they can correct. STEP 3. Wait for an explicit pick. STEP 4. Call confirm_industry(company_id, industry_id) with their pick. NEVER call confirm_industry with the heuristic's pick without an explicit user yes. The :confirmed marker on Company.description is the unblock for draft_content_plan, and it should reflect the user's choice, not the heuristic's.",
     },
   };
 }

@@ -21,7 +21,9 @@ import type { RegisterOptions } from "../index.js";
 import { MUTATION_OPEN_WORLD, READ_ONLY } from "../lib/annotations.js";
 import {
   getPipeline,
+  listPendingPipelines,
   listPipelinesForCompany,
+  markPipelineAcknowledged,
   type PipelineState,
   requestPipelineCancellation,
 } from "../lib/pipeline-state.js";
@@ -60,6 +62,9 @@ function serializePipeline(state: PipelineState): Record<string, unknown> {
 function humanizePhase(kind: PipelineState["kind"], subPhase: string): string {
   if (subPhase.startsWith("queued")) return "en cola";
   if (subPhase.startsWith("starting")) return "arrancando";
+  if (subPhase.startsWith("materialize_avatar_assets"))
+    return "generando los avatares del plan";
+  if (subPhase.startsWith("materializing_avatar")) return "generando un avatar";
   if (subPhase.startsWith("backgrounds")) return "generando los fondos de cada scene";
   if (subPhase.startsWith("tts")) return "generando los audios de cada scene";
   if (subPhase.startsWith("lipsync")) return "rendereando los videos del avatar (lipsync)";
@@ -69,6 +74,13 @@ function humanizePhase(kind: PipelineState["kind"], subPhase: string): string {
   if (subPhase.startsWith("submitting")) return "enviando el pedido a Creative Studio";
   if (subPhase.startsWith("rendering slides")) return "rendereando los slides del creative";
   if (subPhase.startsWith("uploading slides")) return "subiendo los slides a tu Media Library";
+  if (subPhase.startsWith("resolving_assets")) return "generando las imágenes y videos del plan";
+  if (subPhase.startsWith("creating_post_groups")) return "creando los post groups en Followr";
+  if (subPhase.startsWith("scheduling_posts")) return "calendarizando los posteos";
+  if (subPhase.startsWith("executing_item:")) {
+    const slug = subPhase.split(":")[1] ?? "";
+    return `ejecutando el día "${slug}"`;
+  }
   if (subPhase.startsWith("executing")) return "ejecutando los items del plan";
   if (subPhase === "completed") return "terminado";
   if (subPhase.startsWith("failed")) return `falló: ${subPhase}`;
@@ -104,6 +116,50 @@ function buildUserFacingSummary(state: PipelineState, phaseEs: string): string {
     case "cancelled":
       return "Cancelado a pedido tuyo. Los jobs ya enviados al backend siguen corriendo (Followr no tiene API de abort) pero el orquestador no avanza más fases. Los créditos ya gastados no se recuperan.";
   }
+}
+
+function describeRelativeAge(hoursAgo: number): string {
+  if (hoursAgo < 1) return "hace menos de una hora";
+  if (hoursAgo < 24) return `hace ${hoursAgo} ${hoursAgo === 1 ? "hora" : "horas"}`;
+  const days = Math.floor(hoursAgo / 24);
+  if (days === 1) return "ayer";
+  if (days < 7) return `hace ${days} días`;
+  return `hace más de una semana`;
+}
+
+function describePipelineKind(kind: PipelineState["kind"]): string {
+  switch (kind) {
+    case "avatar_video":
+      return "un reel con avatar";
+    case "avatar_lipsync":
+      return "un clip de avatar (single-scene)";
+    case "brand_creative":
+      return "una pieza con Creative Studio";
+    case "ai_video_clip":
+      return "un video AI";
+    case "content_plan_execution":
+      return "un plan de contenido";
+  }
+}
+
+function buildPendingPipelineIntro(
+  state: PipelineState,
+  completedHoursAgo: number,
+): string {
+  const kindLabel = describePipelineKind(state.kind);
+  const ageLabel = describeRelativeAge(completedHoursAgo);
+  const phaseLabel = state.phase;
+  if (phaseLabel === "completed") {
+    return `${ageLabel.charAt(0).toUpperCase()}${ageLabel.slice(1)} el usuario disparó ${kindLabel} y se fue mientras corría el pipeline. Recién terminó y todavía no se enteró en chat. Empezá tu primera respuesta de la sesión avisándole que está listo, resumí en una o dos líneas qué quedó publicado / generado (leé result.metadata si lo necesitás), y después llamá mark_pipeline_acknowledged(pipeline_id) para que esto no se repita en la próxima sesión.`;
+  }
+  if (phaseLabel === "failed") {
+    const reason = state.failure?.user_message ?? "no se registró el motivo";
+    return `${ageLabel.charAt(0).toUpperCase()}${ageLabel.slice(1)} el usuario disparó ${kindLabel} y se fue. El pipeline falló durante la ejecución (motivo: ${reason}). Empezá tu primera respuesta avisándole que tuvimos un problema con el flujo, qué se pudo / no se pudo terminar, y ofrecé reintentar. Después llamá mark_pipeline_acknowledged(pipeline_id).`;
+  }
+  if (phaseLabel === "cancelled") {
+    return `${ageLabel.charAt(0).toUpperCase()}${ageLabel.slice(1)} se canceló ${kindLabel} a pedido del usuario. Si retomamos la conversación, confirmá que la cancelación se ejecutó y los créditos ya gastados no vuelven. Después llamá mark_pipeline_acknowledged(pipeline_id).`;
+  }
+  return `${ageLabel.charAt(0).toUpperCase()}${ageLabel.slice(1)} terminó ${kindLabel} en estado ${phaseLabel}. Resumí al usuario lo que pasó y llamá mark_pipeline_acknowledged(pipeline_id).`;
 }
 
 function formatRemaining(seconds: number): string {
@@ -176,9 +232,29 @@ WHEN PIPELINE_ID IS NOT FOUND: returns reason=pipeline_id_not_found_or_expired. 
       title: "Wait up to N seconds for an async pipeline to reach a terminal state (bounded poll)",
       description: `Poll a pipeline until it reaches a terminal state (completed, failed, cancelled) or the bounded wait elapses, whichever comes first. The max wait is HARD-CAPPED at 180 seconds (3 min) to stay safely under every MCP transport timeout (claude.ai cuts at ~4 min, others at 5+ min).
 
-WHEN TO CALL: when the user explicitly says "esperá" / "quédate ahí" / "no me hagas volver". The tool returns either the final result (if completed in the window) OR a still_running state with the latest phase if the cap elapses.
+WHEN TO CALL: when the user explicitly says "esperá" / "quédate ahí" / "no me hagas volver" / "contame cómo va". The tool returns either the final result (if completed in the window) OR a still_running state with the latest phase if the cap elapses.
 
-DO NOT call back-to-back in a loop. After a still_running return, tell the user something like "Sigue, ¿esperás otro toque o querés seguir con otra cosa?" and let them decide. Looping by yourself burns no credits but wastes the user's wall clock and looks neurotic.
+CHAINED-NARRATION PATTERN ("stay-with-me" mode for execute_content_plan): the user wants to see live progress without leaving the chat. The right shape is short waits (max_wait_seconds=60) interleaved with a narration turn each time the tool returns. Example for a 7-day plan:
+
+  Turn 1 (after execute_content_plan with wait:false):
+    Agent: "Lo dejo en background y volvés cuando quieras, o querés que te vaya contando cómo va?"
+    User: "contame"
+  Turn 2:
+    Agent calls wait_for_pipeline(pipeline_id, max_wait_seconds=60) → returns still_running with current_sub_phase="materialize_avatar_assets", progress={1, 3}
+    Agent: "Voy generando los avatares del lunes y jueves, 1 de 3 listo." → calls wait_for_pipeline again with max_wait_seconds=60
+  Turn 3:
+    wait returns still_running with current_sub_phase="resolving_assets", progress={4, 14}
+    Agent: "Avatares listos. Estoy generando las imágenes ahora, 4 de 14." → next wait
+  ...
+  Turn N (terminal):
+    wait returns phase="completed", result.metadata has the executed_slugs / totals
+    Agent: "Listo. Quedó todo calendarizado. Te resumo: ..."
+
+Why this shape works: each iteration's wait is short enough that the model never blocks the WebSocket for too long, and the narration between iterations keeps claude.ai's connection alive and the user engaged. Looping with max_wait_seconds=180 silently three times in a row is the anti-pattern — the user sees a spinner for 9 min with no signal that you are doing anything. Cap at 60s per wait when narrating live; bump to 180s only when the user explicitly says "esperá callado".
+
+SET-AND-FORGET (the default): user closes claude.ai right after the initial confirmation. The pipeline runs in Followr backend. When the user next opens a conversation, get_session_context._assistant_guidance.pending_pipelines_count is non-zero and list_pending_pipelines surfaces the summary. wait_for_pipeline is NOT used in this mode.
+
+DO NOT call back-to-back in a loop WITHOUT narrating to the user between iterations. A silent loop wastes wall clock and feels broken. After a still_running return, ALWAYS speak the user-visible progress (current_sub_phase + progress + ETA) BEFORE the next wait.
 
 For instant status checks (no waiting), use get_pipeline_status instead.`,
       inputSchema: {
@@ -316,6 +392,145 @@ PRECONDITION: company_id required. If multiple companies and the user hasn't nam
                 null,
                 2,
               ),
+            },
+          ],
+        };
+      } catch (err) {
+        return toolErrorFromException(err);
+      }
+    },
+  );
+
+  // ── list_pending_pipelines ───────────────────────────────────────────
+  server.registerTool(
+    "list_pending_pipelines",
+    {
+      annotations: READ_ONLY,
+      title: "Surface recent terminal pipelines the user has not seen in chat yet",
+      description: `List pipelines that finished (completed / failed / cancelled) in the last 5 days AND were never explicitly mentioned to the user in chat. Use this to close the set-and-forget loop: the user fires a long-running plan, walks away, and comes back later (sometimes hours, sometimes days). When they open a new conversation, get_session_context._assistant_guidance.pending_pipelines_count tells you whether there is anything to surface. If it is non-zero, call this tool BEFORE your first substantive message of the session and lead with a one-line recap of what finished.
+
+WHEN TO CALL: at the start of any conversation when get_session_context.pending_pipelines_count > 0. Optionally call again later in the same conversation if the user explicitly asks "che, qué quedó pendiente?".
+
+PRECONDITION: company_id optional. Omit to span every company the user owns; pass company_id when the conversation is already anchored on a specific brand.
+WINDOW: hard-coded 5 days from terminal_at_ms. Older pipelines drop off silently to keep the queue bounded.
+ACKNOWLEDGMENT FLOW: when you mention any returned pipeline to the user, immediately call mark_pipeline_acknowledged(pipeline_id) so the next session does not surface it again. The intro_for_agent field already includes a draft opener that you can adapt verbatim.
+OUTPUT: pipelines_to_surface[] sorted by terminal_at_ms desc. Each entry has the pipeline_id, kind, company_id, terminal phase, completed_at, completed_hours_ago, user_facing_summary (one line you can read verbatim) and intro_for_agent (a multi-sentence brief that contextualizes the work for the user). When the list is empty the response shape stays the same with pipelines_to_surface: [] and you do NOT need to say anything to the user.`,
+      inputSchema: {
+        company_id: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe("Filter by company. Omit to span every company the user owns."),
+        max_age_days: z
+          .number()
+          .int()
+          .min(1)
+          .max(30)
+          .optional()
+          .describe("Override the default 5-day window. Capped at 30 days."),
+      },
+    },
+    async ({ company_id, max_age_days }) => {
+      try {
+        const pipelines = listPendingPipelines({
+          ...(company_id !== undefined ? { company_id } : {}),
+          ...(max_age_days !== undefined ? { max_age_days } : {}),
+        });
+        const now = Date.now();
+        const surface = pipelines.map((p) => {
+          const phaseLabelEs = humanizePhase(p.kind, p.current_sub_phase);
+          const completedAt = p.terminal_at_ms ?? p.updated_at_ms;
+          const completedHoursAgo = Math.round((now - completedAt) / (60 * 60 * 1000));
+          const intro = buildPendingPipelineIntro(p, completedHoursAgo);
+          return {
+            pipeline_id: p.pipeline_id,
+            kind: p.kind,
+            company_id: p.company_id,
+            phase: p.phase,
+            completed_at_iso: new Date(completedAt).toISOString(),
+            completed_hours_ago: completedHoursAgo,
+            user_facing_summary: buildUserFacingSummary(p, phaseLabelEs),
+            intro_for_agent: intro,
+          };
+        });
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  pipelines_to_surface: surface,
+                  count: surface.length,
+                  _assistant_guidance: {
+                    next_step:
+                      surface.length > 0
+                        ? "surface_pending_pipelines_to_user_then_ack"
+                        : "no_pending_pipelines",
+                    instructions:
+                      surface.length > 0
+                        ? "Lead your first response of the session with the intro_for_agent text adapted to natural Spanish (do NOT paste it verbatim if the wording feels mechanical). Mention every pipeline returned; the user fired them and is waiting on the outcome. After mentioning each one, call mark_pipeline_acknowledged(pipeline_id) so it does not get surfaced again next session."
+                        : "Nothing to surface. Continue the conversation as usual.",
+                  },
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (err) {
+        return toolErrorFromException(err);
+      }
+    },
+  );
+
+  // ── mark_pipeline_acknowledged ───────────────────────────────────────
+  server.registerTool(
+    "mark_pipeline_acknowledged",
+    {
+      annotations: MUTATION_OPEN_WORLD,
+      title: "Mark a terminal pipeline as already mentioned to the user in chat",
+      description: `Record that you (the agent) mentioned this pipeline to the user. After this call list_pending_pipelines no longer returns the entry, so next session will not double-surface the same completion.
+
+WHEN TO CALL: immediately after you tell the user about a finished pipeline (typically right after list_pending_pipelines surfaces it). One call per pipeline_id; safe to skip if you decided not to mention it (e.g. the user was not interested or the pipeline is stale from a different workflow).
+
+RETURNS ok: true on success, ok: false with reason when the pipeline is already acked, was never terminal, or expired from in-memory state.`,
+      inputSchema: {
+        pipeline_id: z.string().min(1),
+      },
+    },
+    async ({ pipeline_id }) => {
+      try {
+        const accepted = markPipelineAcknowledged(pipeline_id);
+        if (!accepted) {
+          const state = getPipeline(pipeline_id);
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify(
+                  {
+                    ok: false,
+                    reason: !state
+                      ? "pipeline_id_not_found_or_expired"
+                      : state.acknowledged_at_ms !== null
+                        ? "already_acknowledged"
+                        : "not_in_terminal_phase",
+                    pipeline_id,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({ ok: true, pipeline_id }, null, 2),
             },
           ],
         };

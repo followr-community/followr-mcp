@@ -42,18 +42,30 @@ export interface NormalizationResult {
   errors: NormalizationError[];
 }
 
+export type AspectRatio = "1:1" | "4:3" | "16:9" | "3:4" | "9:16";
+
 /**
  * Derive aspect ratio from network + asset_layout when the agent did not
  * provide an override. Mirrors the documented per-network defaults in the
  * AssetSourceAiImageSchema description.
+ *
+ * The vertical-formats short-circuit covers reel / short / story across every
+ * network. TikTok feed is vertical-only too, so it is treated like a vertical
+ * format even though product_type === "feed". Without this case the function
+ * used to fall through to the 1:1 default and the agent would generate a 1:1
+ * clip that TikTok rejects at publish time.
  */
 export function deriveAspectRatio(
   network: SocialNetwork,
   product_type: ProductType,
   layout: AssetLayout,
-): "1:1" | "4:3" | "16:9" | "3:4" | "9:16" {
+): AspectRatio {
   // Vertical formats always 9:16
   if (product_type === "reel" || product_type === "short" || product_type === "story") {
+    return "9:16";
+  }
+  // TikTok feed is vertical-only despite product_type=feed.
+  if (network === "tiktok") {
     return "9:16";
   }
   // YouTube long is landscape
@@ -74,6 +86,66 @@ export function deriveAspectRatio(
   }
   // Instagram / Facebook / Threads / Bluesky: 1:1 feed default
   return "1:1";
+}
+
+/**
+ * Aspect ratios the (network, product_type) combination accepts at publish
+ * time. Used by the plan validator to surface a blocker BEFORE generation
+ * starts, so the agent does not burn credits producing assets the network
+ * will reject.
+ *
+ * Rules captured here mirror the network-level publish constraints, not the
+ * AI model's accepted output ratios. The model usually accepts more shapes
+ * than the destination network does. The check is per sub_post: the same
+ * source can be rejected for TikTok and accepted for Instagram feed.
+ */
+export function allowedAspectRatiosForNetwork(
+  network: SocialNetwork,
+  product_type: ProductType,
+): ReadonlyArray<AspectRatio> {
+  // Vertical-only formats across networks.
+  if (product_type === "reel" || product_type === "short" || product_type === "story") {
+    return ["9:16"];
+  }
+  if (network === "tiktok") {
+    return ["9:16"];
+  }
+  if (product_type === "long_video") {
+    return ["16:9"];
+  }
+  switch (network) {
+    case "instagram":
+      return ["1:1", "4:3", "3:4", "16:9"];
+    case "facebook":
+      return ["1:1", "4:3", "3:4", "16:9", "9:16"];
+    case "linkedin":
+      return ["1:1", "4:3", "16:9"];
+    case "pinterest":
+      return ["3:4", "1:1", "9:16"];
+    case "x":
+    case "threads":
+    case "bluesky":
+      return ["1:1", "16:9", "9:16", "3:4", "4:3"];
+    case "youtube":
+      return ["16:9"];
+    default: {
+      const exhaustive: never = network;
+      void exhaustive;
+      return ["1:1"];
+    }
+  }
+}
+
+/**
+ * Convenience predicate. Returns true when `aspect` is one of the ratios the
+ * (network, product_type) combination accepts at publish time.
+ */
+export function isAspectRatioAllowedForNetwork(
+  aspect: AspectRatio,
+  network: SocialNetwork,
+  product_type: ProductType,
+): boolean {
+  return allowedAspectRatiosForNetwork(network, product_type).includes(aspect);
 }
 
 /**
