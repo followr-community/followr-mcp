@@ -63,7 +63,9 @@ function humanizePhase(kind: PipelineState["kind"], subPhase: string): string {
   if (subPhase.startsWith("backgrounds")) return "generando los fondos de cada scene";
   if (subPhase.startsWith("tts")) return "generando los audios de cada scene";
   if (subPhase.startsWith("lipsync")) return "rendereando los videos del avatar (lipsync)";
+  if (subPhase.startsWith("probing_durations")) return "midiendo la duración exacta de cada escena";
   if (subPhase.startsWith("concat")) return "uniendo las escenas con subtítulos";
+  if (subPhase.startsWith("library_upload")) return "subiendo el video a tu Media Library";
   if (subPhase.startsWith("submitting")) return "enviando el pedido a Creative Studio";
   if (subPhase.startsWith("rendering slides")) return "rendereando los slides del creative";
   if (subPhase.startsWith("uploading slides")) return "subiendo los slides a tu Media Library";

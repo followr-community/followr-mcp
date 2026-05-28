@@ -50,7 +50,7 @@ import {
   toCreativeStudioAspectRatio,
 } from "../lib/aspect-ratio-translate.js";
 import { scrapeBrandSignalsFromWebsite } from "../lib/brand-website-scraper.js";
-import { invalidateContextsForCompany } from "../lib/content-plan-state.js";
+import { patchContextsForCompany } from "../lib/content-plan-state.js";
 import {
   createPipeline,
   markPipelineCompleted,
@@ -686,7 +686,9 @@ USAGE FLOW:
 3. If user picks one: confirm_visual_style({ company_id, primary_slug }) persists it
 4. If user wants alternatives: propose_visual_style_options with exclude_slugs to iterate
 
-INTEGRATION WITH generate_brand_creative: once confirmed, generate_brand_creative uses the cached primary_slug as default when style_key is not passed explicitly. The user no longer needs to pick a style every time.`,
+INTEGRATION WITH generate_brand_creative: once confirmed, generate_brand_creative uses the cached primary_slug as default when style_key is not passed explicitly. The user no longer needs to pick a style every time.
+
+RELATED TOOLS (named explicitly so the host's tool-search precaches them): list_visual_styles, propose_visual_style_options, confirm_visual_style, generate_brand_creative, prepare_content_plan_context, draft_content_plan.`,
       inputSchema: {
         company_id: z.number().int().positive(),
         force_refresh: z
@@ -1147,11 +1149,14 @@ DO NOT USE THIS for one-off overrides. If the user just wants this particular cr
 
         const newDescription = appendVisualStyleMarker(description, primary_slug);
         await client.updateCompany(company_id, { description: newDescription });
-        // Drop cached content-plan contexts for this company: their
-        // has_visual_style_marker snapshot was false and downstream tools
-        // (draft_content_plan, brand_visual_identity_setup_proposal) would
-        // still rely on the stale value.
-        invalidateContextsForCompany(company_id);
+        // Patch cached content-plan contexts in place instead of evicting
+        // them. The only field that changes is has_visual_style_marker;
+        // brief, budget, networks, etc. did not. Evicting would force the
+        // agent to re-call prepare_content_plan_context just to flip this
+        // single bool, which is exactly the round-trip the PipeLime
+        // 2026-05-28 session paid (draft_content_plan failed with
+        // context_id_invalid_or_expired). See patchContextsForCompany.
+        patchContextsForCompany(company_id, { has_visual_style_marker: true });
 
         const styleInfo = getStyleBySlug(primary_slug);
         const displayName =

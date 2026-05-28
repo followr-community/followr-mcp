@@ -18,7 +18,15 @@
 
 import type { AiResult, Avatar, FollowrClient } from "@followr-mcp/shared";
 
+import { probeMp4Duration } from "./mp4-probe.js";
 import { PipelineFailedException } from "./pipeline-exceptions.js";
+
+// Natural tail buffer appended to each scene's render duration. Gives the
+// avatar a microframe of close before any transition. Without it, even with
+// the EXACT lipsync duration, the cut feels mechanical (no breath between
+// scenes). 0.25s is imperceptible as "freeze" but kills the abruptness; see
+// PipeLime cortado fix 2026-05-28.
+const SCENE_TAIL_BUFFER_SECONDS = 0.25;
 
 // Re-export so callers that imported the exceptions from this file (legacy
 // v0.5.0) keep compiling. Canonical location is lib/pipeline-exceptions.ts.
@@ -126,13 +134,17 @@ export function estimateAvatarVideoSeconds(
 
 // ── Internals ──────────────────────────────────────────────────────────────
 
-// Per-scene duration estimate from script length. ElevenLabs tts_3 reads
+// Per-scene duration FALLBACK from script length. ElevenLabs tts_3 reads
 // roughly 0.06-0.07s per character; add a 0.5s buffer for natural pauses.
-// Used to set cumulative `time` + `duration` per element in the concat
-// render_script. The buffer makes the estimate slightly overshoot, trading
-// a small silent gap at scene tails for safety against audio overlap when
-// the real TTS turns out longer than the estimate. If users report drift,
-// swap for real duration probing of the lipsync URLs (HEAD + mp4 metadata).
+// This is ONLY a fallback for when probeMp4Duration can't read the real
+// lipsync video duration (network failure, malformed mp4, server doesn't
+// honor Range). The primary path uses the probed real duration of each
+// lipsync mp4, which is the only way to avoid the truncation that made
+// every scene end "cortada" in the PipeLime 2026-05-28 session. The
+// estimator understates length whenever a script has multiple sentences
+// (punctuation pauses), longer voices, or slower speech rates, and any
+// understate sends Creatomate to cut the video before the avatar finishes
+// the last word.
 function estimateSceneDuration(script: string): number {
   return Math.min(30, Math.max(2, script.length * 0.07 + 0.5));
 }
@@ -415,6 +427,37 @@ export async function executeAvatarVideoPipeline(
   }
   const lipsyncUrls = videoFinals.map((v) => v.response!);
 
+  // === Phase 2.5: Probe REAL lipsync mp4 durations. ===
+  // The old code used estimateSceneDuration(script.length * 0.07 + 0.5) for
+  // both the video element's `duration` and the cumulative `time`. When the
+  // estimate undershot the real audio (which happened on most multi-sentence
+  // scripts because ElevenLabs adds ~0.3-0.5s pause per period), Creatomate
+  // cut the video at the estimated mark and the avatar's last word was
+  // chopped off. Every scene ended "cortada".
+  //
+  // Fix: probe each lipsync mp4's moov.mvhd via Range request and use the
+  // real duration in render_script. If probing fails (network, malformed
+  // file, server doesn't honor Range), fall back to the estimate so the
+  // pipeline still ships. See lib/mp4-probe.ts and the PipeLime 2026-05-28
+  // session for the trigger.
+  hooks.checkCancelled?.("probing_durations");
+  hooks.onPhase?.({
+    sub_phase: `probing_durations (0/${lipsyncUrls.length})`,
+    progress: { completed: 0, total: lipsyncUrls.length },
+  });
+  let probedCompleted = 0;
+  const sceneRealDurations = await Promise.all(
+    lipsyncUrls.map(async (url, i) => {
+      const probed = await probeMp4Duration(url).catch(() => null);
+      probedCompleted += 1;
+      hooks.onPhase?.({
+        sub_phase: `probing_durations (${probedCompleted}/${lipsyncUrls.length})`,
+        progress: { completed: probedCompleted, total: lipsyncUrls.length },
+      });
+      return probed ?? estimateSceneDuration(scripts[i]!);
+    }),
+  );
+
   // === Phase 3: Build Creatomate render_script and submit concat. ===
   // Shape verified empirically 2026-05-19 (sesión 7) and corrected
   // 2026-05-27 after discovering the multi-scene defect. For each scene
@@ -422,9 +465,10 @@ export async function executeAvatarVideoPipeline(
   // (subtitles via transcript_source linking by id). Tracks alternate:
   // scene 0 = tracks 1+2, scene 1 = tracks 3+4, ... which stacks elements
   // in z-order, NOT in time. Sequential playback REQUIRES explicit `time`
-  // and `duration` per element, computed cumulatively from
-  // estimateSceneDuration. Without them all scenes start at t=0 and their
-  // audio tracks mix on top of each other. Empirical shape reference:
+  // and `duration` per element, computed cumulatively from the real probed
+  // duration of each lipsync clip (with a tiny tail buffer for natural
+  // pacing). Without them all scenes start at t=0 and their audio tracks
+  // mix on top of each other. Empirical shape reference:
   // docs/followr-api/avatars.md:800.
   hooks.checkCancelled?.("concat");
   hooks.onPhase?.({
@@ -439,7 +483,11 @@ export async function executeAvatarVideoPipeline(
   let cumulativeTime = 0;
   lipsyncUrls.forEach((url, i) => {
     const videoId = `video-scene-${i + 1}`;
-    const sceneDuration = estimateSceneDuration(scripts[i]!);
+    // Real lipsync duration + a tiny tail buffer. Creatomate freezes the
+    // video element's last frame when its declared duration exceeds the
+    // source mp4's intrinsic duration; the 0.25s freeze is imperceptible
+    // and prevents the previously-jarring cut.
+    const sceneDuration = sceneRealDurations[i]! + SCENE_TAIL_BUFFER_SECONDS;
     const sceneTime = cumulativeTime;
     const animations = buildAnimationsArray(i, sceneDuration, scene_animation, scene_transition);
     elements.push({

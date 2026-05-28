@@ -535,6 +535,14 @@ export function getContext(context_id: string): ContextSnapshot | null {
 // confirm_industry already wrote the :confirmed marker, because the snapshot
 // captured the pre-mutation state and still says confirmed=false.
 // Returns the number of contexts evicted (useful for logging/telemetry).
+//
+// PREFER patchContextsForCompany when possible: mutations that only flip
+// a single snapshot field (visual_style marker, industry confirmed) should
+// patch in place so the agent keeps using the same context_id (no
+// unnecessary prepare_content_plan_context re-call). Use invalidate only
+// when the snapshot is genuinely stale (e.g. deep_research changed
+// cached_industry_id; brand voice prompt was created so the brief changed
+// shape).
 export function invalidateContextsForCompany(company_id: number): number {
   let evicted = 0;
   for (const [id, c] of contexts) {
@@ -544,6 +552,37 @@ export function invalidateContextsForCompany(company_id: number): number {
     }
   }
   return evicted;
+}
+
+// Mutate live contexts for a company in place rather than evicting them.
+// Used by mutations that only change a single snapshot field (visual style
+// marker, industry confirmed flag) and where evicting would force the
+// agent to re-call prepare_content_plan_context just to pick up a single
+// bool flip. Real case: PipeLime 2026-05-28 session, confirm_visual_style
+// followed by confirm_industry both invalidated the same context, then
+// draft_content_plan failed with context_id_invalid_or_expired and the
+// agent had to re-call prepare_content_plan_context to get a fresh id.
+// Returns the number of contexts patched.
+export function patchContextsForCompany(
+  company_id: number,
+  patch: Partial<
+    Pick<
+      ContextSnapshot,
+      | "cached_industry_id"
+      | "cached_industry_confirmed"
+      | "has_visual_style_marker"
+      | "brand_has_voice_prompt"
+      | "networks_connected"
+    >
+  >,
+): number {
+  let patched = 0;
+  for (const c of contexts.values()) {
+    if (c.company_id !== company_id) continue;
+    Object.assign(c, patch);
+    patched += 1;
+  }
+  return patched;
 }
 
 export function createPlan(

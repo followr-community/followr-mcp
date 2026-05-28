@@ -65,7 +65,7 @@ import {
   type IndustryId,
   type IndustryProfile,
 } from "../lib/industry-profiles/index.js";
-import { invalidateContextsForCompany } from "../lib/content-plan-state.js";
+import { invalidateContextsForCompany, patchContextsForCompany } from "../lib/content-plan-state.js";
 import { detectSpa, type SpaDetectionResult } from "../lib/spa-detector.js";
 import { toolError, toolErrorFromException } from "../lib/tool-error.js";
 
@@ -1190,7 +1190,9 @@ DO NOT USE THIS to silently accept the auto-detection. The whole point of this g
 
 VALIDATION: industry_id must be one of the catalog ids in lib/industry-profiles (saas, ecommerce_fashion, ecommerce_general, restaurant, service_b2b, education, real_estate, healthcare, creative_agency, local_business, personal_brand, news_media, hotel_hospitality, fitness_wellness, events_organizer, ngo_nonprofit, generic_business). Unknown ids return a structured error and the marker is left untouched.
 
-WRITE: PUT /api/companies/{id} with description merged. Safe to call multiple times; same-day re-confirmations are no-ops.`,
+WRITE: PUT /api/companies/{id} with description merged. Safe to call multiple times; same-day re-confirmations are no-ops.
+
+RELATED TOOLS (named explicitly so the host's tool-search precaches them): deep_research, prepare_content_plan_context, detect_brand_visual_style, propose_visual_style_options, confirm_visual_style, draft_content_plan. After this returns, the typical next steps are confirm_visual_style (if visual style still missing) and then draft_content_plan.`,
       inputSchema: {
         company_id: z.number().int().positive(),
         industry_id: z
@@ -1223,15 +1225,19 @@ WRITE: PUT /api/companies/{id} with description merged. Safe to call multiple ti
         const description = company.description ?? "";
         const suffix = buildCacheSuffix(industry_id as IndustryId, true);
         const newDescription = applyCacheSuffixToDescription(description, suffix);
-        let contextsEvicted = 0;
         if (newDescription !== description) {
           await client.updateCompany(company_id, { description: newDescription });
-          // Drop every cached content-plan context for this company: their
-          // snapshot froze cached_industry as unconfirmed and draft_content_plan
-          // would still reject with industry_confirmation_required despite the
-          // marker now reading :confirmed. Without this eviction, agents have
-          // to manually re-call prepare_content_plan_context to refresh.
-          contextsEvicted = invalidateContextsForCompany(company_id);
+          // Patch live content-plan contexts in place rather than evicting
+          // them. The only snapshot fields that changed are
+          // cached_industry_id and cached_industry_confirmed; brief, budget,
+          // networks, etc. did not. Evicting would force the agent to
+          // re-call prepare_content_plan_context just to flip these two
+          // fields (real round-trip cost paid by the PipeLime 2026-05-28
+          // session). See patchContextsForCompany.
+          patchContextsForCompany(company_id, {
+            cached_industry_id: industry_id,
+            cached_industry_confirmed: true,
+          });
         }
         const profile = getProfile(industry_id as IndustryId);
 

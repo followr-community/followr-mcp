@@ -1,4 +1,4 @@
-import { FollowrClient } from "@followr-mcp/shared";
+import { FollowrApiError, FollowrClient } from "@followr-mcp/shared";
 import type { Asset } from "@followr-mcp/shared";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -43,6 +43,147 @@ function filenameFromUrl(url: string, fallbackExt: string): string {
   }
 }
 
+// Steps of the 3-step asset upload pattern, used for granular error
+// surfacing. The user gets to know WHICH step failed, not just "Server Error".
+type UploadStep =
+  | "url_download"
+  | "placeholder_create"
+  | "presigned_request"
+  | "azure_blob_put";
+
+// Retriable failures: transient 5xx from the Followr backend or Azure blob,
+// and generic network errors (fetch TypeError). 4xx are NOT retried (they
+// indicate permanent issues: bad input, auth, etc.).
+function isRetriableUploadError(err: unknown): boolean {
+  if (err instanceof FollowrApiError) {
+    return err.status >= 500 && err.status < 600;
+  }
+  // Network errors from fetch surface as TypeError ("fetch failed", "network
+  // request failed"). These are usually transient.
+  if (err instanceof TypeError) return true;
+  return false;
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Wrap a step with exponential backoff retries for transient errors.
+// Default: 2 retries with delays of 2s then 8s. Total worst case = 3 attempts
+// over ~10s before giving up. Suitable for the once-per-asset upload path.
+async function withUploadRetry<T>(fn: () => Promise<T>): Promise<T> {
+  const backoffsMs = [2000, 8000];
+  const maxAttempts = backoffsMs.length + 1;
+  let lastError: unknown;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      if (attempt === maxAttempts - 1 || !isRetriableUploadError(err)) {
+        throw err;
+      }
+      await sleepMs(backoffsMs[attempt]!);
+    }
+  }
+  throw lastError;
+}
+
+// Best-effort cleanup of an asset placeholder that was created in step 1
+// but never received bytes (step 2 or 3 failed). Without this, every failed
+// upload leaks a "phantom" asset entry into the user's library. Real case:
+// PipeLime 2026-05-28 session left 4 phantom assets for one failed reel.
+// If the cleanup itself fails, we swallow the error: the user is already
+// being told the upload failed; a noisy cleanup error would distract from
+// the real problem.
+async function cleanupPhantomPlaceholder(
+  client: FollowrClient,
+  assetId: number,
+): Promise<{ deleted: boolean; cleanup_error?: string }> {
+  try {
+    await client.deleteAsset(assetId);
+    return { deleted: true };
+  } catch (err) {
+    return {
+      deleted: false,
+      cleanup_error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
+interface StepFailureContext {
+  step: UploadStep;
+  url: string;
+  type: "image" | "video";
+  companyId: number;
+  /** Set when step 1 succeeded and a phantom was created (steps 2/3). */
+  cleanedUpAssetId?: number;
+  cleanupResult?: { deleted: boolean; cleanup_error?: string };
+}
+
+// Map an underlying error from any of the 3 upload steps into a
+// ToolErrorException with a step-tagged reason, a friendly user_message
+// that names the step + a hint based on the error class (401 -> token
+// expired; 5xx after retries -> backend instability; etc.), and details
+// useful for debugging.
+function wrapStepFailure(err: unknown, ctx: StepFailureContext): ToolErrorException {
+  const httpStatus = err instanceof FollowrApiError ? err.status : null;
+  const backendMessage =
+    err instanceof FollowrApiError
+      ? err.message
+      : err instanceof Error
+        ? err.message
+        : String(err);
+
+  let hint: string;
+  let reason: string;
+  if (httpStatus === 401) {
+    hint =
+      "Your Followr API token appears to be expired or invalid. Generate a fresh one in Followr Settings > API Keys and retry.";
+    reason = `upload_failed_at_${ctx.step}_auth`;
+  } else if (httpStatus !== null && httpStatus >= 500) {
+    hint = `The Followr backend returned ${httpStatus} on the "${ctx.step}" step even after retrying with backoff. Likely a transient backend hiccup. Wait a minute and retry the upload.`;
+    reason = `upload_failed_at_${ctx.step}_5xx`;
+  } else if (httpStatus !== null && httpStatus >= 400) {
+    hint = `The request was rejected (HTTP ${httpStatus}) on the "${ctx.step}" step. The backend message is "${backendMessage}". This is usually a permanent issue (bad input, missing permission, invalid asset state); retrying as-is will not help.`;
+    reason = `upload_failed_at_${ctx.step}_4xx`;
+  } else {
+    hint = `Network or runtime error on the "${ctx.step}" step: "${backendMessage}". Check connectivity and retry.`;
+    reason = `upload_failed_at_${ctx.step}_network`;
+  }
+
+  const cleanupNote =
+    ctx.cleanedUpAssetId !== undefined
+      ? ctx.cleanupResult?.deleted
+        ? ` Cleaned up the placeholder asset (id ${ctx.cleanedUpAssetId}) so it does not leak into your library.`
+        : ` Tried to clean up the placeholder asset (id ${ctx.cleanedUpAssetId}) but the delete itself failed (${ctx.cleanupResult?.cleanup_error}). Run scripts/cleanup-phantom-assets.mjs if you want to scrub the leftover entries.`
+      : "";
+
+  return new ToolErrorException(
+    toolError({
+      reason,
+      user_message: `Failed to upload ${ctx.type} (step "${ctx.step}"): ${backendMessage}.${cleanupNote} ${hint}`,
+      details: {
+        step: ctx.step,
+        source_url: ctx.url,
+        asset_type: ctx.type,
+        company_id: ctx.companyId,
+        http_status: httpStatus,
+        backend_message: backendMessage,
+        ...(ctx.cleanedUpAssetId !== undefined
+          ? {
+              cleaned_up_placeholder_asset_id: ctx.cleanedUpAssetId,
+              cleanup_succeeded: ctx.cleanupResult?.deleted ?? false,
+              ...(ctx.cleanupResult?.cleanup_error
+                ? { cleanup_error: ctx.cleanupResult.cleanup_error }
+                : {}),
+            }
+          : {}),
+      },
+    }),
+  );
+}
+
 export async function uploadFromUrl(
   client: FollowrClient,
   args: {
@@ -56,7 +197,27 @@ export async function uploadFromUrl(
   },
 ): Promise<Asset> {
   const { companyId, url, type, name, visibility, contentTypeOverride, folderId } = args;
-  const downloadResp = await fetch(url);
+
+  // ── Step 0: download source bytes ────────────────────────────────────
+  // Pre-step (the placeholder doesn't exist yet, no cleanup needed on
+  // failure). Kept with its original error shape for backwards-compat with
+  // callers that branch on reason="url_download_failed".
+  let downloadResp: Response;
+  try {
+    downloadResp = await withUploadRetry(() => fetch(url));
+  } catch (err) {
+    throw new ToolErrorException(
+      toolError({
+        reason: "url_download_failed",
+        user_message: `Failed to download ${type} from "${url}": ${err instanceof Error ? err.message : String(err)}. Check that the URL is reachable.`,
+        details: {
+          source_url: url,
+          asset_type: type,
+          network_error: err instanceof Error ? err.message : String(err),
+        },
+      }),
+    );
+  }
   if (!downloadResp.ok) {
     throw new ToolErrorException(
       toolError({
@@ -85,17 +246,61 @@ export async function uploadFromUrl(
   const buffer = await downloadResp.arrayBuffer();
   const fallbackExt = type === "image" ? "jpg" : "mp4";
   const filename = name ?? filenameFromUrl(url, fallbackExt);
-  const asset = await client.createAsset(companyId, {
-    name: filename,
-    type,
-    ...(folderId !== undefined ? { folder_id: folderId } : {}),
-  });
-  const upload = await client.requestAssetUpload(asset.id, type, {
-    filename,
-    type,
-    visibility: visibility ?? "public",
-  });
-  await client.uploadToBlob(upload.presigned_url, buffer, contentType);
+
+  // ── Step 1: create placeholder asset ─────────────────────────────────
+  let asset: Asset;
+  try {
+    asset = await withUploadRetry(() =>
+      client.createAsset(companyId, {
+        name: filename,
+        type,
+        ...(folderId !== undefined ? { folder_id: folderId } : {}),
+      }),
+    );
+  } catch (err) {
+    // No placeholder created yet; nothing to clean up.
+    throw wrapStepFailure(err, { step: "placeholder_create", url, type, companyId });
+  }
+
+  // ── Step 2: request presigned upload URL ─────────────────────────────
+  // From here on, a failure means we have a phantom placeholder in the
+  // user's library. Best-effort delete before propagating.
+  let upload: { presigned_url: string; url: string };
+  try {
+    upload = await withUploadRetry(() =>
+      client.requestAssetUpload(asset.id, type, {
+        filename,
+        type,
+        visibility: visibility ?? "public",
+      }),
+    );
+  } catch (err) {
+    const cleanupResult = await cleanupPhantomPlaceholder(client, asset.id);
+    throw wrapStepFailure(err, {
+      step: "presigned_request",
+      url,
+      type,
+      companyId,
+      cleanedUpAssetId: asset.id,
+      cleanupResult,
+    });
+  }
+
+  // ── Step 3: PUT bytes to Azure blob ──────────────────────────────────
+  try {
+    await withUploadRetry(() => client.uploadToBlob(upload.presigned_url, buffer, contentType));
+  } catch (err) {
+    const cleanupResult = await cleanupPhantomPlaceholder(client, asset.id);
+    throw wrapStepFailure(err, {
+      step: "azure_blob_put",
+      url,
+      type,
+      companyId,
+      cleanedUpAssetId: asset.id,
+      cleanupResult,
+    });
+  }
+
   return { ...asset, url: upload.url };
 }
 

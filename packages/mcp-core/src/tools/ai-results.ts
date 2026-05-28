@@ -27,7 +27,8 @@ import {
   updatePipelinePhase,
 } from "../lib/pipeline-state.js";
 import { getAiPreferences } from "../lib/preferences.js";
-import { toolError, toolErrorFromException } from "../lib/tool-error.js";
+import { toolError, ToolErrorException, toolErrorFromException } from "../lib/tool-error.js";
+import { uploadFromUrl } from "./assets.js";
 
 // Drop BYOK metadata before exposing AiResult to the AI client.
 function sanitizeAiResult(result: AiResult): Omit<AiResult, "use_own_key"> {
@@ -532,6 +533,8 @@ OUTFIT PRESERVATION: when the avatar portrait shows a specific outfit that must 
 
 ASYNC BY DEFAULT (v0.5.0). This tool now returns immediately with a pipeline_id and an ETA; the video keeps generating in the background. The agent tracks progress via get_pipeline_status (instant) or wait_for_pipeline (bounded poll up to 3 min). This avoids the WebSocket transport timeout that breaks multi-min sync waits on claude.ai. Tell the user something like "Empecé tu reel, va a tardar X-Y min, decime 'fijate' cuando quieras chequear". NEVER promise "te aviso cuando termine" (no push notifications). To opt into legacy sync behavior (only on CLI / IDE clients without transport timeouts), pass wait:true.
 
+AUTO-UPLOAD TO ASSET LIBRARY (v0.7.0+). When the pipeline completes, the final video is AUTOMATICALLY uploaded into the company's asset library and the resulting asset_id is exposed in the pipeline result (result.asset_id, also surfaced in get_pipeline_status / wait_for_pipeline). The agent can pass that asset_id directly to create_post (assets=[{id, type:"video"}]) without an intermediate upload_video_from_url call. This kills the prior failure mode where the agent had to chain generate_avatar_video -> upload_video_from_url -> create_post and the middle step occasionally returned "Server Error" (real case: PipeLime 2026-05-28). The upload runs the hardened uploadFromUrl with cleanup-on-failure + retry-with-backoff, so transient backend hiccups self-heal. If the upload itself fails after all retries, the pipeline still completes (the underlying ai_result video URL is durable) and metadata.library_upload describes the failure so the agent can decide whether to surface it or retry. In sync mode (wait:true) the auto-upload happens before the tool returns, and the response carries asset_id in the same shape.
+
 CRITICAL: heavy operation. Cost is per SECOND of total video duration (each lipsync scene uses veed_fabric_1.0 at 25 cr/seg; backgrounds add more). For a 3-scene 9:16 video without backgrounds at ~30s total = roughly 750 credits; with backgrounds enabled add 30-100 cr per scene. A 60s multi-scene piece can reach 2000+ cr. Always confirm with the user before proceeding and surface get_credits_balance first.
 
 REQUIRES TEXT BUDGET TOO. This flow internally calls Followr's TTS endpoint (ElevenLabs via Followr) for each scene's audio, which consumes ai_text_budget words on top of the image/video credits. When generate_backgrounds=true the per-scene visual prompt derivation also runs through Followr's chat AI (more words). If get_ai_budget shows ai_text_budget.total === 0 (plan does not include the text/audio module) or ai_text_budget.remaining <= 0 (cycle exhausted), this tool will fail with HTTP 402 entity="words" at the audio step BEFORE generating any video. get_session_context._assistant_guidance.plan_capability_warnings already surfaces this gate at orient time; honor that warning AND, per Rule 21 of the system prompt, NEVER silently downgrade to a no-voice alternative (generate_ai_video_clip) without surfacing the trade-off to the user first.
@@ -548,7 +551,9 @@ SUBTITLES: burned in by default with Followr's default style (Montserrat 700, 9.
 
 SCENE ANIMATIONS: optional camera animation per scene via scene_animation. 'zoom_in' adds a gradual 100%->110% scale across each scene (subtle parallax feel). Mirrors Followr UI Scene Animations toggle.
 
-SCENE TRANSITIONS: optional transition between scenes via scene_transition. 'slide_left' makes each new scene slide in from the right (1 second). First scene never has a transition (no previous scene). Mirrors Followr UI Scene Transitions toggle.`,
+SCENE TRANSITIONS: optional transition between scenes via scene_transition. 'slide_left' makes each new scene slide in from the right (1 second). First scene never has a transition (no previous scene). Mirrors Followr UI Scene Transitions toggle.
+
+RELATED TOOLS (named explicitly so the host's tool-search precaches them): get_avatar, list_avatars, create_avatar_full_flow, generate_avatar_lipsync_clip, generate_ai_video_clip, get_pipeline_status, wait_for_pipeline, create_post, create_post_group, validate_against_specs. The typical chain after this tool completes (with auto-upload in v0.7.0+) is: wait_for_pipeline -> create_post_group -> create_post (with the asset_id from result.asset_id) -> update_post_group to schedule.`,
       inputSchema: {
         company_id: z.number().int().positive(),
         avatar_id: z.number().int().positive().describe("Avatar with voice + image attached."),
@@ -683,6 +688,46 @@ Shape detail: each transition is encoded as a video-element-scoped block inside 
         // videos take 3-15 min.
         if (wait === true) {
           const result = await executeAvatarVideoPipeline(client, pipelineParams);
+          // Auto-upload to asset library (same dance as the async runner;
+          // see Phase 4 comment there). Best-effort: failures surface in
+          // library_upload but do not destroy the response.
+          let assetId: number | undefined;
+          let assetCdnUrl: string | undefined;
+          let libraryUpload: Record<string, unknown> = { ok: false, reason: "no_final_url" };
+          const finalUrl = result.finalVideo.response;
+          if (finalUrl) {
+            const sceneSuffix = scripts.length === 1 ? "scene" : "scenes";
+            const dateTag = new Date().toISOString().slice(0, 10);
+            const defaultName = `Avatar ${result.avatar.name} reel (${scripts.length} ${sceneSuffix}, ${dateTag})`;
+            try {
+              const asset = await uploadFromUrl(client, {
+                companyId: company_id,
+                url: finalUrl,
+                type: "video",
+                name: defaultName,
+                visibility: "public",
+              });
+              assetId = asset.id;
+              assetCdnUrl = asset.url;
+              libraryUpload = { ok: true, asset_id: asset.id, asset_cdn_url: asset.url };
+            } catch (err) {
+              if (err instanceof ToolErrorException) {
+                const sc = err.result.structuredContent;
+                libraryUpload = {
+                  ok: false,
+                  reason: sc.reason,
+                  user_message: sc.user_message,
+                  ...(sc.details ? { details: sc.details } : {}),
+                };
+              } else {
+                libraryUpload = {
+                  ok: false,
+                  reason: "library_upload_unknown_error",
+                  user_message: `Library upload failed: ${err instanceof Error ? err.message : String(err)}`,
+                };
+              }
+            }
+          }
           return {
             content: [
               {
@@ -702,6 +747,8 @@ Shape detail: each transition is encoded as a video-element-scoped block inside 
                     lipsync_ai_result_ids: result.videoFinals.map((v) => v.id),
                     individual_lipsync_urls: result.lipsyncUrls,
                     final_video: sanitizeAiResult(result.finalVideo),
+                    ...(assetId !== undefined ? { asset_id: assetId, asset_cdn_url: assetCdnUrl } : {}),
+                    library_upload: libraryUpload,
                   },
                   null,
                   2,
@@ -768,9 +815,71 @@ Shape detail: each transition is encoded as a video-element-scoped block inside 
                   },
                 },
               );
+
+              // === Phase 4: Auto-upload final video into the asset library. ===
+              // Without this, the agent has to call upload_video_from_url
+              // separately, which is exactly where the PipeLime 2026-05-28
+              // session broke (3 retries of "Server Error", workflow died
+              // before the post was published). By doing the upload inside
+              // the same pipeline state we (a) make the asset_id available
+              // via get_pipeline_status / wait_for_pipeline for direct use
+              // in create_post, and (b) get a single retry surface that the
+              // agent already polls. The hardened uploadFromUrl (cleanup +
+              // retry + step-tagged errors) sits underneath, so transient
+              // failures self-heal and a real failure does not leak a
+              // phantom placeholder.
+              //
+              // If the upload step fails, we still complete the pipeline
+              // (the underlying ai_result.response URL is durable in
+              // Followr DB; the user can manually re-upload later). The
+              // failure is surfaced in metadata.library_upload so the agent
+              // can decide whether to retry or surface to the user.
+              let assetId: number | undefined;
+              let assetCdnUrl: string | undefined;
+              let libraryUploadFailure:
+                | { reason: string; user_message: string; details?: Record<string, unknown> }
+                | null = null;
+              const finalUrl = result.finalVideo.response;
+              if (finalUrl) {
+                updatePipelinePhase(pipelineId, {
+                  sub_phase: "library_upload (registering asset)",
+                  progress: null,
+                });
+                const sceneSuffix = scripts.length === 1 ? "scene" : "scenes";
+                const dateTag = new Date().toISOString().slice(0, 10);
+                const defaultName = `Avatar ${result.avatar.name} reel (${scripts.length} ${sceneSuffix}, ${dateTag})`;
+                try {
+                  const asset = await uploadFromUrl(client, {
+                    companyId: company_id,
+                    url: finalUrl,
+                    type: "video",
+                    name: defaultName,
+                    visibility: "public",
+                  });
+                  assetId = asset.id;
+                  assetCdnUrl = asset.url;
+                  recordPipelineSubJobs(pipelineId, { library_upload_asset: asset.id });
+                } catch (err) {
+                  if (err instanceof ToolErrorException) {
+                    const sc = err.result.structuredContent;
+                    libraryUploadFailure = {
+                      reason: sc.reason,
+                      user_message: sc.user_message,
+                      ...(sc.details ? { details: sc.details } : {}),
+                    };
+                  } else {
+                    libraryUploadFailure = {
+                      reason: "library_upload_unknown_error",
+                      user_message: `Library upload failed with an unexpected error: ${err instanceof Error ? err.message : String(err)}`,
+                    };
+                  }
+                }
+              }
+
               markPipelineCompleted(pipelineId, {
                 ai_result_id: result.finalVideo.id,
-                ...(result.finalVideo.response ? { asset_url: result.finalVideo.response } : {}),
+                ...(assetId !== undefined ? { asset_id: assetId } : {}),
+                ...(assetCdnUrl ?? finalUrl ? { asset_url: assetCdnUrl ?? finalUrl! } : {}),
                 metadata: {
                   avatar_id,
                   avatar_name: result.avatar.name,
@@ -782,6 +891,11 @@ Shape detail: each transition is encoded as a video-element-scoped block inside 
                   audio_ai_result_ids: result.audioFinals.map((a) => a.id),
                   lipsync_ai_result_ids: result.videoFinals.map((v) => v.id),
                   individual_lipsync_urls: result.lipsyncUrls,
+                  library_upload: assetId !== undefined
+                    ? { ok: true, asset_id: assetId, asset_cdn_url: assetCdnUrl }
+                    : libraryUploadFailure
+                      ? { ok: false, ...libraryUploadFailure }
+                      : { ok: false, reason: "no_final_url" },
                 },
               });
             } catch (err) {
