@@ -230,6 +230,106 @@ describe("estimatePlanItemCostDeduped: non-AI assets", () => {
   });
 });
 
+// Avatar variable cost ──────────────────────────────────────────────────────
+//
+// Validates that avatar cost is derived from script length (via the internal
+// estimateTtsSeconds helper). Pre-refactor the costs were hardcoded:
+//   ai_avatar_lipsync: 25 * 12 = 300 cr regardless of script
+//   ai_avatar_video:   25 * 10 * sceneCount regardless of scripts
+// Now costs scale with the actual TTS seconds. Constants in content-plan.ts:
+//   AVATAR_TTS_COST_PER_SECOND = 25
+//   AVATAR_TTS_CHARS_PER_SECOND = 14
+//   AVATAR_TTS_FLOOR_SECONDS = 8
+
+describe("estimatePlanItemCostDeduped: avatar variable cost", () => {
+  it("ai_avatar_lipsync with a short script bills the floor (25 * 8 = 200 cr)", () => {
+    const item = planItem([
+      makeSubPost({
+        video_source: {
+          type: "ai_avatar_lipsync",
+          script: "Hola.", // 5 chars → ceil(5/14)=1, floored to 8
+          avatar_id: 1,
+        },
+      }),
+    ]);
+    const c = estimatePlanItemCostDeduped(item);
+    expect(c.video_ai_count).toBe(1);
+    expect(c.video_ai_cost).toBe(200); // 25 cr/s * 8 s floor
+    // Critical: NOT the old hardcode of 300 (which assumed 12s flat).
+    expect(c.video_ai_cost).not.toBe(300);
+  });
+
+  it("ai_avatar_lipsync with a long script bills proportionally to seconds", () => {
+    const longScript = "a".repeat(280); // 280 chars / 14 = 20 s
+    const item = planItem([
+      makeSubPost({
+        video_source: {
+          type: "ai_avatar_lipsync",
+          script: longScript,
+          avatar_id: 1,
+        },
+      }),
+    ]);
+    const c = estimatePlanItemCostDeduped(item);
+    expect(c.video_ai_cost).toBe(25 * 20); // 500 cr
+    // Critical: greater than the old hardcode of 300.
+    expect(c.video_ai_cost).toBeGreaterThan(300);
+  });
+
+  it("ai_avatar_video with one short scene bills floor seconds (200 cr, NOT old hardcode 250)", () => {
+    const item = planItem([
+      makeSubPost({
+        video_source: {
+          type: "ai_avatar_video",
+          scripts: ["Hola."], // 5 chars → floored to 8 s
+          avatar_id: 1,
+        },
+      }),
+    ]);
+    const c = estimatePlanItemCostDeduped(item);
+    expect(c.video_ai_cost).toBe(25 * 8); // 200 cr
+    // Old hardcode: 25 * 10 * 1 = 250 cr.
+    expect(c.video_ai_cost).not.toBe(250);
+  });
+
+  it("ai_avatar_video with multiple scenes sums per-scene TTS seconds", () => {
+    const item = planItem([
+      makeSubPost({
+        video_source: {
+          type: "ai_avatar_video",
+          scripts: [
+            "a".repeat(140), // 140/14 = 10 s
+            "a".repeat(210), // 210/14 = 15 s
+            "a".repeat(28), // 28/14 = 2 → floored to 8 s
+          ],
+          avatar_id: 1,
+        },
+      }),
+    ]);
+    const c = estimatePlanItemCostDeduped(item);
+    // 25 * (10 + 15 + 8) = 25 * 33 = 825
+    expect(c.video_ai_cost).toBe(825);
+    // Old hardcode: 25 * 10 * 3 = 750 cr.
+    expect(c.video_ai_cost).not.toBe(750);
+  });
+
+  it("ai_avatar_video with generate_backgrounds adds 60 cr per scene on top of TTS", () => {
+    const item = planItem([
+      makeSubPost({
+        video_source: {
+          type: "ai_avatar_video",
+          scripts: ["a".repeat(140), "a".repeat(140)], // 2 scenes of 10s each
+          avatar_id: 1,
+          generate_backgrounds: true,
+        },
+      }),
+    ]);
+    const c = estimatePlanItemCostDeduped(item);
+    // 25 cr/s * 20 s + 60 cr/scene * 2 = 500 + 120 = 620
+    expect(c.video_ai_cost).toBe(620);
+  });
+});
+
 // Mixed Tier 1 + Tier 3 in one plan_item ─────────────────────────────────────
 
 describe("estimatePlanItemCostDeduped: mixed Tier 1 + Tier 3 in one plan_item", () => {

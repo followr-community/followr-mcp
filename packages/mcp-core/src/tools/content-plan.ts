@@ -1125,37 +1125,105 @@ RELATED TOOLS IN THE PLANNING WORKFLOW (named explicitly so the host's tool-sear
         });
       }
 
-      const phase2Questions: Array<Record<string, unknown>> = [
-        {
-          id: "time_window",
-          phase: "scope",
-          blocks_plan_until_resolved: true,
-          rationale_for_agent:
-            "Defines the window the plan covers. Ask in a SINGLE tap question; convert option_id to concrete YYYY-MM-DD start/end when calling draft_content_plan.",
-          ask_user_question_payload: {
-            question: "¿Qué ventana de días querés para el plan?",
-            header: "Ventana",
-            options: [
-              {
-                label: "Esta semana",
-                description: "De lunes a domingo de la semana en curso.",
-              },
-              {
-                label: "Próximos 7 días",
-                description: "Desde mañana, durante 7 días corridos.",
-              },
-              {
-                label: "Próximas 2 semanas",
-                description: "Desde mañana, durante 14 días corridos.",
-              },
+      // Smart-window detection. When today's local hour in the company TZ
+      // is >= 19, "esta semana" interpreted as Mon-Sun would put the first
+      // 0-N slots in the past (server-side past gate then fires per
+      // publish_at_in_past in runValidation, costing the user 1-2 wasted
+      // turns). Surface the choice up front instead: the user picks how to
+      // handle the consumed day BEFORE drafting, not after the draft fails.
+      // Real friction: PipeLime 2026-05-28 session, Thursday 21:00 BA, the
+      // agent drafted Thu-Sun with a 13:00 Thursday slot, validator
+      // blocked, agent moved to Thursday evening which was also past,
+      // validator blocked again. The smart-window options below resolve
+      // this on the first turn.
+      const companyTzForWindow = resolveTimezone(
+        (companyResolved as Company & { timezone?: string | null }).timezone,
+      );
+      let companyLocalHour: number | null = null;
+      try {
+        const hourStr = new Intl.DateTimeFormat("en-US", {
+          timeZone: companyTzForWindow,
+          hour: "2-digit",
+          hour12: false,
+        }).format(new Date());
+        const parsed = parseInt(hourStr, 10);
+        if (Number.isFinite(parsed) && parsed >= 0 && parsed <= 23) {
+          companyLocalHour = parsed === 24 ? 0 : parsed;
+        }
+      } catch {
+        // Invalid timezone string — skip smart-window detection, fall
+        // back to the standard options. publish_at_in_past gate still
+        // protects against the worst case downstream.
+      }
+      const todayConsumed = companyLocalHour !== null && companyLocalHour >= 19;
+
+      const timeWindowQuestion: Record<string, unknown> = todayConsumed
+        ? {
+            id: "time_window",
+            phase: "scope",
+            blocks_plan_until_resolved: true,
+            rationale_for_agent: `Defines the window the plan covers. ATENCIÓN: la hora local de la company (${companyTzForWindow}) es ${companyLocalHour}:00, así que hoy ya está prácticamente consumido (no entra como slot publicable). Las 3 opciones reemplazan la "esta semana" clásica para evitar que el agente arme un plan con el primer slot en el pasado. Convertí option_id a YYYY-MM-DD concreto cuando llames draft_content_plan.`,
+            ask_user_question_payload: {
+              question:
+                "Hoy ya está casi terminado en la zona horaria de la marca. ¿Cómo armamos la ventana del plan?",
+              header: "Ventana",
+              options: [
+                {
+                  label: "Lo que queda de esta semana",
+                  description:
+                    "Posteamos los días que faltan hasta el domingo (sin contar hoy).",
+                },
+                {
+                  label: "Próxima semana completa (lun-dom)",
+                  description:
+                    "Saltamos a la semana que viene completa, lunes a domingo.",
+                },
+                {
+                  label: "Atravesar el weekend al próximo lunes",
+                  description:
+                    "Mañana hasta el lunes que viene inclusive, sin parar el viernes ni el domingo.",
+                },
+              ],
+            },
+            option_actions: [
+              { option_index: 0, next_action: "use_value", value: "rest_of_this_week" },
+              { option_index: 1, next_action: "use_value", value: "next_week_full" },
+              { option_index: 2, next_action: "use_value", value: "through_next_monday" },
             ],
-          },
-          option_actions: [
-            { option_index: 0, next_action: "use_value", value: "this_week" },
-            { option_index: 1, next_action: "use_value", value: "next_7_days" },
-            { option_index: 2, next_action: "use_value", value: "next_14_days" },
-          ],
-        },
+          }
+        : {
+            id: "time_window",
+            phase: "scope",
+            blocks_plan_until_resolved: true,
+            rationale_for_agent:
+              "Defines the window the plan covers. Ask in a SINGLE tap question; convert option_id to concrete YYYY-MM-DD start/end when calling draft_content_plan.",
+            ask_user_question_payload: {
+              question: "¿Qué ventana de días querés para el plan?",
+              header: "Ventana",
+              options: [
+                {
+                  label: "Esta semana",
+                  description: "De lunes a domingo de la semana en curso.",
+                },
+                {
+                  label: "Próximos 7 días",
+                  description: "Desde mañana, durante 7 días corridos.",
+                },
+                {
+                  label: "Próximas 2 semanas",
+                  description: "Desde mañana, durante 14 días corridos.",
+                },
+              ],
+            },
+            option_actions: [
+              { option_index: 0, next_action: "use_value", value: "this_week" },
+              { option_index: 1, next_action: "use_value", value: "next_7_days" },
+              { option_index: 2, next_action: "use_value", value: "next_14_days" },
+            ],
+          };
+
+      const phase2Questions: Array<Record<string, unknown>> = [
+        timeWindowQuestion,
         {
           id: "posts_per_day",
           phase: "scope",
@@ -2192,7 +2260,9 @@ MUTATION but IDEMPOTENT for the same input: re-calling with the same context_id 
 
 DO NOT PROPOSE THE PLAN IN PROSE BEFORE CALLING THIS TOOL. After the user answers the clarifying questions (clarifying_questions_v2.phase_2_plan_scope), build plan_items[] internally and call this tool DIRECTLY. The summary_for_user it returns is what you show the user, never your own prose table or "te propongo este plan: lun X, mar Y, ...". Surfacing a prose plan before validation creates two failure modes: (1) the user approves something the validator will then reject (carousel exceeding network limit, network duplicate slot, budget exhaustion); (2) the user fatigues during an extra confirmation turn and the conversation dies before draft is called. Real failure mode observed 2026-05-23 (PostApprove session, share id 5e1b6ec4): the agent built a 7-day prose table, the user never replied, draft_content_plan was never called.
 
-AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.estimated_total_credits_cost) and remaining budget (totals.budget_remaining_after_execution) in natural language, list any warnings (warnings[].user_facing_message), and ask for explicit approval. ONLY THEN call execute_content_plan(plan_id, confirm: true). If the user wants changes, call update_content_plan(plan_id, changes) instead.`,
+AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.estimated_total_credits_cost) and remaining budget (totals.budget_remaining_after_execution) in natural language, list any warnings (warnings[].user_facing_message), and ask for explicit approval. ONLY THEN call execute_content_plan(plan_id, confirm: true). If the user wants changes, call update_content_plan(plan_id, changes) instead.
+
+USER-FACING RENDER RULE for video assets. When you compress, paraphrase or summarize the plan for the user, NEVER collapse a video to just "Video". Always preserve which KIND it is: "avatar hablando" (the brand's avatar narrates, with or without subtítulos depending on shape) vs "video con IA, sin persona en cámara" (AI-generated clip with no person) vs "video subido" (user-uploaded). Asset kind is the primary attribute the user evaluates the plan by, NOT a detail. Lose this and the user has to ask "es avatar o IA?" mid-conversation, which is exactly the friction this tool fights against.`,
       inputSchema: {
         context_id: z.string().min(1),
         time_window: z.object({
@@ -2383,19 +2453,19 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
       // near_duplicate warning never fires.
       autoApplyImageDedupHints(planItemsArr);
 
-      // 2b. Auto-correct inverted video_sources (silent). Si el agente armó
-      // plan_items con video_kind contradiciendo el default de la industria
-      // sin que el concepto matchee flip_concepts, los flippeamos in-place.
-      // Las correcciones se exponen como `_internal_corrections_applied` (no
-      // user-facing) para debugging y para que el agent no las repita en
-      // future updates.
-      // Agregado 2026-05-25 tras el anti-pattern PipeLime.
-      const videoStrategyCorrections = await autoCorrectInvertedVideoSources(
-        client,
-        ctx.company_id,
-        ctx.cached_industry_id,
-        planItemsArr,
-      );
+      // 2b. Video-kind deviation detection runs INSIDE runValidation now.
+      // The previous silent auto-corrector (autoCorrectInvertedVideoSources,
+      // 2026-05-25 → 2026-05-28) was replaced after a real session leaked an
+      // ai_clip video for a service_b2b post that should have been the brand's
+      // avatar narrating. Two failure modes drove the change: (a) silent skip
+      // when listAvatars failed transiently or substring flip_concepts matcher
+      // missed the natural-language concept, (b) the LLM and the user had no
+      // visibility into why a video ended up as the "wrong" kind. The new path
+      // is: validator detects the deviation, pushes an upfront_decision the
+      // agent surfaces before the plan summary, the user picks "flip all to
+      // default" or "keep as is". No more magic, no more multi-language phrase
+      // curation, and update_content_plan inherits the check for free because
+      // runValidation runs on every mutation.
 
       // 3. Run the validation pipeline (extracted helper so update_content_plan
       // can re-use it).
@@ -2458,14 +2528,6 @@ AFTER THIS RETURNS: show summary_for_user verbatim, mention the cost (totals.est
         manual_materialization_required: manualMaterialization,
         warnings: filterUserFacingWarnings(v.warnings),
         _internal_warning_signals: extractInternalOnlyWarnings(v.warnings),
-        _internal_corrections_applied:
-          videoStrategyCorrections.length > 0
-            ? {
-                video_strategy: videoStrategyCorrections,
-                guidance:
-                  "DEBUG ONLY. NO MENCIONAR AL USER. El plan recibido por el agente fue auto-corregido en estos plan_items para alinearse con la default_video_kind de la industria. El user solo ve el plan corregido en summary_for_user. NO digas 'corregí esto' al user; el plan que ves YA es el correcto.",
-              }
-            : null,
         blockers: v.blockers,
         next_step_instructions:
           v.blockers.length > 0
@@ -2661,7 +2723,9 @@ OUTPUT: same shape as draft_content_plan (plan_id stays the same; status reflect
 
 NO MUTATIONS TO FOLLOWR: this tool only edits in-memory plan state. Executes nothing in Followr until execute_content_plan is called.
 
-AFTER THIS: same flow as draft. Show the updated table, await explicit approval, then execute.`,
+AFTER THIS: same flow as draft. Show the updated table, await explicit approval, then execute.
+
+USER-FACING RENDER RULE (same as draft_content_plan): when you paraphrase the updated plan, NEVER collapse a video to just "Video". Preserve the kind: "avatar hablando" vs "video con IA, sin persona en cámara" vs "video subido". The user evaluates the plan by asset kind.`,
       inputSchema: {
         plan_id: z.string().min(1),
         changes: z.array(ChangeSchema).min(1).max(40),
@@ -2901,7 +2965,9 @@ OUTPUT: same shape as draft_content_plan (plan_id, status, summary_for_user, tot
 
 USE THIS when the user asks to advance item by item ("arranca con el primero", "andá pidiendo confirmación", "uno por uno") or when they explicitly ask for more detail about a specific post before approving. Call it once per plan_item right BEFORE you call execute_content_plan(plan_id, plan_item_slugs: [slug], confirm: true).
 
-OUTPUT: { plan_id, slug, concept, publish_at_local, networks: [{ network_display, format, caption_final, assets: [{ kind, description, model?, cost_credits }] }], totals: { credits, estimated_generation_minutes }, flags: [...], rendered_markdown }. The agent can either surface rendered_markdown verbatim or quote individual fields.
+OUTPUT: { plan_id, slug, concept, publish_at_local, networks: [{ network_display, format, caption_final, assets: [{ kind, description, model?, cost_credits, video_kind_user_facing? }] }], totals: { credits, estimated_generation_minutes }, flags: [...], rendered_markdown }. The agent can either surface rendered_markdown verbatim or quote individual fields.
+
+USER-FACING RENDER RULE: when you paraphrase an asset for the user, the kind ("avatar hablando" vs "video con IA, sin persona en cámara" vs "foto" vs "carrusel") is mandatory. Don't compress it away. Each AssetPreview carries an explicit description field plus video_kind_user_facing on video assets ("avatar_lipsync" = avatar hablando una escena sin subtítulos, "avatar_multi_scene_video" = avatar narrando varias escenas con subtítulos, "ai_clip_with_audio" / "ai_clip_silent" = video con IA sin persona en cámara). Use those, not a generic "Video".
 
 NO MUTATION. Pure read of in-memory plan state.`,
       inputSchema: {
@@ -5941,12 +6007,26 @@ export function estimatePlanItemCostDeduped(item: PlanItem): SubPostCost {
           out.video_ai_cost += 400 * 8;
         }
       } else if (src.type === "ai_avatar_lipsync") {
+        // Cost variable on script length via estimateTtsSeconds. Antes
+        // estaba hardcoded en 25 * 12 = 300 cr para cualquier script. Sigue
+        // siendo el mismo helper que usa singleAssetCost; el cost del
+        // summary table (buildSummaryTable) y del cost_breakdown
+        // (buildCostBreakdown) ya lo comparten para que no haya drift.
         out.video_ai_count += 1;
-        out.video_ai_cost += 25 * 12;
+        out.video_ai_cost += AVATAR_TTS_COST_PER_SECOND * estimateTtsSeconds(src.script);
       } else if (src.type === "ai_avatar_video") {
+        // Idem ai_avatar_lipsync: sum de TTS seconds por escena, en vez del
+        // hardcode anterior de 25 * 10 * sceneCount. Backgrounds sigue
+        // siendo flat 60 cr/scene si generate_backgrounds está activo.
         const sceneCount = src.scripts.length;
-        const lipsyncCost = 25 * 10 * sceneCount;
-        const backgroundCost = src.generate_backgrounds ? 60 * sceneCount : 0;
+        const ttsSeconds = src.scripts.reduce(
+          (acc, s) => acc + estimateTtsSeconds(s),
+          0,
+        );
+        const lipsyncCost = AVATAR_TTS_COST_PER_SECOND * ttsSeconds;
+        const backgroundCost = src.generate_backgrounds
+          ? AVATAR_BACKGROUND_COST_PER_SCENE * sceneCount
+          : 0;
         out.video_ai_count += 1;
         out.video_ai_cost += lipsyncCost + backgroundCost;
       } else if (src.type === "concept_only_image") {
@@ -6030,15 +6110,13 @@ function buildSummaryTable(plan: ContentPlan): string[] {
         const fp = fingerprintAssetSource(ref);
         if (seenInItem.has(fp)) continue;
         seenInItem.add(fp);
-        if (ref.src.type === "ai_generate" && ref.mode === "image") {
-          const imgSrc = ref.src as Extract<ImageSrc, { type: "ai_generate" }>;
-          const m = IMAGE_MODELS.find((x) => x.model_id === (imgSrc.model ?? "nano_banana_2")) ?? IMAGE_MODELS[0];
-          rowCost += m?.cost_per_image ?? 25;
-        } else if (ref.src.type === "ai_generate" && ref.mode === "video") {
-          const vidSrc = ref.src as Extract<VideoSrc, { type: "ai_generate" }>;
-          const m = VIDEO_MODELS.find((x) => x.model_id === vidSrc.model);
-          rowCost += m ? m.cost_per_second * (vidSrc.duration_seconds ?? m.default_duration_seconds) : 400 * 8;
-        }
+        // Single source of truth para per-asset cost: delegar en
+        // singleAssetCost. Antes la summary table tenía su propia rama
+        // que solo contaba ai_generate (imagen/video) y ignoraba avatares,
+        // así que avatar_video y avatar_lipsync aparecían como 0 cr en
+        // el resumen mientras que cost_breakdown sí los billeaba. Ahora
+        // ambos paths usan el mismo helper y los costos coinciden.
+        rowCost += singleAssetCost(ref).cost;
       }
       const sharingForSubPost = sharing.get(`${item.slug}#${i}`) ?? [];
       const sharedLabels = sharingForSubPost
@@ -6118,12 +6196,32 @@ function singleAssetCost(ref: AssetSourceRef): { cost: number; model: string | n
     };
   }
   if (src.type === "ai_avatar_lipsync") {
-    return { cost: 25 * 12, model: "veed_fabric_1.0", kind: "avatar_lipsync" };
+    // Cost varía con el largo real del script (TTS bills per second of
+    // synthesized speech). Antes acá había un hardcode de 25 * 12 = 300 cr
+    // que sobre-estimaba scripts cortos y sub-estimaba scripts largos. Ahora
+    // estimateTtsSeconds aplica el floor de AVATAR_TTS_FLOOR_SECONDS para
+    // que el preview no muestre 0 ni un costo absurdamente bajo.
+    const seconds = estimateTtsSeconds(src.script);
+    return {
+      cost: AVATAR_TTS_COST_PER_SECOND * seconds,
+      model: "veed_fabric_1.0",
+      kind: "avatar_lipsync",
+    };
   }
   if (src.type === "ai_avatar_video") {
+    // Mismo razonamiento que ai_avatar_lipsync: cost = 25 cr/sec * sum de
+    // segundos estimados de speech por escena. Antes era 25 * 10 * sceneCount
+    // (asumiendo 10s flat por escena) lo cual ignoraba scripts cortos o
+    // largos.
     const sceneCount = src.scripts.length;
-    const lipsyncCost = 25 * 10 * sceneCount;
-    const backgroundCost = src.generate_backgrounds ? 60 * sceneCount : 0;
+    const ttsSeconds = src.scripts.reduce(
+      (acc, script) => acc + estimateTtsSeconds(script),
+      0,
+    );
+    const lipsyncCost = AVATAR_TTS_COST_PER_SECOND * ttsSeconds;
+    const backgroundCost = src.generate_backgrounds
+      ? AVATAR_BACKGROUND_COST_PER_SCENE * sceneCount
+      : 0;
     return {
       cost: lipsyncCost + backgroundCost,
       model: "veed_fabric_1.0+creatomate",
@@ -6249,7 +6347,7 @@ function displayLayout(layout: AssetLayout, product: ProductType): string {
 
 // ── Natural-language preview (for preview_plan_item) ──────────────────────
 
-interface AssetPreview {
+export interface AssetPreview {
   kind: "ai_image" | "url_image" | "library_image" | "ai_video" | "url_video" | "library_video" | "avatar_lipsync" | "avatar_video";
   description: string;
   model?: string;
@@ -6986,7 +7084,7 @@ function renderMarkdown(args: {
   return lines.join("\n");
 }
 
-function describeAssetKind(a: AssetPreview): string {
+export function describeAssetKind(a: AssetPreview): string {
   switch (a.kind) {
     case "ai_image": {
       const model = IMAGE_MODELS.find((m) => m.model_id === a.model);
@@ -7006,18 +7104,18 @@ function describeAssetKind(a: AssetPreview): string {
       // Stays in plain language, no model_ids, no internal flags.
       const audioLabel =
         a.audio_status === "with_native_audio"
-          ? "con audio nativo"
+          ? "con sonido"
           : "sin sonido, lo agregás vos después en un editor";
-      return `Video generado con IA (${name}, ${dur}s, ${audioLabel}, ${a.cost_credits} cr)`;
+      return `Video corto con IA, más creativo, sin persona a cámara generalmente (${name}, ${dur}s, ${audioLabel}, ${a.cost_credits} cr)`;
     }
     case "url_video":
       return "Video del sitio (sin generar nada)";
     case "library_video":
       return "Video que ya está cargado en la biblioteca";
     case "avatar_lipsync":
-      return `Avatar virtual hablando a cámara (voz sintética del script, ${a.cost_credits} cr)`;
+      return `Avatar hablando en una única escena (toma simple y sin subtítulos, ${a.cost_credits} cr)`;
     case "avatar_video":
-      return `Avatar virtual narrando varias escenas (voz sintética + subtítulos quemados, ${a.cost_credits} cr)`;
+      return `Avatar hablando con varias escenas anidadas (con subtítulos, ${a.cost_credits} cr)`;
   }
 }
 
@@ -7037,15 +7135,22 @@ function displayAssetStrategy(strategy: AssetsStrategy, layout: AssetLayout): st
     if (vs.type === "asset_id") return "Video ya subido";
     if (vs.type === "ai_generate") {
       const model = VIDEO_MODELS.find((m) => m.model_id === vs.model);
-      const audioBit = model?.audio_capability === "with_native_audio" ? " con audio" : " sin audio";
-      return model ? `Video con IA (${model.display_name}${audioBit})` : "Video con IA";
+      const audioBit = model?.audio_capability === "with_native_audio" ? " con sonido" : " sin sonido";
+      return model
+        ? `Video con IA, sin persona en cámara (${model.display_name}${audioBit})`
+        : "Video con IA, sin persona en cámara";
     }
     if (vs.type === "concept_only_video") {
       const model = vs.model ? VIDEO_MODELS.find((m) => m.model_id === vs.model) : undefined;
-      return model ? `Video con IA (${model.display_name})` : "Video con IA";
+      return model
+        ? `Video con IA, sin persona en cámara (${model.display_name})`
+        : "Video con IA, sin persona en cámara";
     }
-    if (vs.type === "ai_avatar_lipsync") return "Avatar habla a cámara";
-    if (vs.type === "ai_avatar_video") return `Avatar narra ${vs.scripts.length} escena${vs.scripts.length === 1 ? "" : "s"}`;
+    if (vs.type === "ai_avatar_lipsync") return "Avatar hablando (una escena, sin subtítulos)";
+    if (vs.type === "ai_avatar_video") {
+      const n = vs.scripts.length;
+      return `Avatar hablando (${n} escena${n === 1 ? "" : "s"} anidada${n === 1 ? "" : "s"}, con subtítulos)`;
+    }
   }
   return "-";
 }
@@ -7067,6 +7172,12 @@ interface ValidationCtx {
   // warning on the next update_content_plan. See visual-style-marker.ts for
   // the marker format.
   has_visual_style_marker: boolean;
+  // Cached industry id from Company.description marker. Required by the
+  // video-kind deviation check (collectVideoKindDeviations) so the validator
+  // can compare the LLM's chosen video_source.type against the industry's
+  // default_video_kind without re-resolving it. null when the company has
+  // never been classified; the deviation check skips silently in that case.
+  cached_industry_id: string | null;
 }
 
 interface ValidationTotals {
@@ -7157,43 +7268,54 @@ function extractUpfrontDecisions(
 }
 
 /**
- * Auto-corrige video_sources de plan_items cuando el video_kind elegido
- * contradice el `default_video_kind` recomendado por la industria de la
- * empresa, y el concepto del plan_item NO matchea ningún `flip_concept`
- * del profile (lo cual significaría que el agente legitimamente quiso
- * flipear el default).
+ * Detecta plan_items cuyo video_source.type contradice el `default_video_kind`
+ * recomendado por la industry profile. Reemplaza al corrector silencioso anterior
+ * (`autoCorrectInvertedVideoSources`, 2026-05-25 → 2026-05-28) por las razones
+ * de:
  *
- * Side effect: MUTA los plan_items in-place. Devuelve la lista de
- * correcciones aplicadas para que el caller pueda incluirla en
- * `_internal_corrections_applied` (debugging) y para que el `_assistant_guidance`
- * pueda instruir al agente que NO mencione las correcciones al user
- * (correcciones silenciosas).
+ * (1) El corrector mutaba plan_items in-place sin decirle ni al user ni al LLM
+ *     que estaba cambiando algo. Cuando fallaba (avatar fetch transient, script
+ *     muy corto, substring matcher no cubría una paráfrasis del concept), el
+ *     plan quedaba "mal" y nadie podía debuggear. Sesión real PipeLime 2026-05-28:
+ *     sábado TikTok salió como ai_generate (Veo) cuando debía ser ai_avatar_video
+ *     con Mia narrando, el user lo notó al preguntar explícitamente.
  *
- * Conversiones soportadas:
- *   ai_clip → ai_avatar_video: requiere que la company tenga al menos 1
- *     avatar cargado. Si no, NO se corrige (el avatar_setup_proposal
- *     upstream debió pedir al user que cree uno antes). Scripts se derivan
- *     del caption_concept del sub_post o del concept_shared del item.
- *   ai_avatar_lipsync → ai_avatar_video: SHAPE upgrade dentro de la familia
- *     avatar. La industry policy default avatar_video define "reel multi-
- *     escena con subtítulos quemados" como shape canónica; lipsync (single-
- *     scene sin subtítulos) es la versión degradada. El upgrade es
- *     non-breaking: misma cost-per-second de TTS, generate_backgrounds queda
- *     en false así que cost total no se mueve, output gana subtítulos.
- *     Agregado 2026-05-26 tras la sesión PipeLime (saas) donde se filtró
- *     lipsync en 5 piezas.
- *   ai_avatar_video → ai_clip: convierte scripts a un prompt visual
- *     concatenado, defaults a veo_3.1_fast 8s sin reference image.
- *   ai_avatar_lipsync → ai_clip: idem, prompt del script.
+ * (2) El matcher de `flip_concepts` por substring sobre snake_case tokens
+ *     (`process_diagram`, `data_in_motion`) nunca matcheaba prosa natural ("diagrama
+ *     del proceso", "process diagram of the pipeline"), así que la heurística que
+ *     decidía cuándo flipear estaba estructuralmente rota. Curar phrases por
+ *     idioma no escala (el MCP lo usa gente en cualquier idioma).
  *
- * Si la industry no está cacheada, si el profile no se encuentra, o si la
- * estrategia es `is_ambiguous`, no se hace ninguna corrección.
+ * Diseño nuevo: este helper SOLO colecta deviations. NO muta nada. El caller
+ * (`runValidation`) empaqueta las deviations en un único warning con flag
+ * `is_upfront_decision: true`, así que `extractUpfrontDecisions` lo rutea al
+ * `upfront_decisions_required` que el agent muestra ANTES del plan summary. El
+ * user decide en una sola pregunta batch: "todos al default" o "dejá como
+ * están".
  *
- * Agregado 2026-05-25 tras la sesión-test PipeLime donde el agente armó 6
- * ai_clips + 1 avatar para una industry (local_business) cuyo default es
- * avatar.
+ * Skip silencioso cuando:
+ *   - No hay industry cacheada (the agent no clasificó la marca todavía).
+ *   - Industry no es una de las conocidas.
+ *   - Profile.video_strategy.is_ambiguous === true (generic_business).
+ *   - El profile.default_video_kind requiere avatar pero la company no tiene
+ *     ninguno en inventory: en ese caso el avatar_setup_proposal upstream ya
+ *     pidió al user que cree el primero, no tiene sentido nag por la deviation
+ *     hasta que cree uno.
+ *
+ * Skip por sub_post (no deviation):
+ *   - vs.type === "url" o "asset_id": el user ya eligió un asset específico
+ *     subiendo o reusando, esa es decisión explícita.
+ *   - vs.type === "concept_only_video": Tier 1 con resolución deferida.
+ *
+ * Deviations detectadas:
+ *   - default ai_avatar_video + vs.type === "ai_generate" → cross-family flip.
+ *   - default ai_avatar_video + vs.type === "ai_avatar_lipsync" → within-family
+ *     shape downgrade (single-scene sin subtítulos vs default multi-scene con
+ *     subtítulos).
+ *   - default ai_clip + vs.type === "ai_avatar_lipsync" o "ai_avatar_video" →
+ *     cross-family flip (ecommerce, hospitality, etc.).
  */
-async function autoCorrectInvertedVideoSources(
+export async function collectVideoKindDeviations(
   client: FollowrClient,
   companyId: number,
   cachedIndustryId: string | null,
@@ -7202,60 +7324,43 @@ async function autoCorrectInvertedVideoSources(
   Array<{
     slug: string;
     sub_post_index: number;
-    from_kind: string;
-    to_kind: string;
-    reason: string;
+    network: SocialNetwork;
+    chosen_kind: "ai_generate" | "ai_avatar_lipsync" | "ai_avatar_video";
+    expected_default_kind: VideoStrategy["default_video_kind"];
+    concept: string;
   }>
 > {
   if (!cachedIndustryId) return [];
-  const KNOWN: ReadonlySet<string> = new Set<string>([
-    "ecommerce_fashion", "ecommerce_general", "saas", "restaurant",
-    "service_b2b", "education", "real_estate", "healthcare",
-    "creative_agency", "local_business", "personal_brand", "news_media",
-    "hotel_hospitality", "fitness_wellness", "events_organizer",
-    "ngo_nonprofit", "generic_business",
-  ]);
-  if (!KNOWN.has(cachedIndustryId)) return [];
+  if (!ALL_INDUSTRY_IDS.includes(cachedIndustryId as IndustryId)) return [];
   const profile = getProfile(cachedIndustryId as IndustryId);
   const strategy = profile.video_strategy;
   if (strategy.is_ambiguous === true) return [];
-
   const defaultKind = strategy.default_video_kind;
-  const flipConcepts = strategy.flip_concepts.map((c) => c.toLowerCase());
 
-  // Solo fetch avatares si vamos a necesitarlos (default avatar + hay items
-  // de ai_clip para flipear).
-  let avatarsCache: { id: number; default?: boolean }[] | null = null;
-  const loadAvatars = async (): Promise<{ id: number; default?: boolean }[]> => {
-    if (avatarsCache !== null) return avatarsCache;
+  // Avatar inventory gate. Si el default es ai_avatar_video pero la company
+  // no tiene ningún avatar, no surfacing deviations: upstream
+  // avatar_setup_proposal ya está pidiendo al user que cree uno y el LLM
+  // necesariamente tuvo que caer en ai_generate como fallback. Surfacing un
+  // warning extra acá sería ruidoso. Si listAvatars falla transientemente
+  // tratamos eso como "0 avatares conocidos" y skipeamos también (silent
+  // skip aceptable acá porque el upstream proposal cubre el caso real).
+  if (defaultKind === "ai_avatar_video") {
     try {
-      const list = await client.listAvatars(companyId, { pageSize: 30 });
-      avatarsCache = list.map((a) => ({ id: a.id, default: (a as { default?: boolean }).default }));
+      const avatars = await client.listAvatars(companyId, { pageSize: 30 });
+      if (avatars.length === 0) return [];
     } catch {
-      avatarsCache = [];
+      return [];
     }
-    return avatarsCache;
-  };
+  }
 
-  const pickAvatarId = async (): Promise<number | null> => {
-    const avatars = await loadAvatars();
-    if (avatars.length === 0) return null;
-    const def = avatars.find((a) => a.default === true);
-    return def ? def.id : (avatars[0]?.id ?? null);
-  };
-
-  const corrections: Array<{
+  const deviations: Array<{
     slug: string;
     sub_post_index: number;
-    from_kind: string;
-    to_kind: string;
-    reason: string;
+    network: SocialNetwork;
+    chosen_kind: "ai_generate" | "ai_avatar_lipsync" | "ai_avatar_video";
+    expected_default_kind: VideoStrategy["default_video_kind"];
+    concept: string;
   }> = [];
-
-  const conceptMatchesFlip = (text: string): boolean => {
-    const lower = text.toLowerCase();
-    return flipConcepts.some((kw) => lower.includes(kw));
-  };
 
   for (const item of planItems) {
     const itemConcept = item.concept_shared ?? "";
@@ -7264,107 +7369,44 @@ async function autoCorrectInvertedVideoSources(
       const vs = sp.assets_strategy.video_source;
       if (!vs) continue;
 
+      // User-explicit choices (uploaded URL, library asset, Tier-1 deferred
+      // concept_only_video) are NOT deviations.
+      if (
+        vs.type === "url" ||
+        vs.type === "asset_id" ||
+        vs.type === "concept_only_video"
+      ) {
+        continue;
+      }
+
+      let chosenKind:
+        | "ai_generate"
+        | "ai_avatar_lipsync"
+        | "ai_avatar_video"
+        | null = null;
+      if (defaultKind === "ai_avatar_video") {
+        if (vs.type === "ai_generate") chosenKind = "ai_generate";
+        else if (vs.type === "ai_avatar_lipsync") chosenKind = "ai_avatar_lipsync";
+      } else if (defaultKind === "ai_clip") {
+        if (vs.type === "ai_avatar_video") chosenKind = "ai_avatar_video";
+        else if (vs.type === "ai_avatar_lipsync") chosenKind = "ai_avatar_lipsync";
+      }
+      if (chosenKind === null) continue; // no deviation
+
       const subConcept = sp.caption_concept ?? itemConcept;
-      const concept = `${itemConcept} ${subConcept}`.trim();
-      if (conceptMatchesFlip(concept)) continue; // legítimamente flipped
-
-      // ai_avatar_lipsync → ai_avatar_video (industry default avatar; lipsync
-      // es la SHAPE degradada dentro de la familia avatar). Agregado 2026-05-26
-      // tras la sesión PipeLime (saas) donde el agente eligió ai_avatar_lipsync
-      // para 5 piezas en lugar de ai_avatar_video. El enum VideoKind del
-      // industry profile solo distingue ai_clip vs ai_avatar_video; lipsync
-      // pasaba el filtro silencioso porque "no es ai_clip", pero pierde la
-      // shape multi-escena con subtítulos que la policy define como default.
-      //
-      // El upgrade es non-breaking porque:
-      //   - El TTS cost por segundo es idéntico (25 cr/seg de speech) tanto
-      //     en avatar_video como en lipsync, sin backgrounds.
-      //   - generate_backgrounds queda en false por default, así que el costo
-      //     total no cambia vs la versión lipsync (mismo costo, MEJOR output:
-      //     ahora con subtítulos quemados).
-      //   - El user nunca pidió lipsync explícitamente (Rule 21 del system
-      //     prompt: si fuera un downgrade por presupuesto deliberado, el
-      //     agente tenía que avisar primero; si llegó hasta acá sin avisar,
-      //     es un slip y lo corregimos).
-      //
-      // Si el user en futuras iteraciones PIDE explícitamente lipsync
-      // ("solo una toma corta sin subtítulos"), la flip_concepts del profile
-      // o un update_content_plan con replace_sub_post explícito quedan como
-      // escape hatches; ESTA corrección solo se dispara cuando el concept NO
-      // matchea ningún flip_concept (chequeado arriba).
-      if (
-        defaultKind === "ai_avatar_video" &&
-        vs.type === "ai_avatar_lipsync"
-      ) {
-        if (vs.script.length < 8) continue;
-        sp.assets_strategy.video_source = {
-          type: "ai_avatar_video",
-          scripts: [vs.script],
-          avatar_id: vs.avatar_id,
-        };
-        corrections.push({
-          slug: item.slug,
-          sub_post_index: i,
-          from_kind: "ai_avatar_lipsync",
-          to_kind: "ai_avatar_video",
-          reason: `Industry ${cachedIndustryId} default is ai_avatar_video (multi-scene reel with subtitles); lipsync is the degraded single-scene shape and concept "${concept.slice(0, 80)}" does not match any flip_concept that would justify the simpler shape`,
-        });
-        continue;
-      }
-
-      // ai_clip → ai_avatar_video (industry default avatar)
-      if (
-        defaultKind === "ai_avatar_video" &&
-        vs.type === "ai_generate"
-      ) {
-        const avatarId = await pickAvatarId();
-        if (avatarId === null) continue; // sin inventory, no podemos corregir
-        const script = (subConcept || itemConcept).slice(0, 800);
-        if (script.length < 8) continue; // sin texto razonable para script
-        sp.assets_strategy.video_source = {
-          type: "ai_avatar_video",
-          scripts: [script],
-          avatar_id: avatarId,
-        };
-        corrections.push({
-          slug: item.slug,
-          sub_post_index: i,
-          from_kind: "ai_clip",
-          to_kind: "ai_avatar_video",
-          reason: `Industry ${cachedIndustryId} default is ai_avatar_video; concept "${concept.slice(0, 80)}" does not match any flip_concept`,
-        });
-        continue;
-      }
-
-      // ai_avatar_video / ai_avatar_lipsync → ai_clip (industry default clip)
-      if (
-        defaultKind === "ai_clip" &&
-        (vs.type === "ai_avatar_video" || vs.type === "ai_avatar_lipsync")
-      ) {
-        const prompt =
-          vs.type === "ai_avatar_video"
-            ? vs.scripts.join(". ").slice(0, 600)
-            : vs.script.slice(0, 600);
-        if (prompt.length < 8) continue;
-        sp.assets_strategy.video_source = {
-          type: "ai_generate",
-          model: "veo_3.1_fast",
-          prompt,
-          duration_seconds: 8,
-        };
-        corrections.push({
-          slug: item.slug,
-          sub_post_index: i,
-          from_kind: vs.type === "ai_avatar_video" ? "ai_avatar_video" : "ai_avatar_lipsync",
-          to_kind: "ai_clip",
-          reason: `Industry ${cachedIndustryId} default is ai_clip; concept "${concept.slice(0, 80)}" does not match any flip_concept`,
-        });
-        continue;
-      }
+      const concept = (`${itemConcept} ${subConcept}`.trim() || itemConcept).slice(0, 160);
+      deviations.push({
+        slug: item.slug,
+        sub_post_index: i,
+        network: sp.social_network,
+        chosen_kind: chosenKind,
+        expected_default_kind: defaultKind,
+        concept,
+      });
     }
   }
 
-  return corrections;
+  return deviations;
 }
 
 /**
@@ -8212,6 +8254,69 @@ async function runValidation(args: {
         ],
       });
     }
+  }
+
+  // Video-kind deviation check. Replaces the old silent corrector
+  // (autoCorrectInvertedVideoSources). For industries with a non-ambiguous
+  // default_video_kind, any sub_post whose video_source contradicts the
+  // default surfaces ONE batched upfront decision so the user picks "convert
+  // all to default" or "keep as is" before approving the plan. Runs in both
+  // draft and update validation paths (this function is shared) so the check
+  // can't drift between iterations.
+  const videoKindDeviations = await collectVideoKindDeviations(
+    client,
+    ctx.company_id,
+    ctx.cached_industry_id,
+    plan_items,
+  );
+  if (videoKindDeviations.length > 0) {
+    const expectedDefault = videoKindDeviations[0]!.expected_default_kind;
+    const defaultLabel =
+      expectedDefault === "ai_avatar_video"
+        ? "que tu avatar narre (con varias escenas anidadas y subtítulos)"
+        : "video corto con IA, sin persona a cámara";
+    const chosenSummaryByItem = videoKindDeviations.map((d) => {
+      const chosenLabel =
+        d.chosen_kind === "ai_avatar_video"
+          ? "avatar hablando con varias escenas anidadas (con subtítulos)"
+          : d.chosen_kind === "ai_avatar_lipsync"
+            ? "avatar hablando en una única escena (sin subtítulos)"
+            : "video corto con IA, sin persona a cámara";
+      return `${d.concept.slice(0, 80)} (${displayNetworkName(d.network)}): ahora ${chosenLabel}`;
+    });
+    const itemCount = videoKindDeviations.length;
+    const userFacingMessage =
+      `Para tu industria el default de videos es ${defaultLabel}. ` +
+      `En este plan ${itemCount === 1 ? "hay 1 video que NO" : `hay ${itemCount} videos que NO`} ` +
+      `siguen ese default:\n- ${chosenSummaryByItem.join("\n- ")}\n` +
+      `¿${itemCount === 1 ? "Lo paso" : "Los paso"} al default, o ${itemCount === 1 ? "lo dejo" : "los dejo"} como ${itemCount === 1 ? "está" : "están"}?`;
+    warnings.push({
+      issue: "video_kind_deviates_from_industry_default",
+      is_upfront_decision: true,
+      user_facing_message: userFacingMessage,
+      deviating_items: videoKindDeviations,
+      expected_default_kind: expectedDefault,
+      resolution_options: [
+        {
+          id: "convert_all_to_default",
+          description:
+            expectedDefault === "ai_avatar_video"
+              ? `Convertir todos los video_sources que deviates a ai_avatar_video. Para cada deviating_item llamá update_content_plan con changes=[{action: 'replace_sub_post', slug, sub_post_index, new_sub_post: { ...keep network/asset_layout..., assets_strategy: { ...existing..., video_source: { type: 'ai_avatar_video', scripts: [<derivá del concept_shared o caption_concept>], avatar_id: <default avatar id> } } }}]. Costs is the existing assignment based on script length (estimateTtsSeconds).`
+              : `Convertir todos los video_sources que deviates a ai_generate (video con IA sin persona). Para cada deviating_item llamá update_content_plan con changes=[{action: 'replace_sub_post', slug, sub_post_index, new_sub_post: { ...keep network/asset_layout..., assets_strategy: { ...existing..., video_source: { type: 'ai_generate', model: 'veo_3.1_fast', prompt: <derivá del concept>, duration_seconds: 8 } } }}].`,
+          user_facing_description:
+            expectedDefault === "ai_avatar_video"
+              ? "Que tu avatar narre los que ahora están como video con IA (los paso al default de tu industria)."
+              : "Que sean videos cortos con IA (sin persona a cámara) en lugar de avatar narrando.",
+        },
+        {
+          id: "keep_deviations_as_is",
+          description:
+            "El user confirma que la mezcla actual de video kinds es deliberada. NO llames update_content_plan; avanzá con set_copy_drafts / execute_content_plan como si la deviation hubiese sido aprobada explícitamente.",
+          user_facing_description:
+            "Dejalos como están, el mix actual es a propósito.",
+        },
+      ],
+    });
   }
 
   return {

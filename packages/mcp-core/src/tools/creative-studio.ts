@@ -684,7 +684,7 @@ USAGE FLOW:
 1. detect_brand_visual_style({ company_id }) → ranked top 3 + traits
 2. Agent shows top 3 with preview_url images to the user, asks: "este es tu estilo, te gusta?"
 3. If user picks one: confirm_visual_style({ company_id, primary_slug }) persists it
-4. If user wants alternatives: propose_visual_style_options with exclude_slugs to iterate
+4. If user says 'mostrame más' / 'ninguno me gusta' / 'siguiente': RE-CALL detect_brand_visual_style with exclude_slugs = the slugs you already showed and top_n = 3-5. The classifier output already ranks the WHOLE catalog against the brand evidence, so re-calls paginate the existing ranking (zero extra cost for vision captions, single chat call to re-rank against the smaller candidate set). Stay on this tool while the user is iterating; do NOT fall back to propose_visual_style_options or list_visual_styles for "show more" because those use generic catalog popularity and lose the brand-specific signal you already paid for.
 
 INTEGRATION WITH generate_brand_creative: once confirmed, generate_brand_creative uses the cached primary_slug as default when style_key is not passed explicitly. The user no longer needs to pick a style every time.
 
@@ -712,19 +712,46 @@ RELATED TOOLS (named explicitly so the host's tool-search precaches them): list_
           .describe(
             "Optional additional reference image URLs to include in the analysis (e.g. brands the user admires, screenshots they uploaded). Useful when website/posts have low visual signal.",
           ),
+        top_n: z
+          .number()
+          .int()
+          .min(1)
+          .max(10)
+          .optional()
+          .describe(
+            "How many ranked styles to return in this call. Default 3. Use when the user said 'mostrame más' / 'ninguno me gusta' after the first call: re-call with top_n: 3-5 and exclude_slugs filled with the slugs already shown. The classifier reasons against the WHOLE 32-style catalog and we return the next top_n that aren't in exclude_slugs, so the ranking against your brand's visual evidence is preserved across calls.",
+          ),
+        exclude_slugs: z
+          .array(z.string())
+          .optional()
+          .describe(
+            "Slugs already shown to the user from previous calls (so they don't reappear). Pass the cumulative set across re-calls. When non-empty the classifier is asked to skip these and return the next-best matches in the ranking.",
+          ),
       },
     },
-    async ({ company_id, force_refresh, max_signals, include_uploads }) => {
+    async ({ company_id, force_refresh, max_signals, include_uploads, top_n, exclude_slugs }) => {
       try {
         const maxSignals = max_signals ?? 6;
+        const topN = top_n ?? 3;
+        const excludeSet = new Set((exclude_slugs ?? []).filter(isValidStyleSlug));
 
         // ── Load company + check cached marker ──────────────────────
         const company = await client.getCompany(company_id);
         const description = company.description ?? "";
         const cachedMarker = parseVisualStyleMarker(description);
 
-        // Return cached if exists and not forced (zero-cost path)
-        if (!force_refresh && cachedMarker && isValidStyleSlug(cachedMarker.slug)) {
+        // Return cached if exists and not forced AND not paginating.
+        // When exclude_slugs is non-empty the caller is iterating past the
+        // first batch (user said "mostrame más"), so the cached primary
+        // wouldn't help; fall through to run detection fresh. Same with a
+        // request for top_n > 1: the cache only has the confirmed primary.
+        const isPaginating = excludeSet.size > 0;
+        if (
+          !force_refresh &&
+          !isPaginating &&
+          cachedMarker &&
+          isValidStyleSlug(cachedMarker.slug)
+        ) {
           const primaryStyle = getStyleBySlug(cachedMarker.slug);
           return {
             content: [
@@ -914,9 +941,16 @@ RELATED TOOLS (named explicitly so the host's tool-search precaches them): list_
         }
 
         // ── Build classifier prompt ─────────────────────────────────
-        const stylesCatalog = VISUAL_STYLES.map(
-          (s) => `- ${s.slug}: ${s.description}`,
-        ).join("\n");
+        // When paginating ("show me more"), drop the excluded slugs from the
+        // candidate catalog so the classifier ranks among the remaining
+        // styles. Asking the classifier to "rank top N excluding [list]"
+        // works in theory but Veo/Gemini hallucinate excluded slugs back
+        // anyway, so we filter on both sides: prompt-side reduces the
+        // hallucination surface, response-side enforces the exclusion.
+        const candidateStyles = VISUAL_STYLES.filter((s) => !excludeSet.has(s.slug));
+        const stylesCatalog = candidateStyles
+          .map((s) => `- ${s.slug}: ${s.description}`)
+          .join("\n");
 
         const captionsList = captions
           .map((c, i) => `${i + 1}. [${c.source}] ${c.caption}`)
@@ -930,23 +964,27 @@ RELATED TOOLS (named explicitly so the host's tool-search precaches them): list_
           .trim()
           .slice(0, 800);
 
+        const requestedRanked = Math.min(topN, candidateStyles.length);
+        const excludeNote = excludeSet.size > 0
+          ? `\nThe user has already seen these styles and rejected them, so do NOT rank any of them: ${Array.from(excludeSet).join(", ")}. They are absent from the catalog above for a reason — pick only from what is listed.\n`
+          : "";
+
         const classifierPrompt = `Brand name: ${company.name ?? "(unknown)"}.
 ${briefText ? `Brand description: ${briefText}` : ""}
 
 Visual evidence (captions of the brand's existing content):
 ${captionsList}
 
-Available visual styles (32 options):
+Available visual styles (${candidateStyles.length} options):
 ${stylesCatalog}
-
-TASK: Rank the top 3 styles that BEST match the visual evidence above. Base the ranking on the actual visual content described, NOT on stylistic guesses or brand category alone.
+${excludeNote}
+TASK: Rank the top ${requestedRanked} styles that BEST match the visual evidence above. Base the ranking on the actual visual content described, NOT on stylistic guesses or brand category alone.
 
 OUTPUT FORMAT: respond with VALID JSON ONLY. No prose, no markdown fences, no other text. Schema:
 {
   "ranked": [
-    {"slug": "<one of the 32 slugs above>", "confidence": <0.0-1.0>, "evidence": "<one short sentence pointing to specific visual elements in the captions>"},
-    {"slug": "...", "confidence": ..., "evidence": "..."},
-    {"slug": "...", "confidence": ..., "evidence": "..."}
+    {"slug": "<one of the available slugs above>", "confidence": <0.0-1.0>, "evidence": "<one short sentence pointing to specific visual elements in the captions>"}
+    // ... ${requestedRanked} entries total, ordered best to worst match
   ],
   "detected_traits": {
     "mood": "<one or two words>",
@@ -999,10 +1037,11 @@ OUTPUT FORMAT: respond with VALID JSON ONLY. No prose, no markdown fences, no ot
           .filter((r): r is { slug: string; confidence: number; evidence: string } =>
             typeof r?.slug === "string" &&
             isValidStyleSlug(r.slug) &&
+            !excludeSet.has(r.slug) &&
             typeof r?.confidence === "number" &&
             typeof r?.evidence === "string",
           )
-          .slice(0, 5)
+          .slice(0, topN)
           .map((r) => ({
             slug: r.slug,
             confidence: Math.max(0, Math.min(1, r.confidence)),
@@ -1019,9 +1058,13 @@ OUTPUT FORMAT: respond with VALID JSON ONLY. No prose, no markdown fences, no ot
             details: {
               raw_response_preview: responseText.slice(0, 500),
               captions_count: captions.length,
+              exclude_slugs_count: excludeSet.size,
             },
           });
         }
+
+        const totalShownAfter = excludeSet.size + ranked.length;
+        const exhaustedRanking = totalShownAfter >= VISUAL_STYLES.length;
 
         return {
           content: [
@@ -1034,11 +1077,24 @@ OUTPUT FORMAT: respond with VALID JSON ONLY. No prose, no markdown fences, no ot
                   signal_sources: captions.map((c) => c.source),
                   ranked_styles: ranked,
                   detected_traits: parsedClassifier.detected_traits ?? null,
-                  user_facing_summary: `Detecté tu estilo. El que más se acerca: ${ranked[0]?.style_info?.name ?? ranked[0]?.slug} (confidence ${Math.round((ranked[0]?.confidence ?? 0) * 100)}%). Tenés ${ranked.length - 1} alternativas también.`,
+                  paginated: excludeSet.size > 0,
+                  catalog_total: VISUAL_STYLES.length,
+                  total_shown_after_this_batch: totalShownAfter,
+                  remaining_in_ranking: Math.max(0, VISUAL_STYLES.length - totalShownAfter),
+                  ranking_exhausted: exhaustedRanking,
+                  user_facing_summary:
+                    excludeSet.size > 0
+                      ? exhaustedRanking
+                        ? `Ya te mostré todos los ${VISUAL_STYLES.length} templates rankeados contra tu marca, y ninguno te convenció. No quedan más en el catálogo.`
+                        : `Te muestro ${ranked.length} ${ranked.length === 1 ? "alternativa más" : "alternativas más"}, rankeadas contra tu marca después de las que ya viste. Quedan ${VISUAL_STYLES.length - totalShownAfter} en el catálogo.`
+                      : `Detecté tu estilo. El que más se acerca: ${ranked[0]?.style_info?.name ?? ranked[0]?.slug} (confidence ${Math.round((ranked[0]?.confidence ?? 0) * 100)}%).${ranked.length > 1 ? ` Tenés ${ranked.length - 1} ${ranked.length - 1 === 1 ? "alternativa" : "alternativas"} también.` : ""}`,
                   _assistant_guidance: {
-                    next_step: "show_top_ranked_with_previews_then_confirm_or_iterate",
-                    instructions:
-                      "Mostrale al user TOP 1-3 styles con sus preview_url images inline (no slugs). Pregunta: '¿te gusta el primero? Si no, te muestro las alternativas o vamos a otros del catálogo'. Cuando confirme uno, llamá confirm_visual_style con su slug. Si no le gusta ninguno de los 3, llamá propose_visual_style_options con exclude_slugs incluyendo los 3 mostrados.",
+                    next_step: exhaustedRanking
+                      ? "exhausted_offer_alternatives"
+                      : "show_ranked_with_previews_then_confirm_or_iterate",
+                    instructions: exhaustedRanking
+                      ? "Probaste todos los styles rankeados contra la marca y ninguno gustó. NO sigas llamando detect_brand_visual_style. Ofrecé dos paths: (a) elegir el closest match de los que ya viste y proceder con confirm_visual_style, (b) dejar el sistema decida sin fijar style (no llamar confirm_visual_style; cuando se genere algo se elige solo)."
+                      : "Mostrá al user los styles devueltos con sus preview_url images INLINE (uno por style, no thumbnails chiquititas) y con sus display_name. Preguntá '¿te gusta alguno?'. Si dice 'mostrame más' / 'ninguno me gusta' / 'siguiente', RE-LLAMÁ detect_brand_visual_style con: exclude_slugs = lista acumulada de slugs ya mostrados (los nuevos + los anteriores) y top_n = 3-5. NO cambies a propose_visual_style_options ni list_visual_styles para esto — ambos usan popularidad genérica del catálogo y pierden el ranking contra TU marca (que ya pagaste de costo computacional una vez). Si el user elige uno, llamá confirm_visual_style con su slug.",
                   },
                 },
                 null,

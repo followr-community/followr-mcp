@@ -292,9 +292,11 @@ describe("Tier 3 regression: cost estimation matches pre-v0.6.1 expectations", (
     expect(c.image_ai_cost).toBe(25);
   });
 
-  it("ai_avatar_lipsync ~= 25 cr/sec * 12 sec floor = 300 cr by current empirical model", () => {
-    // The estimator uses 25 * 12 as a fixed empirical estimate for lipsync.
-    // Verified pre-v0.6.1 to be the established baseline.
+  it("ai_avatar_lipsync now scales with script length (2026-05-29 refactor)", () => {
+    // Pre-refactor the cost was a flat 25 cr/sec * 12 sec = 300 cr for ANY
+    // script. Now estimateTtsSeconds derives the seconds from script length
+    // (14 chars/sec, 8s floor). "Test script" = 11 chars → ceil(11/14)=1,
+    // floored to 8 s. Total = 25 * 8 = 200 cr.
     const item = makeTier3Item("lipsync-cost", [
       makeTier3SubPost(
         "instagram",
@@ -310,17 +312,21 @@ describe("Tier 3 regression: cost estimation matches pre-v0.6.1 expectations", (
     ]);
     const c = estimatePlanItemCostDeduped(item);
     expect(c.video_ai_count).toBe(1);
-    expect(c.video_ai_cost).toBe(25 * 12);
+    expect(c.video_ai_cost).toBe(25 * 8);
   });
 
-  it("Multi-scene avatar_video charges lipsync per scene + optional backgrounds", () => {
+  it("Multi-scene avatar_video charges per-scene TTS seconds + optional backgrounds", () => {
+    // Post 2026-05-29 refactor: cost = 25 * sum(estimateTtsSeconds(script))
+    // + (backgrounds ? 60 * scenes : 0). Scripts "A", "B", "C" each are 1
+    // char → ceil(1/14)=1, floored to 8 s each. Total seconds = 24.
+    // Cost = 25 * 24 + 60 * 3 = 600 + 180 = 780.
     const item = makeTier3Item("multi-scene-cost", [
       makeTier3SubPost(
         "instagram",
         {
           video_source: {
             type: "ai_avatar_video",
-            scripts: ["A", "B", "C"], // 3 scenes
+            scripts: ["A", "B", "C"], // 3 scenes, each floored to 8 s
             avatar_id: 12,
             generate_backgrounds: true,
           },
@@ -330,8 +336,7 @@ describe("Tier 3 regression: cost estimation matches pre-v0.6.1 expectations", (
     ]);
     const c = estimatePlanItemCostDeduped(item);
     expect(c.video_ai_count).toBe(1);
-    // Pre-v0.6.1 formula: 25 * 10 * scenes + (generate_backgrounds ? 60 * scenes : 0)
-    expect(c.video_ai_cost).toBe(25 * 10 * 3 + 60 * 3);
+    expect(c.video_ai_cost).toBe(25 * (8 * 3) + 60 * 3);
   });
 
   it("Carousel of 5 ai_generate slides with different prompts = 5 * 25 cr", () => {
