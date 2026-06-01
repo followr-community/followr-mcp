@@ -106,3 +106,78 @@ export function resolveTimezone(...candidates: Array<string | null | undefined>)
   }
   return "UTC";
 }
+
+/**
+ * True when `tz` is a usable IANA timezone identifier for scheduling.
+ *
+ * Stricter than "Intl accepts it" ON PURPOSE. V8's Intl ACCEPTS legacy
+ * abbreviations like "ART", "EST", "PST", "CET" and maps them to surprising
+ * fixed offsets ("ART" -> GMT+3, not Argentina's -3). An LLM that emits "ART"
+ * meaning Argentina would otherwise schedule 6h off, silently. A real IANA id
+ * is either exactly "UTC" or an Area/Location form containing "/"
+ * ("America/Buenos_Aires", "Europe/Madrid", "Etc/UTC"). We require that shape
+ * first, then confirm the runtime accepts it.
+ */
+export function isValidIanaTimezone(tz: string | null | undefined): boolean {
+  if (typeof tz !== "string") return false;
+  const z = tz.trim();
+  if (z.length === 0) return false;
+  if (z !== "UTC" && !z.includes("/")) return false;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: z });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Reduce a raw resolved timezone to "a real location signal, or null".
+ *
+ * A process deployed in UTC (container, Cloudflare Worker) reports the literal
+ * "UTC" / "Etc/UTC" / "Etc/GMT*"; a real user in the UTC band reports a
+ * geographic zone ("Europe/London", "Atlantic/Reykjavik"). So a literal
+ * UTC-family id means "no location signal", modelled as null. Anything else is
+ * returned only if it passes isValidIanaTimezone.
+ */
+export function normalizeDetectedTimezone(raw: string | null | undefined): string | null {
+  if (typeof raw !== "string") return null;
+  const tz = raw.trim();
+  if (tz.length === 0) return null;
+  if (/^(UTC|Etc\/UTC|Etc\/GMT([+-]\d+)?)$/i.test(tz)) return null;
+  return isValidIanaTimezone(tz) ? tz : null;
+}
+
+/**
+ * Best-effort detection of the user's timezone from the server process. On the
+ * stdio transport the process runs on the user's own machine, so the system
+ * zone IS the user's zone. On a UTC-deployed remote (Worker) this yields null
+ * (see normalizeDetectedTimezone) and the caller falls back to asking.
+ */
+export function detectServerTimezone(): string | null {
+  try {
+    return normalizeDetectedTimezone(Intl.DateTimeFormat().resolvedOptions().timeZone);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Human-friendly label for a timezone, for surfacing in a confirm question:
+ * "America/Argentina/Buenos_Aires" -> "Buenos Aires (GMT-3)". The offset is
+ * rendered for `now` (defaults to the current instant) so it reflects DST.
+ * Falls back to just the city when the runtime cannot render the offset.
+ */
+export function timezoneHumanLabel(iana: string, now: Date = new Date()): string {
+  const city = (iana.split("/").pop() ?? iana).replace(/_/g, " ");
+  try {
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: iana,
+      timeZoneName: "shortOffset",
+    }).formatToParts(now);
+    const offset = parts.find((p) => p.type === "timeZoneName")?.value;
+    return offset ? `${city} (${offset})` : city;
+  } catch {
+    return city;
+  }
+}

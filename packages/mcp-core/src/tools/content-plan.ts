@@ -72,7 +72,13 @@ import { normalizePreferences } from "../lib/normalize-preferences.js";
 import { getAiPreferences } from "../lib/preferences.js";
 import { readCachedIndustry } from "./research.js";
 import { fetchAllCompanies } from "./context.js";
-import { localDateTimeToUtcIso, resolveTimezone } from "../lib/timezone.js";
+import {
+  localDateTimeToUtcIso,
+  resolveTimezone,
+  isValidIanaTimezone,
+  detectServerTimezone,
+  timezoneHumanLabel,
+} from "../lib/timezone.js";
 import {
   type AssetLayout,
   type AssetSourceAiImage,
@@ -1136,7 +1142,14 @@ RELATED TOOLS IN THE PLANNING WORKFLOW (named explicitly so the host's tool-sear
       // blocked, agent moved to Thursday evening which was also past,
       // validator blocked again. The smart-window options below resolve
       // this on the first turn.
+      // detectServerTimezone(): on the stdio transport the process runs on the
+      // user's own machine, so the system zone IS the user's zone. Used both as
+      // the smart-window reference below and to seed the timezone_setup
+      // question when the user has no timezone on file.
+      const detectedTz = detectServerTimezone();
       const companyTzForWindow = resolveTimezone(
+        me?.timezone,
+        detectedTz,
         (companyResolved as Company & { timezone?: string | null }).timezone,
       );
       let companyLocalHour: number | null = null;
@@ -1322,6 +1335,12 @@ RELATED TOOLS IN THE PLANNING WORKFLOW (named explicitly so the host's tool-sear
           confidence: "high",
           reason_es: `Zona horaria del usuario. Aplicar a publish_at_time_local. NO preguntar.`,
         };
+      } else {
+        // No timezone on file: do NOT silently default to UTC (that schedules
+        // posts at the wrong local hour for any non-UTC user, silently and
+        // publicly: PipeLime 2026-06-01). Emit a phase_1 question that proposes
+        // the server-detected zone and lets the user confirm or correct.
+        phase1Questions.push(buildTimezoneSetupQuestion(detectedTz));
       }
 
       const tikTokOrYouTubeConnected =
@@ -1334,10 +1353,11 @@ RELATED TOOLS IN THE PLANNING WORKFLOW (named explicitly so the host's tool-sear
         "2. If phase_1_foundational has questions, ask THOSE in a SINGLE AskUserQuestion call this turn. NEVER mix phase_1 with phase_2 in the same turn. The phase_1 questions are blockers: the user picking 'avanzar sin' is acceptable, but you cannot skip the question itself.",
         "3. For each phase_1 question the user picks 'call_setup_tool' on, invoke option_actions[i].setup_tool with the suggested args (resolve the *_from references against the matching proposal block in this same _assistant_guidance). After every setup tool completes, re-call prepare_content_plan_context to refresh state, then continue.",
         "4. When phase_1 is empty OR fully resolved, ask phase_2_plan_scope in ONE AskUserQuestion call. There are 4 questions; AskUserQuestion supports up to 4, so submit them together.",
-        "5. Treat pre_resolved_decisions as already decided. NEVER ask the user about these (language, networks_intent, timezone). Apply them as defaults when building plan_items[].",
+        "5. Treat pre_resolved_decisions as already decided: NEVER ask the user about language or networks_intent, apply them as defaults when building plan_items[]. TIMEZONE: when pre_resolved_decisions.timezone is present (user has one on file), apply its value silently to every item.timezone and do NOT ask. When it is ABSENT, a timezone_setup question is in phase_1_foundational instead (resolve it like any other phase_1 blocker, see step 9). NEVER default item.timezone to 'UTC' for a user whose location you have not confirmed.",
         "6. After phase_2 answers come in, IMMEDIATELY call draft_content_plan with the structured plan_items[] you build. DO NOT propose the plan to the user in prose first. The summary_for_user that draft_content_plan returns is what you show the user, not your own table.",
         "7. ask_user_question_payload on each question is shaped to match the host's AskUserQuestion tool: copy question, header and options verbatim. Use option_actions to interpret what the user picked.",
         "8. If multiSelect is needed (e.g. user picks two themes at once), AskUserQuestion supports it but the default here is single-select. Keep single-select unless the user signals otherwise.",
+        "9. timezone_setup resolution: if its ask_user_question_payload is present, surface it like other phase_1 questions; picking option_index 0 (next_action 'adopt_timezone') means use its timezone_iana verbatim as item.timezone. If the user picks 'Estoy en otra zona' (next_action 'ask_timezone_freeform') or types via AskUserQuestion's free-text, map their city/country to a valid IANA Area/Location id (e.g. 'New York' -> 'America/New_York'), NEVER a bare abbreviation like 'ART'/'EST'. If ask_user_question_payload is null (no detection signal), ask freeform_prompt in prose instead of via AskUserQuestion. For countries spanning multiple zones (US, Brazil, Australia, Canada, Mexico, Russia, Indonesia, Chile) ask for the city before mapping. The resolved zone goes on EVERY plan_item's timezone.",
       ].join("\n");
 
       const videoOnlyNetworksStrategy = tikTokOrYouTubeConnected
@@ -2004,7 +2024,13 @@ RELATED TOOLS IN THE PLANNING WORKFLOW (named explicitly so the host's tool-sear
     publish_at_time_local: z
       .string()
       .regex(/^\d{2}:\d{2}$/, "expected HH:mm (24h)"),
-    timezone: z.string().min(1).max(60),
+    timezone: z
+      .string()
+      .min(1)
+      .max(60)
+      .describe(
+        "IANA timezone (e.g. 'America/Buenos_Aires', 'Europe/Madrid') used to interpret publish_at_time_local into the UTC publish_at stored by Followr. Source it from prepare_content_plan_context user.timezone, or from the resolved answer to the timezone_setup phase_1 question. Must be an Area/Location id or 'UTC', never a bare abbreviation like 'ART'/'EST'. NEVER default to 'UTC' for a user whose location you have not confirmed: that publishes at the wrong local hour.",
+      ),
     concept_shared: z.string().min(1).max(500),
     rationale: z.string().min(1).max(1000),
     paired_with: z.array(z.string().min(1).max(80)).optional(),
@@ -2202,7 +2228,13 @@ RELATED TOOLS IN THE PLANNING WORKFLOW (named explicitly so the host's tool-sear
       publish_at_time_local: z
         .string()
         .regex(/^\d{2}:\d{2}$/, "expected HH:mm (24h)"),
-      timezone: z.string().min(1).max(60),
+      timezone: z
+        .string()
+        .min(1)
+        .max(60)
+        .describe(
+          "IANA timezone (e.g. 'America/Buenos_Aires', 'Europe/Madrid') used to interpret publish_at_time_local into the UTC publish_at stored by Followr. Source it from prepare_content_plan_context user.timezone, or from the resolved answer to the timezone_setup phase_1 question. Must be an Area/Location id or 'UTC', never a bare abbreviation like 'ART'/'EST'. NEVER default to 'UTC' for a user whose location you have not confirmed: that publishes at the wrong local hour.",
+        ),
       concept_shared: z.string().min(1).max(500),
       rationale: z
         .string()
@@ -5288,6 +5320,90 @@ function subPostAssetRefs(sp: SubPost, item: PlanItem): AssetSourceRef[] {
   return refs;
 }
 
+/**
+ * Resolve the UTC `publish_at` ISO for a single plan item.
+ *
+ * The per-item `timezone` is AUTHORITATIVE: the planner fills it from the
+ * user's timezone (prepare_content_plan_context pre_resolved_decisions) and
+ * runValidation's past-slot guard already interprets the slot against it.
+ * `scheduleTimezone` (plan.auto_publish_schedule.timezone > company timezone
+ * > "UTC") is ONLY a fallback for the schema-prevented case of an empty
+ * item.timezone, so the executor stays consistent with the validator and the
+ * preview instead of being a second, divergent source of truth.
+ *
+ * Regression guard (PipeLime 2026-06-01): the executor used to interpret the
+ * slot against scheduleTimezone alone. The Company resource exposes no
+ * timezone field (timezone lives on the User), so for a plan with no
+ * auto_publish_schedule that chain collapses to "UTC". A 13:00
+ * America/Buenos_Aires intent was then stored as 13:00Z (= 10:00 local),
+ * i.e. 3h early and already in the past at execute time, while the guard
+ * (reading item.timezone) had happily passed it as a future slot.
+ */
+export function resolveItemPublishAtIso(
+  item: Pick<PlanItem, "date" | "publish_at_time_local" | "timezone">,
+  scheduleTimezone: string,
+): string | null {
+  const tz = resolveTimezone(item.timezone, scheduleTimezone);
+  // Defense in depth: V8's Intl accepts legacy abbreviations ("ART" -> GMT+3),
+  // so localDateTimeToUtcIso would return a wrong-but-non-null instant for
+  // them. runValidation already blocks an invalid item.timezone at draft time;
+  // here we refuse to SCHEDULE on a non-IANA zone (returning null leaves the
+  // PostGroup as a draft) rather than auto-publishing at a silently wrong time.
+  if (!isValidIanaTimezone(tz)) return null;
+  return localDateTimeToUtcIso(item.date, item.publish_at_time_local, tz);
+}
+
+/**
+ * Build the `timezone_setup` phase_1 question, emitted by
+ * prepare_content_plan_context when the user has no timezone on file. The
+ * server-detected zone (stdio only) seeds a recommended option; the user
+ * confirms or corrects. With no detection signal (remote/UTC deploy),
+ * ask_user_question_payload is null and the agent asks freeform_prompt in
+ * prose instead. The resolved IANA zone becomes item.timezone on every
+ * plan_item; no setup tool is involved.
+ */
+export function buildTimezoneSetupQuestion(detected: string | null): Record<string, unknown> {
+  const base = {
+    id: "timezone_setup",
+    phase: "foundational",
+    blocks_plan_until_resolved: true,
+  };
+  if (detected) {
+    const label = timezoneHumanLabel(detected);
+    return {
+      ...base,
+      detected_timezone_iana: detected,
+      rationale_for_agent: `User has no timezone on file (user.timezone null). publish_at is computed from item.timezone; with no real zone the post cannot be scheduled (or a wrong abbreviation would publish at the wrong hour). Resolve this BEFORE phase_2. Option 0 is the server-detected zone (${detected}). If the user picks "otra zona" or types a free-text answer, map their city/country to a valid IANA Area/Location id (never a bare abbreviation like "ART"/"EST"); for countries spanning multiple zones (US, Brazil, Australia, Canada, Mexico, Russia, Indonesia, Chile) ASK for the city instead of guessing. Apply the resolved IANA zone as item.timezone on EVERY plan_item. Do NOT call any setup tool: this question only yields a value you carry into draft_content_plan.`,
+      ask_user_question_payload: {
+        question: `¿En qué huso horario querés que se publiquen los posts? Detecté que estás en ${label}.`,
+        header: "Huso horario",
+        options: [
+          {
+            label,
+            description: "Tu huso detectado. Los posts se publican a la hora local de esta zona.",
+          },
+          {
+            label: "Estoy en otra zona",
+            description: "Decime tu ciudad o país y lo configuro.",
+          },
+        ],
+      },
+      option_actions: [
+        { option_index: 0, next_action: "adopt_timezone", timezone_iana: detected },
+        { option_index: 1, next_action: "ask_timezone_freeform" },
+      ],
+    };
+  }
+  return {
+    ...base,
+    detected_timezone_iana: null,
+    rationale_for_agent: `User has no timezone on file and the server has no location signal (remote/UTC deploy). Ask the user, in plain language, for the city or country they want posts published in, and map it to a valid IANA Area/Location id (never a bare abbreviation like "ART"/"EST"). For multi-zone countries ASK for the city. Apply the resolved IANA zone as item.timezone on EVERY plan_item; do NOT default to UTC. No setup tool is involved.`,
+    ask_user_question_payload: null,
+    freeform_prompt: "¿Desde qué ciudad o huso horario querés que se publiquen los posts?",
+    option_actions: [],
+  };
+}
+
 async function executePlanItem(
   client: FollowrClient,
   companyId: number,
@@ -5556,7 +5672,7 @@ async function executePlanItem(
     typeof item.publish_at_time_local === "string" &&
     item.publish_at_time_local.length > 0;
   const publishAtUtc = wantSchedule
-    ? localDateTimeToUtcIso(item.date, item.publish_at_time_local, schedulingCtx.scheduleTimezone)
+    ? resolveItemPublishAtIso(item, schedulingCtx.scheduleTimezone)
     : null;
   const scheduled = wantSchedule && publishAtUtc !== null;
   let group;
@@ -7527,6 +7643,27 @@ async function runValidation(args: {
         issue: "date_out_of_window",
         item: item.slug,
         user_facing_message: `El posteo está agendado para el ${item.date}, fuera de la ventana ${time_window.start} a ${time_window.end} que pediste. Verificá si querías esa fecha o muevo el posteo.`,
+      });
+    }
+
+    // Timezone must be a usable IANA zone. Stricter than "Intl accepts it":
+    // V8 accepts legacy abbreviations ("ART" -> GMT+3) that would publish at a
+    // silently wrong hour. Block here so the agent fixes it at draft time
+    // instead of the executor refusing to schedule (or, pre-guard, publishing
+    // at the wrong instant).
+    if (!isValidIanaTimezone(item.timezone)) {
+      blockers.push({
+        issue: "invalid_timezone",
+        item: item.slug,
+        timezone: item.timezone,
+        user_facing_message: `El posteo "${item.concept_shared.slice(0, 60)}" tiene una zona horaria que no reconozco ("${item.timezone}"). Necesito un IANA válido (ej: America/Buenos_Aires, Europe/Madrid) para calcular la hora de publicación. ¿Desde qué ciudad o huso querés publicar?`,
+        resolution_options: [
+          {
+            id: "set_valid_timezone",
+            description:
+              "Actualizar item.timezone a un IANA Area/Location válido via update_content_plan (operation update_field, field 'timezone'). Mapear la ciudad/país del usuario a IANA; para países con varias zonas (US, Brasil, etc.) pedir la ciudad. Nunca usar abreviaturas tipo 'ART'/'EST'.",
+          },
+        ],
       });
     }
 
