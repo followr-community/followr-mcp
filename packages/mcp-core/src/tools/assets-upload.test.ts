@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 
-import { FollowrApiError } from "@followr-mcp/shared";
+import { FollowrApiError, ensureFilenameExtension } from "@followr-mcp/shared";
 import type { Asset, FollowrClient } from "@followr-mcp/shared";
 
 import { ToolErrorException } from "../lib/tool-error.js";
@@ -13,10 +13,10 @@ function makeAsset(id: number): Asset {
 }
 
 function makeFakeClient(overrides: {
-  createAsset?: () => Promise<Asset>;
-  requestAssetUpload?: () => Promise<{ presigned_url: string; url: string }>;
-  uploadToBlob?: () => Promise<void>;
-  deleteAsset?: (id: number) => Promise<void>;
+  createAsset?: FollowrClient["createAsset"];
+  requestAssetUpload?: FollowrClient["requestAssetUpload"];
+  uploadToBlob?: FollowrClient["uploadToBlob"];
+  deleteAsset?: FollowrClient["deleteAsset"];
 }): FollowrClient {
   return {
     createAsset: overrides.createAsset ?? (async () => makeAsset(123)),
@@ -260,5 +260,113 @@ describe("uploadFromUrl retry-on-5xx", () => {
       result: { structuredContent: { reason: expect.stringContaining("4xx") } },
     });
     expect(attempts).toBe(1);
+  });
+});
+
+// ── Filename extension guarantee ─────────────────────────────────────────────
+// Regression: Followr's presigned-upload endpoints (POST /api/assets/{id}/video
+// and /image) return HTTP 500 when `filename` has no file extension. Verified
+// empirically 2026-06-01 against api.followr.ai:
+//   "Avatar Mia reel (3 scenes, 2026-06-01)"     -> 500 (every avatar video)
+//   "Avatar Mia reel (3 scenes, 2026-06-01).mp4" -> 201
+//   "test" -> 500 ; "test.mp4" -> 201 ; "test.xyz" -> 201 ; "test." -> 201
+// The avatar auto-upload (ai-results.ts) passes a human-readable name with no
+// extension, so every avatar reel upload died at step 2 and was MISDIAGNOSED in
+// code comments as a transient backend outage (the retry hardening could never
+// help: the request is malformed identically on every attempt). uploadFromUrl
+// must guarantee an extension on BOTH the placeholder name (step 1) and the
+// presigned filename (step 2).
+
+describe("uploadFromUrl filename extension guarantee", () => {
+  it("appends a .mp4 extension when a video name has none (the avatar bug)", async () => {
+    let placeholderName: string | undefined;
+    let presignFilename: string | undefined;
+    const client = makeFakeClient({
+      createAsset: async (_companyId, body) => {
+        placeholderName = body.name;
+        return makeAsset(321);
+      },
+      requestAssetUpload: async (_assetId, _kind, body) => {
+        presignFilename = body.filename;
+        return { presigned_url: "https://blob/upload", url: "https://cdn/asset" };
+      },
+    });
+
+    await uploadFromUrl(client, {
+      companyId: 42,
+      url: "https://cdn/no-extension-here", // URL carries no extension either
+      type: "video",
+      name: "Avatar Mia reel (3 scenes, 2026-06-01)",
+    });
+
+    // Both the step-1 placeholder name and the step-2 presigned filename must
+    // carry the extension, so the upload succeeds AND the library shows a sane
+    // name. Spaces/parens/commas are fine; only the missing extension 500s.
+    expect(presignFilename).toBe("Avatar Mia reel (3 scenes, 2026-06-01).mp4");
+    expect(placeholderName).toBe("Avatar Mia reel (3 scenes, 2026-06-01).mp4");
+  });
+
+  it("appends a .jpg extension when an image name has none", async () => {
+    let presignFilename: string | undefined;
+    const client = makeFakeClient({
+      requestAssetUpload: async (_assetId, _kind, body) => {
+        presignFilename = body.filename;
+        return { presigned_url: "https://blob/upload", url: "https://cdn/asset" };
+      },
+    });
+
+    await uploadFromUrl(client, {
+      companyId: 42,
+      url: "https://cdn/whatever",
+      type: "image",
+      name: "Brand hero shot",
+    });
+
+    expect(presignFilename).toBe("Brand hero shot.jpg");
+  });
+
+  it("leaves a filename that already has a real extension untouched", async () => {
+    let presignFilename: string | undefined;
+    const client = makeFakeClient({
+      requestAssetUpload: async (_assetId, _kind, body) => {
+        presignFilename = body.filename;
+        return { presigned_url: "https://blob/upload", url: "https://cdn/asset" };
+      },
+    });
+
+    await uploadFromUrl(client, {
+      companyId: 42,
+      url: "https://cdn/clip.mov",
+      type: "video",
+      name: "Product teaser.mov",
+    });
+
+    expect(presignFilename).toBe("Product teaser.mov");
+  });
+});
+
+// ── ensureFilenameExtension (pure) ───────────────────────────────────────────
+
+describe("ensureFilenameExtension", () => {
+  it("appends the type-appropriate extension when none is present", () => {
+    expect(ensureFilenameExtension("Avatar Mia reel (3 scenes, 2026-06-01)", "video")).toBe(
+      "Avatar Mia reel (3 scenes, 2026-06-01).mp4",
+    );
+    expect(ensureFilenameExtension("test", "video")).toBe("test.mp4");
+    expect(ensureFilenameExtension("brand hero", "image")).toBe("brand hero.jpg");
+    expect(ensureFilenameExtension("2026-06-01", "video")).toBe("2026-06-01.mp4");
+  });
+
+  it("is idempotent for filenames that already have a 1-5 char alnum extension", () => {
+    expect(ensureFilenameExtension("clip.mp4", "video")).toBe("clip.mp4");
+    expect(ensureFilenameExtension("photo.jpeg", "image")).toBe("photo.jpeg");
+    expect(ensureFilenameExtension("teaser.MOV", "video")).toBe("teaser.MOV");
+    expect(ensureFilenameExtension("a.b", "video")).toBe("a.b");
+    expect(ensureFilenameExtension("my.report.final.png", "image")).toBe("my.report.final.png");
+  });
+
+  it("appends when the trailing 'extension' is not a sane token (spaces, too long)", () => {
+    // "v1.2 final" -> last segment "2 final" is not a real extension.
+    expect(ensureFilenameExtension("v1.2 final", "video")).toBe("v1.2 final.mp4");
   });
 });

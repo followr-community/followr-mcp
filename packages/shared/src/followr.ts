@@ -69,6 +69,34 @@ function buildQueryString(query?: Query): string {
   return qs ? `?${qs}` : "";
 }
 
+/**
+ * Guarantee `filename` ends in a usable file extension, appending a
+ * type-appropriate one when it does not.
+ *
+ * WHY: Followr's presigned-upload endpoints (POST /api/assets/{id}/image and
+ * POST /api/assets/{id}/video) return HTTP 500 when the `filename` in the body
+ * has no extension to parse (almost certainly a null PATHINFO_EXTENSION deref
+ * on the backend). Verified empirically 2026-06-01 against api.followr.ai:
+ *   "Avatar Mia reel (3 scenes, 2026-06-01)"      -> 500
+ *   "Avatar Mia reel (3 scenes, 2026-06-01).mp4"  -> 201
+ *   "test" -> 500 ; "test.mp4" -> 201 ; "test.xyz" -> 201 ; "test." -> 201
+ * Spaces, parentheses and commas are all accepted; ONLY a filename with no
+ * extension 500s. The auto-upload of an avatar video named its asset with a
+ * human-readable string and no extension, so every avatar reel upload died at
+ * step 2 and was misread as a transient backend outage (no retry could help:
+ * the request is malformed identically every time).
+ *
+ * Idempotent: filenames already ending in a 1-5 char alphanumeric extension
+ * (.mp4, .mov, .png, .jpeg, .webp, ...) pass through untouched.
+ */
+export function ensureFilenameExtension(filename: string, type: "image" | "video"): string {
+  const base = filename.split("/").pop() ?? filename;
+  const dot = base.lastIndexOf(".");
+  const ext = dot >= 0 ? base.slice(dot + 1) : "";
+  if (/^[A-Za-z0-9]{1,5}$/u.test(ext)) return filename;
+  return `${filename}.${type === "image" ? "jpg" : "mp4"}`;
+}
+
 export class FollowrClient {
   private readonly baseUrl: string;
   private readonly token: string;
@@ -1421,10 +1449,15 @@ export class FollowrClient {
     kind: "image" | "video",
     body: { filename: string; type: "image" | "video"; visibility: "public" | "private"; width?: number; height?: number },
   ): Promise<{ presigned_url: string; url: string }> {
+    // Defense-in-depth: this endpoint 500s on an extensionless filename (see
+    // ensureFilenameExtension). Callers SHOULD pass an extensioned name, but
+    // guarantee it here so no path (including direct callers like canva.ts)
+    // can poison the upload.
+    const safeBody = { ...body, filename: ensureFilenameExtension(body.filename, kind) };
     const result = await this.request<ApiSingle<{ presigned_url: string; url: string }>>(
       "POST",
       `/api/assets/${assetId}/${kind}`,
-      { body },
+      { body: safeBody },
     );
     return result.data;
   }

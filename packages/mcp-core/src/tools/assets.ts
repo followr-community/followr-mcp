@@ -1,4 +1,4 @@
-import { FollowrApiError, FollowrClient } from "@followr-mcp/shared";
+import { FollowrApiError, FollowrClient, ensureFilenameExtension } from "@followr-mcp/shared";
 import type { Asset } from "@followr-mcp/shared";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
@@ -263,7 +263,11 @@ export async function uploadFromUrl(
     contentTypeOverride ?? downloadResp.headers.get("content-type") ?? (type === "image" ? "image/jpeg" : "video/mp4");
   const buffer = await downloadResp.arrayBuffer();
   const fallbackExt = type === "image" ? "jpg" : "mp4";
-  const filename = name ?? filenameFromUrl(url, fallbackExt);
+  // Guarantee an extension: a human-readable `name` (e.g. the avatar
+  // auto-upload's "Avatar X reel (...)") has none, and the presigned endpoint
+  // 500s on extensionless filenames. Applied here so BOTH the step-1
+  // placeholder name and the step-2 presigned filename carry the extension.
+  const filename = ensureFilenameExtension(name ?? filenameFromUrl(url, fallbackExt), type);
 
   // ── Step 1: create placeholder asset ─────────────────────────────────
   let asset: Asset;
@@ -413,7 +417,7 @@ export async function uploadFromData(
       }),
     );
   }
-  const filename = name ?? `upload-${Date.now()}.${decoded.ext}`;
+  const filename = ensureFilenameExtension(name ?? `upload-${Date.now()}.${decoded.ext}`, "image");
   const asset = await client.createAsset(companyId, {
     name: filename,
     type: "image",
