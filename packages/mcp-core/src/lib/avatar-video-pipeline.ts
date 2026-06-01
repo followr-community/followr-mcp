@@ -21,13 +21,6 @@ import type { AiResult, Avatar, FollowrClient } from "@followr-mcp/shared";
 import { probeMp4Duration } from "./mp4-probe.js";
 import { PipelineFailedException } from "./pipeline-exceptions.js";
 
-// Natural tail buffer appended to each scene's render duration. Gives the
-// avatar a microframe of close before any transition. Without it, even with
-// the EXACT lipsync duration, the cut feels mechanical (no breath between
-// scenes). 0.25s is imperceptible as "freeze" but kills the abruptness; see
-// PipeLime cortado fix 2026-05-28.
-const SCENE_TAIL_BUFFER_SECONDS = 0.25;
-
 // Re-export so callers that imported the exceptions from this file (legacy
 // v0.5.0) keep compiling. Canonical location is lib/pipeline-exceptions.ts.
 export { PipelineCancelledException, PipelineFailedException } from "./pipeline-exceptions.js";
@@ -466,9 +459,8 @@ export async function executeAvatarVideoPipeline(
   // scene 0 = tracks 1+2, scene 1 = tracks 3+4, ... which stacks elements
   // in z-order, NOT in time. Sequential playback REQUIRES explicit `time`
   // and `duration` per element, computed cumulatively from the real probed
-  // duration of each lipsync clip (with a tiny tail buffer for natural
-  // pacing). Without them all scenes start at t=0 and their audio tracks
-  // mix on top of each other. Empirical shape reference:
+  // duration of each lipsync clip. Without them all scenes start at t=0 and
+  // their audio tracks mix on top of each other. Empirical shape reference:
   // docs/followr-api/avatars.md:800.
   hooks.checkCancelled?.("concat");
   hooks.onPhase?.({
@@ -483,11 +475,17 @@ export async function executeAvatarVideoPipeline(
   let cumulativeTime = 0;
   lipsyncUrls.forEach((url, i) => {
     const videoId = `video-scene-${i + 1}`;
-    // Real lipsync duration + a tiny tail buffer. Creatomate freezes the
-    // video element's last frame when its declared duration exceeds the
-    // source mp4's intrinsic duration; the 0.25s freeze is imperceptible
-    // and prevents the previously-jarring cut.
-    const sceneDuration = sceneRealDurations[i]! + SCENE_TAIL_BUFFER_SECONDS;
+    // Use each lipsync clip's EXACT probed duration for both the element
+    // duration and the cumulative scene placement, mirroring Creatomate's own
+    // `duration: "media"` default (match the source length). We used to pad
+    // +0.25s here on the belief that Creatomate freezes the last frame past
+    // the source end. It does NOT: there is no hold-last-frame feature (loop
+    // defaults to false, no freeze property) and the veed_fabric mp4s carry no
+    // alpha, so every padded tail rendered as ~0.25s of BLACK and showed up as
+    // a flash between scenes. The probe already returns the full clip length
+    // (the original "cortada" anti-truncation fix), so dropping the pad keeps
+    // every word intact and removes the black gap. Reported 2026-06-01.
+    const sceneDuration = sceneRealDurations[i]!;
     const sceneTime = cumulativeTime;
     const animations = buildAnimationsArray(i, sceneDuration, scene_animation, scene_transition);
     elements.push({
