@@ -6,11 +6,12 @@
 
 Model Context Protocol (MCP) server for [Followr](https://followr.ai). Connect
 Claude Desktop, Claude Code, Cursor, or any MCP-compatible AI client to your
-Followr workspace and operate it from natural language: schedule posts, generate
-content with AI, manage avatars and lipsync videos, run automations, triage the
-social inbox, and more.
+Followr workspace and operate it from natural language: draft and execute
+multi-day content plans, schedule posts, generate content with AI, build brand
+visual identities, manage avatars and lipsync videos, run automations, triage
+the social inbox, and more.
 
-**Status:** v0.4.0. API surface is stabilizing; expect occasional changes
+**Status:** v0.7.0. API surface is stabilizing; expect occasional changes
 between minor versions until v1.0.
 
 ## What it does
@@ -25,7 +26,7 @@ Once installed, you can ask Claude things like:
 
 The MCP exposes:
 
-- **72 tools** spanning post groups (including `search_posts_by_topic` for semantic queries over the post history), posts (including `create_post` for attaching media per network), tags, folders, assets (`upload_image_from_url`, `delete_asset`), avatars, voices (`create_voice_from_elevenlabs`, `delete_voice`), brand-voice prompts, Canva integration, Social Hub (DMs, comments, contacts), Autopilot rules, AI generation (text/image/audio/lipsync video), analytics, subscription balance, company settings, session orientation (`get_session_context`), and cross-network spec validation (`validate_against_specs`) that warns about caption length, asset count/type/size, video duration, aspect ratio, and per-account constraints (Twitter Premium, TikTok tier) before publishing.
+- **108 tools** spanning multi-day content planning (`draft_content_plan`, `preview_content_plan`, `execute_content_plan`), brand visual identity, deep research, post groups (including `search_posts_by_topic` for semantic queries over the post history), posts (including `create_post` for attaching media per network), tags, folders, assets (`upload_image_from_url`, `delete_asset`), avatars, voices (`create_voice_from_elevenlabs`, `delete_voice`), brand-voice prompts, Canva integration, Social Hub (DMs, comments, contacts), Autopilot rules, AI generation (text/image/audio/lipsync video), analytics, subscription balance, company settings, session orientation (`get_session_context`), and cross-network spec validation (`validate_against_specs`) that warns about caption length, asset count/type/size, video duration, aspect ratio, and per-account constraints (Twitter Premium, TikTok tier) before publishing.
 - **6 resources** (catalog endpoints) for companies, calendars, brand voice, avatars, ElevenLabs voices, and individual post groups.
 - **5 prompts** (canned multi-tool workflows) for weekly briefs, campaign launches, video series, crisis response, and URL repurposing.
 
@@ -111,7 +112,7 @@ followr-mcp/
     shared/      Followr API client (TypeScript), reusable across satellites
     mcp-core/    MCP server core: tools, resources, prompts
     stdio/       npm package entrypoint for local MCP clients (Claude Desktop, Code, Cursor)
-    worker/      Cloudflare Worker stub for remote HTTP transport (v0.2, work in progress)
+    worker/      Cloudflare Worker stub for remote HTTP transport (work in progress)
 ```
 
 ## Followr API documentation

@@ -6,11 +6,12 @@
 
 Model Context Protocol (MCP) server for [Followr](https://followr.ai). Connect
 Claude Desktop, Claude Code, Cursor, or any MCP-compatible AI client to your
-Followr workspace and operate it from natural language: schedule posts, generate
-content with AI, manage avatars and lipsync videos, run automations, triage the
-social inbox, and more.
+Followr workspace and operate it from natural language: draft and execute
+multi-day content plans, schedule posts, generate content with AI, build brand
+visual identities, manage avatars and lipsync videos, run automations, triage
+the social inbox, and more.
 
-**Status:** v0.4.0. API surface is stabilizing; expect occasional changes
+**Status:** v0.7.0. API surface is stabilizing; expect occasional changes
 between minor versions until v1.0.
 
 ## What you can ask Claude after installing
@@ -21,10 +22,12 @@ between minor versions until v1.0.
 - "List all unread DMs across my Facebook and Instagram accounts."
 - "Create a short avatar video with [avatar name] saying [script] for Instagram Reels."
 
-The MCP exposes 72 tools, 6 resources, and 5 canned workflows. New since v0.2.0:
-`search_posts_by_topic` (semantic search over post history), `delete_voice`,
-`delete_asset`, and `get_session_context` (one-call orientation). Source code
-and full tool list at https://github.com/followr-community/followr-mcp.
+The MCP exposes 108 tools, 6 resources, and 5 canned workflows, including
+multi-day content planning (`draft_content_plan`, `preview_content_plan`,
+`execute_content_plan`), brand visual identity, deep research, semantic post
+search (`search_posts_by_topic`), avatar and lipsync video, and one-call
+orientation (`get_session_context`). Source code and full tool list at
+https://github.com/followr-community/followr-mcp.
 
 ## Before you start
 
@@ -193,9 +196,9 @@ npx -y @followr/mcp --version || true
 - Source code is open and auditable: https://github.com/followr-community/followr-mcp.
 - To revoke a leaked API key: Followr → profile picture → API Keys → delete.
 
-## What's not in v0.1
+## Current limitations
 
-- Remote HTTP transport (planned for v0.2). Today the MCP runs as a local subprocess only.
+- The MCP runs as a local subprocess only (stdio transport). A remote HTTP transport is in progress in the `worker` package but not yet published.
 - A handful of Followr API endpoints we have not verified end-to-end yet (analytics edge cases, some Canva flows).
 
 ## Where to ask for help
